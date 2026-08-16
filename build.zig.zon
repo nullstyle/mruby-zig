@@ -8,10 +8,10 @@
         "build",
         "src",
         "examples",
-        "tests",
         "tools",
         "LICENSE",
         "README.md",
+        "CHANGELOG.md",
     },
     .dependencies = .{
         .mruby = .{

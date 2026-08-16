@@ -46,7 +46,7 @@ pub const Value = struct {
     }
 
     pub fn typeOf(self: Value) Type {
-        return @enumFromInt(c.mrz_type(self.v));
+        return @fromBackingInt(@intCast(c.mrz_type(self.v)));
     }
 
     pub fn isNil(self: Value) bool {

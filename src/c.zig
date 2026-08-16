@@ -176,8 +176,6 @@ pub extern fn mrz_exc_value(mrb: *mrb_state) mrb_value;
 pub extern fn mrz_exc_clear(mrb: *mrb_state) void;
 pub extern fn mrz_exc_set(mrb: *mrb_state, exc: mrb_value) void;
 pub extern fn mrz_set_instance_tt(cls: *RClass, tt: mrb_vtype) void;
-pub extern fn mrz_dbg_globals(mrb: *mrb_state) ?*anyopaque;
-pub extern fn mrz_dbg_symidx(mrb: *mrb_state) u32;
 
 pub extern fn mrz_type(v: mrb_value) mrb_vtype;
 pub extern fn mrz_nil_p(v: mrb_value) bool;

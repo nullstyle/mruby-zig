@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+      - run: mise install
+      - run: mise x -- zig fmt --check .
+      - run: mise x -- zig build test
+      - run: mise x -- zig build
+      - run: |
+          ./zig-out/bin/quickstart
+          ./zig-out/bin/host_functions
+          ./zig-out/bin/exceptions
+          ./zig-out/bin/mruby-repl -e '[1,2,3].sum'
+
+  cross:
+    name: cross compile (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-gnu
+          - target: x86_64-linux-musl
+          - target: x86_64-windows-gnu # best effort
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+      - run: mise install
+      - run: mise x -- zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+        continue-on-error: ${{ matrix.target == 'x86_64-windows-gnu' }}
+
+  gem-sets:
+    name: gem set (${{ matrix.gem_set }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        gem_set: [standard, minimal]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+      - run: mise install
+      - run: mise x -- zig build test -Dgem-set=${{ matrix.gem_set }}

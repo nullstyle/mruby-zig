@@ -182,6 +182,20 @@ pub fn build(b: *std.Build) !void {
     mruby_mod.addIncludePath(lib_presym_dir);
     for (gem_include_dirs.items) |dir| mruby_mod.addIncludePath(dir);
 
+    // REPL tool.
+    const repl_mod = b.createModule(.{
+        .root_source_file = b.path("tools/repl.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    repl_mod.addImport("mruby", mruby_mod);
+    const repl = b.addExecutable(.{ .name = "mruby-repl", .root_module = repl_mod });
+    b.installArtifact(repl);
+    const run_repl = b.addRunArtifact(repl);
+    run_repl.step.dependOn(b.getInstallStep());
+    const repl_step = b.step("run-repl", "interactive mruby REPL");
+    repl_step.dependOn(&run_repl.step);
+
     // Tests.
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),

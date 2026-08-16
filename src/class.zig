@@ -347,4 +347,3 @@ fn Wrap(comptime fmt: []const u8, comptime func: anytype) type {
         }
     };
 }
-

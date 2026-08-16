@@ -141,7 +141,7 @@ pub const Vm = struct {
         defer c.mrz_gc_arena_restore(vm.mrb, ai);
 
         var err = false;
-        const v = c.mrb_protect_error(vm.mrb, protectedCall, @constCast(@ptrCast(&ctx)), &err);
+        const v = c.mrb_protect_error(vm.mrb, protectedCall, @ptrCast(@constCast(&ctx)), &err);
         if (err) {
             c.mrz_exc_set(vm.mrb, v);
             return error.RubyException;

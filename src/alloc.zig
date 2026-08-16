@@ -88,12 +88,12 @@ export fn mrb_basic_alloc_func(p: ?*anyopaque, size: usize) callconv(.c) ?*anyop
 }
 
 fn writeHeader(raw: [*]u8, size: usize) void {
-    const h: *usize = @alignCast(@ptrCast(raw));
+    const h: *usize = @ptrCast(@alignCast(raw));
     h.* = size;
 }
 
 fn readHeader(raw: [*]u8) usize {
-    const h: *const usize = @alignCast(@ptrCast(raw));
+    const h: *const usize = @ptrCast(@alignCast(raw));
     return h.*;
 }
 

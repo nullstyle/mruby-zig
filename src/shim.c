@@ -36,9 +36,6 @@ void mrz_set_instance_tt(struct RClass *c, enum mrb_vtype tt) {
   MRB_SET_INSTANCE_TT(c, tt);
 }
 
-/* debug introspection */
-void *mrz_dbg_globals(mrb_state *mrb) { return mrb->globals; }
-mrb_sym mrz_dbg_symidx(mrb_state *mrb) { return mrb->symidx; }
 
 /* ---- value classification ---- */
 
