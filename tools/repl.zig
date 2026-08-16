@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buf: [4096]u8 = undefined;
     var stdout_file = std.Io.File.stdout().writer(io, &stdout_buf);
     const out = &stdout_file.interface;
-    mruby.output.setOutputWriter(vm, out);
+    try mruby.output.setOutputWriter(vm, out);
 
     const result = vm.loadString(src.items) catch {
         const exc = vm.lastError().?;

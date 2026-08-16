@@ -18,6 +18,10 @@ pub const Gem = struct {
     /// Extra include directories (relative to the mruby dependency root)
     /// this gem's sources need.
     include_dirs: []const []const u8 = &.{},
+    /// Runtime dependencies on other gems in the catalog (mirrors each
+    /// gem's `mrbgem.rake` `add_dependency` lines; test-only dependencies
+    /// are omitted). Used by the build to validate/complete the selection.
+    deps: []const []const u8 = &.{},
 
     pub fn funcname(gem: Gem, buf: []u8) []const u8 {
         for (gem.name, 0..) |ch, i| buf[i] = if (ch == '-') '_' else ch;
@@ -36,7 +40,7 @@ pub const standard = [_]Gem{
     .{ .name = "mruby-metaprog", .c_srcs = &.{gemDir("mruby-metaprog") ++ "src/metaprog.c"} },
     .{ .name = "mruby-method", .c_srcs = &.{gemDir("mruby-method") ++ "src/method.c"}, .rb_files = &.{gemDir("mruby-method") ++ "mrblib/method.rb"} },
     .{ .name = "mruby-binding", .c_srcs = &.{gemDir("mruby-binding") ++ "src/binding.c"} },
-    .{ .name = "mruby-eval", .c_srcs = &.{gemDir("mruby-eval") ++ "src/eval.c"} },
+    .{ .name = "mruby-eval", .c_srcs = &.{gemDir("mruby-eval") ++ "src/eval.c"}, .deps = &.{"mruby-binding"} },
     .{ .name = "mruby-compar-ext", .rb_files = &.{gemDir("mruby-compar-ext") ++ "mrblib/compar.rb"} },
     .{ .name = "mruby-enum-ext", .rb_files = &.{gemDir("mruby-enum-ext") ++ "mrblib/enum.rb"} },
     .{ .name = "mruby-string-ext", .c_srcs = &.{gemDir("mruby-string-ext") ++ "src/string.c"}, .rb_files = &.{gemDir("mruby-string-ext") ++ "mrblib/string.rb"} },
@@ -50,8 +54,8 @@ pub const standard = [_]Gem{
     .{ .name = "mruby-objectspace", .c_srcs = &.{gemDir("mruby-objectspace") ++ "src/mruby_objectspace.c"} },
     .{ .name = "mruby-fiber", .c_srcs = &.{gemDir("mruby-fiber") ++ "src/fiber.c"} },
     .{ .name = "mruby-enumerator", .rb_files = &.{gemDir("mruby-enumerator") ++ "mrblib/enumerator.rb"} },
-    .{ .name = "mruby-enum-lazy", .rb_files = &.{gemDir("mruby-enum-lazy") ++ "mrblib/lazy.rb"} },
-    .{ .name = "mruby-set", .c_srcs = &.{gemDir("mruby-set") ++ "src/set.c"}, .rb_files = &.{gemDir("mruby-set") ++ "mrblib/set.rb"}, .defines = &.{"MRB_USE_SET"} },
+    .{ .name = "mruby-enum-lazy", .rb_files = &.{gemDir("mruby-enum-lazy") ++ "mrblib/lazy.rb"}, .deps = &.{ "mruby-enumerator", "mruby-enum-ext" } },
+    .{ .name = "mruby-set", .c_srcs = &.{gemDir("mruby-set") ++ "src/set.c"}, .rb_files = &.{gemDir("mruby-set") ++ "mrblib/set.rb"}, .defines = &.{"MRB_USE_SET"}, .deps = &.{ "mruby-hash-ext", "mruby-enumerator" } },
     .{ .name = "mruby-toplevel-ext", .rb_files = &.{gemDir("mruby-toplevel-ext") ++ "mrblib/toplevel.rb"} },
     .{ .name = "mruby-kernel-ext", .c_srcs = &.{gemDir("mruby-kernel-ext") ++ "src/kernel.c"} },
     .{ .name = "mruby-class-ext", .c_srcs = &.{gemDir("mruby-class-ext") ++ "src/class.c"} },
@@ -68,7 +72,7 @@ pub const standard = [_]Gem{
 /// extensions beyond core mruby (plus `mruby-eval`, which is tiny and
 /// commonly wanted even in constrained builds).
 pub const minimal = [_]Gem{
-    .{ .name = "mruby-eval", .c_srcs = &.{gemDir("mruby-eval") ++ "src/eval.c"} },
+    .{ .name = "mruby-eval", .c_srcs = &.{gemDir("mruby-eval") ++ "src/eval.c"}, .deps = &.{"mruby-binding"} },
 };
 
 /// All gems known to the catalog, used to resolve `-Dwith-gems=...`.

@@ -146,9 +146,16 @@ the first `Vm`), `mruby.alloc.liveBytes()` / `liveAllocs()` for
 observability. It is process-global — an upstream 4.0 constraint — and
 defaults to the thread-safe `std.heap.c_allocator`.
 
-Values returned by `loadString` are not GC-rooted once the call returns;
-root anything you keep across further Ruby execution (a global/ivar, or an
-`vm.arenaScope()` around a tight loop of calls).
+Two lifetime rules keep you safe:
+
+- Values returned by `loadString` are not GC-rooted once the call returns;
+  root anything you keep across further Ruby execution (a global/ivar, or
+  a `vm.arenaScope()` around a tight loop of calls).
+- String slices are **borrowed**: `Value.asString`, the `S`/`s`/`z` method
+  parameters, and `Rest.get` point into the Ruby heap and are valid only
+  until the next interpreter call — use `Value.dupeString(allocator)` to
+  keep them. `vm.loadString` evaluates a source slice only up to its first
+  NUL byte (the lexer's sentinel).
 
 ## Gem configuration
 
@@ -160,16 +167,36 @@ symbol/proc/kernel/toplevel/compar`), `struct`, `set`, `fiber`,
 `objectspace`, and `math`.
 
 ```sh
-mise x -- zig build -Dgem-set=minimal          # core + compiler + eval
+mise x -- zig build -Dgem-set=minimal          # core + compiler + eval (+ deps)
 mise x -- zig build -Dwith-gems=mruby-io       # add gems on top
 mise x -- zig build -Dwithout-gems=mruby-pack  # remove gems
 ```
+
+Gem dependencies are honored like Rake's `add_dependency`: `-Dwith-gems`
+pulls in anything the added gem needs, and `-Dwithout-gems` cascade-removes
+gems that depend on what you removed (printed as configure-time notes), so
+misconfigurations can't silently produce an interpreter that fails to boot.
 
 Excluded from defaults for portability: `io`, `socket`, `dir`, `errno`,
 `print`, and the math-extras (`bigint`, `complex`, `rational`, `cmath`).
 Note that without `mruby-bigint`, integer *literals* beyond the int32 pool
 range raise `RangeError` at load time (upstream 4.0 behavior); computed
 values up to ±2^63 work fine.
+
+## Sandboxing and limits
+
+The default gem set is deliberately **compute-only**: no `io`, `socket`,
+`dir`, `errno`, or process gems, so scripts cannot touch the filesystem,
+network, or spawn processes unless the host adds those gems or exposes
+such capability through Zig methods. What the host must still manage:
+
+- **CPU**: an infinite loop in a script cannot be interrupted; run
+  untrusted scripts on a worker thread with your own timeout/kill policy.
+- **Memory**: allocations are observable via `mruby.alloc.liveBytes()` /
+  `liveAllocs()`; enforcing a quota (failing `mrb_basic_alloc_func` past a
+  limit) is a natural extension.
+- Deep recursion is safely caught (mruby raises `SystemStackError`, which
+  surfaces as `error.RubyException` like any other exception).
 
 ## Layout
 
@@ -219,7 +246,7 @@ functions, keeping every layout decision on the C side.
 ## Development
 
 ```sh
-mise x -- zig build test              # 19 tests incl. Ruby suites
+mise x -- zig build test              # 26 tests incl. Ruby suites
 mise x -- zig build run-host-functions
 mise x -- zig build run-repl -- -e 'RUBY_VERSION'
 ```

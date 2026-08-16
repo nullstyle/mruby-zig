@@ -20,7 +20,7 @@ pub fn main(init: std.process.Init) !void {
 
     var buffer: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
     defer buffer.deinit();
-    mruby.output.setOutputWriter(vm, &buffer.writer);
+    try mruby.output.setOutputWriter(vm, &buffer.writer);
 
     const divider = try vm.defineClass("Divider", null);
     divider.defineMethod("divide", "ii", Divider.divide);

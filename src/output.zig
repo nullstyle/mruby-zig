@@ -1,5 +1,10 @@
 //! Ruby output redirection.
 //!
+//! Fidelity note: `print`/`puts`/`p` here cover the common semantics
+//! (including `puts` printing array elements one per line); they are not a
+//! complete reimplementations of CRuby's IO (no `$stdout` object, no
+//! `$SCRIPT_LINES__`, buffering is per-call flush).
+//!
 //! `vm.setOutputWriter(&writer.interface)` installs `print`, `puts`, and `p`
 //! on Kernel so Ruby-side output flows into any Zig `std.Io.Writer`
 //! (a buffered file writer, a socket, an in-memory buffer, ...).
@@ -20,13 +25,13 @@ pub const Value = value_mod.Value;
 pub const Vm = vm_mod.Vm;
 
 /// Set the destination for Ruby-level print/puts/p and install those
-/// methods on Kernel (idempotent).
-pub fn setOutputWriter(vm: *Vm, writer: *std.Io.Writer) void {
+/// methods on Kernel (idempotent; later calls only retarget the writer).
+pub fn setOutputWriter(vm: *Vm, writer: *std.Io.Writer) !void {
     vm.writer = writer;
     if (vm.output_installed) return;
     vm.output_installed = true;
 
-    const kernel = vm.getClass("Kernel") catch return;
+    const kernel = try vm.getClass("Kernel");
     kernel.defineMethod("print", "*", printFn);
     kernel.defineMethod("puts", "*", putsFn);
     kernel.defineMethod("p", "*", inspectFn);
@@ -53,14 +58,26 @@ fn printFn(vm: *Vm, self: Value, rest: class_mod.Rest) anyerror!Value {
 fn putsFn(vm: *Vm, self: Value, rest: class_mod.Rest) anyerror!Value {
     _ = self;
     const writer = vm.writer orelse return Value.nil(vm.mrb);
-    for (0..rest.len) |i| {
-        const s = try toS(vm, rest.get(i));
-        try writer.writeAll(s);
-        if (s.len == 0 or s[s.len - 1] != '\n') try writer.writeAll("\n");
-    }
     if (rest.len == 0) try writer.writeAll("\n");
+    for (0..rest.len) |i| try putsElem(vm, rest.get(i));
     try writer.flush();
     return Value.nil(vm.mrb);
+}
+
+/// CRuby `puts` semantics: arrays print one element per line (recursively);
+/// scalars print `to_s` plus a newline unless already newline-terminated.
+fn putsElem(vm: *Vm, v: Value) !void {
+    const writer = vm.writer orelse return;
+    if (c.mrz_array_p(v.v)) {
+        const n = try (try vm.call(v, "size", .{})).asInt();
+        for (0..@intCast(n)) |i| {
+            try putsElem(vm, try vm.call(v, "[]", .{vm.intValue(i)}));
+        }
+        return;
+    }
+    const s = try toS(vm, v);
+    try writer.writeAll(s);
+    if (s.len == 0 or s[s.len - 1] != '\n') try writer.writeAll("\n");
 }
 
 fn inspectFn(vm: *Vm, self: Value, rest: class_mod.Rest) anyerror!Value {

@@ -20,5 +20,24 @@ Initial implementation.
   bindings (`src/c.zig`) keep `mrb_state` opaque.
 - Standard gem set (28 gems) plus `minimal` preset; `-Dwith-gems` /
   `-Dwithout-gems` adjustment.
-- 19 Zig tests including embedded Ruby integration suites and an eval tool
+- 26 Zig tests including embedded Ruby integration suites, concurrent-VM
+  and regression coverage, and an eval tool
   (`zig build run-repl -- -e 'expr'`).
+
+Code-review hardening:
+
+- Gem dependencies are validated at configure time: `-Dwith-gems` pulls in
+  dependencies, `-Dwithout-gems` cascade-removes dependents (fixes the
+  `minimal` set link failure and silent boot failures from invalid sets).
+- `Vm.defineClass`/`defineModule` run under `mrb_protect_error` (no
+  unprotected longjmp path remains in the safe layer); `Vm.init` failure
+  paths no longer leak the interpreter state and expose the Ruby-level
+  reason via `Vm.lastInitFailure()`.
+- `convert.toValue` returns `error.Overflow` for unrepresentable integers
+  (instead of panicking); `Vm.intValue` saturates; `Value.dupeString` added
+  for owned string copies.
+- `setGlobal`/`setIvar`/`setOutputWriter` propagate errors instead of
+  silently no-op'ing; `puts` prints array elements one per line (CRuby
+  semantics); `mrz_exc_set` ignores immediate values.
+- Presym scanner octal-escape handling now matches `presym.rb` exactly
+  (`\0` + up to three digits).

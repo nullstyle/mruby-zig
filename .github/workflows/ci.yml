@@ -60,3 +60,8 @@ jobs:
           install: true
       - run: mise install
       - run: mise x -- zig build test -Dgem-set=${{ matrix.gem_set }}
+      # dependency cascade: removing enumerator must also remove its
+      # dependents (enum-lazy, set) and still produce a working interpreter
+      - run: mise x -- zig build -Dwithout-gems=mruby-enumerator
+      - run: ./zig-out/bin/mruby-repl -e '[1,2].sum'
+      - run: mise x -- zig build test -Dwithout-gems=mruby-pack

@@ -285,15 +285,68 @@ fn selectGems(
         while (it.next()) |raw| {
             const name = std.mem.trim(u8, raw, " ");
             if (name.len == 0) continue;
-            var i: usize = 0;
-            while (i < list.items.len) {
-                if (std.mem.eql(u8, list.items[i].name, name)) {
-                    _ = list.orderedRemove(i);
-                } else i += 1;
+            removeGem(&list, name);
+            // Cascade: a gem whose dependency was removed cannot initialize;
+            // remove its dependents transitively (with a clear trace). The
+            // scan restarts after every removal so no stale slice is walked.
+            var changed = true;
+            while (changed) {
+                changed = false;
+                var i: usize = 0;
+                while (i < list.items.len) : (i += 1) {
+                    var removed = false;
+                    for (list.items[i].deps) |dep| {
+                        if (!selected(list, dep)) {
+                            std.debug.print("note: -Dwithout-gems={s} also removes {s} (depends on it)\n", .{ name, list.items[i].name });
+                            removeGem(&list, list.items[i].name);
+                            changed = true;
+                            removed = true;
+                            break;
+                        }
+                    }
+                    if (removed) break;
+                }
             }
         }
     }
+    // Auto-add missing dependencies (rake's add_dependency semantics),
+    // inserting each one just before its first dependent.
+    resolveDeps(arena, &list);
     return list.items;
+}
+
+fn selected(list: std.ArrayList(gems_mod.Gem), name: []const u8) bool {
+    for (list.items) |g| {
+        if (std.mem.eql(u8, g.name, name)) return true;
+    }
+    return false;
+}
+
+fn removeGem(list: *std.ArrayList(gems_mod.Gem), name: []const u8) void {
+    var i: usize = 0;
+    while (i < list.items.len) {
+        if (std.mem.eql(u8, list.items[i].name, name)) {
+            _ = list.orderedRemove(i);
+        } else i += 1;
+    }
+}
+
+fn resolveDeps(arena: std.mem.Allocator, list: *std.ArrayList(gems_mod.Gem)) void {
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var i: usize = 0;
+        while (i < list.items.len) : (i += 1) {
+            for (list.items[i].deps) |dep| {
+                if (selected(list.*, dep)) continue;
+                const g = gems_mod.byName(dep) orelse
+                    std.debug.panic("gem {s} depends on unknown gem {s}", .{ list.items[i].name, dep });
+                list.insert(arena, i, g) catch @panic("OOM");
+                changed = true;
+                break;
+            }
+        }
+    }
 }
 
 fn hostTool(b: *std.Build, path: []const u8) *std.Build.Step.Compile {

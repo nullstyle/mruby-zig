@@ -10,15 +10,18 @@ const value_mod = @import("value.zig");
 
 pub const Value = value_mod.Value;
 
-pub fn toValue(mrb: *c.mrb_state, x: anytype) Value {
+/// Convert a Zig value to a Ruby value. Integers that do not fit an i64
+/// (e.g. a large u64, since this build has no bigint) return
+/// `error.Overflow`. Strings are copied into Ruby heap strings.
+pub fn toValue(mrb: *c.mrb_state, x: anytype) !Value {
     const T = @TypeOf(x);
     if (T == Value) return x;
     if (T == c.mrb_value) return .{ .mrb = mrb, .v = x };
     return switch (@typeInfo(T)) {
-        .int => |info| if (info.signedness == .signed)
-            .{ .mrb = mrb, .v = c.mrz_int_value(mrb, @intCast(x)) }
-        else
-            .{ .mrb = mrb, .v = c.mrz_int_value(mrb, @intCast(x)) },
+        .int => blk: {
+            const n: i64 = std.math.cast(i64, x) orelse return error.Overflow;
+            break :blk .{ .mrb = mrb, .v = c.mrz_int_value(mrb, n) };
+        },
         .float => .{ .mrb = mrb, .v = c.mrz_float_value(mrb, x) },
         .bool => .{ .mrb = mrb, .v = c.mrz_bool_value(x) },
         .optional => if (x) |inner| toValue(mrb, inner) else Value.nil(mrb),

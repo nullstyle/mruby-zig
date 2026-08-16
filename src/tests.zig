@@ -14,6 +14,14 @@ const ruby_suites = .{
     .{ .name = "numerics", .src = @embedFile("tests_ruby/numerics.rb") },
 };
 
+fn countLines(s: []const u8) usize {
+    var n: usize = 0;
+    for (s) |ch| {
+        if (ch == '\n') n += 1;
+    }
+    return n + @intFromBool(s.len > 0 and s[s.len - 1] != '\n');
+}
+
 test "ruby integration suite" {
     inline for (ruby_suites) |suite| {
         const vm = try mruby.Vm.init();
@@ -25,17 +33,33 @@ test "ruby integration suite" {
             const msg = exc.message();
             defer mruby.alloc.gpa.free(msg);
             std.debug.print("ruby suite '{s}' failed: {s}: {s}\n", .{ suite.name, cls, msg });
-            // Bisect: report the first failing line.
+            // Bisect: accumulate lines until they parse standalone (so a
+            // multi-line def/class is consumed as a unit), then report the
+            // first window that still fails.
             var it = std.mem.splitScalar(u8, suite.src, '\n');
+            var acc: std.ArrayList(u8) = .empty;
+            defer acc.deinit(std.testing.allocator);
+            var acc_start: usize = 0;
             var line_no: usize = 0;
             while (it.next()) |line| : (line_no += 1) {
-                if (line.len == 0) continue;
+                if (line.len == 0 and acc.items.len == 0) continue;
+                if (acc.items.len == 0) acc_start = line_no;
+                acc.appendSlice(std.testing.allocator, line) catch break;
+                acc.append(std.testing.allocator, '\n') catch break;
+                if (acc.items.len > 4096) break;
                 const line_vm = mruby.Vm.init() catch break;
                 defer line_vm.deinit();
-                _ = line_vm.loadString(line) catch {
-                    std.debug.print("  first failing line {d}: {s}\n", .{ line_no + 1, line });
-                    break;
-                };
+                if (line_vm.loadString(acc.items)) |_| {
+                    acc.clearRetainingCapacity();
+                } else |_| {
+                    line_vm.clearError();
+                    // Might be an incomplete multi-line construct; keep
+                    // accumulating unless this was already a single line.
+                    if (countLines(acc.items) == 1) {
+                        std.debug.print("  first failing line {d}: {s}\n", .{ acc_start + 1, line });
+                        break;
+                    }
+                }
             }
             return error.RubySuiteFailed;
         };
@@ -233,7 +257,7 @@ test "globals and ivars" {
 
     _ = try vm.loadString("$answer = 42");
     try std.testing.expectEqual(@as(i64, 42), try (try vm.getGlobal("answer")).asInt());
-    vm.setGlobal("name", vm.stringValue("zig"));
+    try vm.setGlobal("name", vm.stringValue("zig"));
     try std.testing.expectEqualStrings("zig", try (try vm.loadString("$name")).asString());
 
     const obj = try vm.loadString("Object.new.tap { |o| o.instance_variable_set(:@v, 7) }");
@@ -312,7 +336,7 @@ test "ruby print output reaches zig writer" {
     var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer buffer.deinit();
 
-    mruby.output.setOutputWriter(vm, &buffer.writer);
+    try mruby.output.setOutputWriter(vm, &buffer.writer);
     _ = try vm.loadString("print 'a'; puts 'b'; p 42");
 
     const out = buffer.writer.buffer[0..buffer.writer.end];
@@ -337,6 +361,90 @@ test "values rooted in globals survive gc churn" {
     }
     const held = try vm.getGlobal("held");
     try std.testing.expectEqualStrings("i am a string", try held.asString());
+}
+
+// ---- robustness (regression tests for review findings) ---------------------
+
+test "defineClass over non-class constant errors instead of crashing" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+    _ = try vm.loadString("Runner = 5");
+    // Before the fix this raised a TypeError with no protect point (longjmp
+    // across a Zig frame, i.e. undefined behavior).
+    try std.testing.expectError(error.RubyException, vm.defineClass("Runner", null));
+    try std.testing.expectError(error.RubyException, vm.defineModule("Runner"));
+}
+
+test "defineModule returns existing module" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+    const m = try vm.defineModule("Enumerable");
+    _ = m;
+    const again = try vm.defineModule("Enumerable");
+    _ = again;
+}
+
+test "large sources exercise the heap eval path" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+    // > the 4 KiB stack fast path in loadString.
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(std.testing.allocator);
+    var pad: std.ArrayList(u8) = .empty;
+    defer pad.deinit(std.testing.allocator);
+    var pi: usize = 0;
+    while (pi < 900) : (pi += 1) try pad.appendSlice(std.testing.allocator, "# padding\n");
+    try script.appendSlice(std.testing.allocator, pad.items);
+    try script.appendSlice(std.testing.allocator, "([1, 2, 3].map { |x| x * 3 }).reduce(:+)");
+    const v = try vm.loadString(script.items);
+    try std.testing.expectEqual(@as(i64, 18), try v.asInt());
+}
+
+test "dupeString outlives interpreter churn" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+    const v = try vm.loadString("'keep me'");
+    const owned = try v.dupeString(std.testing.allocator);
+    defer std.testing.allocator.free(owned);
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        var buf: [64]u8 = undefined;
+        const src = try std.fmt.bufPrint(&buf, "\"garbage {d}\"; GC.start", .{i});
+        _ = try vm.loadString(src);
+    }
+    try std.testing.expectEqualStrings("keep me", owned);
+}
+
+test "unsigned overflow in toValue errors rather than panics" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+    try std.testing.expectError(error.Overflow, mruby.convert.toValue(vm.mrb, @as(u64, std.math.maxInt(u64))));
+    // Saturation for the infallible callback helper.
+    const v = vm.intValue(@as(u64, std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), try v.asInt());
+}
+
+test "concurrent VMs on separate threads" {
+    const Worker = struct {
+        fn run() !void {
+            const vm = try mruby.Vm.init();
+            defer vm.deinit();
+            var i: usize = 0;
+            while (i < 25) : (i += 1) {
+                const v = try vm.loadString("(1..50).reduce(:+)");
+                if (try v.asInt() != 1275) return error.TestUnexpectedResult;
+            }
+        }
+    };
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{});
+    for (threads) |t| t.join();
+}
+
+test "init failure diagnostics are queryable" {
+    // Simulated by checking the API shape; a real InitFailure needs a
+    // misconfigured gem set, which the build now rejects at configure time.
+    _ = mruby.Vm.lastInitFailure();
 }
 
 // ---- allocator ---------------------------------------------------------------

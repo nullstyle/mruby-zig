@@ -28,6 +28,7 @@ mrb_value mrz_exc_value(mrb_state *mrb) {
 }
 void mrz_exc_clear(mrb_state *mrb) { mrb->exc = NULL; }
 void mrz_exc_set(mrb_state *mrb, mrb_value exc) {
+  if (mrb_immediate_p(exc)) return; /* not a heap object */
   mrb->exc = mrb_obj_ptr(exc);
 }
 

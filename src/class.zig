@@ -13,9 +13,17 @@
 //!     }.call);
 //!
 //! Format specifiers: `i` -> i64, `f` -> f64, `b` -> bool, `n` -> u32
-//! (symbol id), `o` -> Value, `z` -> [:0]const u8, `S` -> []const u8,
+//! (symbol id), `o` -> Value, `z` -> [:0]const u8, `S`/`s` -> []const u8,
 //! `&` -> Value (block; nil if none), `*` -> Rest (view of remaining args),
 //! `|` -> separator after which specs are optional.
+//!
+//! String parameters (`S`, `s`, `z`) are **borrowed**: the backing memory
+//! lives on the Ruby heap and is valid only until the callback's next call
+//! into the interpreter; copy anything you keep.
+//!
+//! Optional arguments (after `|`) default to zero values when absent —
+//! an omitted optional is indistinguishable from an explicitly passed
+//! default.
 //!
 //! Error handling: any Zig error surfaced from the callback becomes a Ruby
 //! RuntimeError carrying the error name; a callback that raised its own Ruby
@@ -109,20 +117,6 @@ fn parseSpecs(comptime fmt: []const u8) []const Spec {
         else => @compileError("unsupported mrb_get_args format char '" ++ [1]u8{ch} ++ "'"),
     };
     return specs;
-}
-
-fn ParamType(comptime s: Spec) type {
-    return switch (s) {
-        .int_ => i64,
-        .float => f64,
-        .boolean => bool,
-        .nsymbol => u32,
-        .object, .block => Value,
-        .zstring => [:0]const u8,
-        .stringval => []const u8,
-        .rstring => []const u8,
-        .rest => Rest,
-    };
 }
 
 /// Storage for one call's parsed arguments, plus the machinery that feeds

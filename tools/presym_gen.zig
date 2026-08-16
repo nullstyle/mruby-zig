@@ -230,16 +230,15 @@ fn unescapeEscape(s: []const u8, out: *Emitter) !usize {
         return 1;
     }
     if (s[0] == '0') {
-        var n: usize = 0;
+        // Ruby: \(0[0-7]{,3}) — the leading zero plus up to 3 octal digits.
+        var n: usize = 1;
         var val: u16 = 0;
-        while (n < 3 and n < s.len) : (n += 1) {
+        while (n < 4 and n < s.len) : (n += 1) {
             const d = std.fmt.charToDigit(s[n], 8) catch break;
             val = val * 8 + d;
         }
-        if (n > 0) {
-            try out.byte(@truncate(val));
-            return n;
-        }
+        try out.byte(@truncate(val));
+        return n;
     }
     const simple = [_]struct { c: u8, b: u8 }{
         .{ .c = 'a', .b = 0x07 }, .{ .c = 'b', .b = 0x08 }, .{ .c = 'e', .b = 0x1b },

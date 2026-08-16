@@ -69,13 +69,19 @@ pub const Value = struct {
         return c.mrz_float_v(self.v);
     }
 
-    /// String contents as a slice pointing into the Ruby heap. The slice is
-    /// valid until the GC can move/free the string; dupe it if you need to
-    /// keep it across Ruby calls.
+    /// String contents as a **borrowed** slice pointing into the Ruby heap.
+    /// The slice is valid only until the next call into the interpreter
+    /// that can allocate or run the GC; use `dupeString` to keep it.
     pub fn asString(self: Value) ![]const u8 {
         if (!c.mrz_string_p(self.v)) return error.TypeMismatch;
         const p = c.mrz_string_ptr(self.v) orelse return error.TypeMismatch;
         return p[0..@intCast(c.mrz_string_len(self.v))];
+    }
+
+    /// Copy the string contents into caller-owned memory. The safe way to
+    /// hold Ruby text beyond the next interpreter call.
+    pub fn dupeString(self: Value, allocator: std.mem.Allocator) ![]u8 {
+        return allocator.dupe(u8, try self.asString());
     }
 
     pub fn isString(self: Value) bool {
