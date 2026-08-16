@@ -61,6 +61,7 @@ pub const standard = [_]Gem{
     .{ .name = "mruby-struct", .c_srcs = &.{gemDir("mruby-struct") ++ "src/struct.c"}, .rb_files = &.{gemDir("mruby-struct") ++ "mrblib/struct.rb"} },
     .{ .name = "mruby-data", .c_srcs = &.{gemDir("mruby-data") ++ "src/data.c"} },
     .{ .name = "mruby-random", .c_srcs = &.{gemDir("mruby-random") ++ "src/random.c"} },
+    .{ .name = "mruby-math", .c_srcs = &.{gemDir("mruby-math") ++ "src/math.c"} },
 };
 
 /// The "minimal" set: just enough for `Vm.loadString` with no stdlib

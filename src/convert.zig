@@ -1,0 +1,118 @@
+//! Zig <-> Ruby conversions.
+//!
+//! `toValue` / `fromValue` dispatch on the Zig type. Supported: integers,
+//! floats, bools, slices of u8 (copied into Ruby strings on the way in),
+//! `Value` itself (passthrough), and `?T` optionals of any supported type.
+
+const std = @import("std");
+const c = @import("c.zig");
+const value_mod = @import("value.zig");
+
+pub const Value = value_mod.Value;
+
+pub fn toValue(mrb: *c.mrb_state, x: anytype) Value {
+    const T = @TypeOf(x);
+    if (T == Value) return x;
+    if (T == c.mrb_value) return .{ .mrb = mrb, .v = x };
+    return switch (@typeInfo(T)) {
+        .int => |info| if (info.signedness == .signed)
+            .{ .mrb = mrb, .v = c.mrz_int_value(mrb, @intCast(x)) }
+        else
+            .{ .mrb = mrb, .v = c.mrz_int_value(mrb, @intCast(x)) },
+        .float => .{ .mrb = mrb, .v = c.mrz_float_value(mrb, x) },
+        .bool => .{ .mrb = mrb, .v = c.mrz_bool_value(x) },
+        .optional => if (x) |inner| toValue(mrb, inner) else Value.nil(mrb),
+        .pointer => |info| switch (info.size) {
+            .slice => blk: {
+                const Elem = @typeInfo(T).pointer.child;
+                if (Elem == u8) {
+                    break :blk .{ .mrb = mrb, .v = c.mrb_str_new(mrb, if (x.len == 0) null else x.ptr, @intCast(x.len)) };
+                }
+                @compileError("unsupported slice element type for toValue: " ++ @typeName(Elem));
+            },
+            else => @compileError("unsupported pointer type for toValue: " ++ @typeName(T)),
+        },
+        .null => Value.nil(mrb),
+        else => @compileError("unsupported type for toValue: " ++ @typeName(T)),
+    };
+}
+
+pub fn fromValue(comptime T: type, v: Value) !T {
+    if (T == Value) return v;
+    if (T == c.mrb_value) return v.v;
+    return switch (@typeInfo(T)) {
+        .int => blk: {
+            if (!c.mrz_integer_p(v.v)) return error.TypeMismatch;
+            const n = c.mrz_integer(v.v);
+            break :blk std.math.cast(T, n) orelse return error.Overflow;
+        },
+        .float => blk: {
+            if (c.mrz_integer_p(v.v)) {
+                break :blk @floatFromInt(c.mrz_integer(v.v));
+            }
+            if (!c.mrz_float_p(v.v)) return error.TypeMismatch;
+            break :blk @as(T, c.mrz_float_v(v.v));
+        },
+        .bool => c.mrz_test(v.v),
+        .optional => |opt| if (v.isNil()) null else try fromValue(opt.child, v),
+        .pointer => |info| switch (info.size) {
+            .slice => blk: {
+                if (info.size == .slice) {
+                    const Elem = @typeInfo(T).pointer.child;
+                    if (Elem == u8 and info.is_const) {
+                        if (!c.mrz_string_p(v.v)) return error.TypeMismatch;
+                        const p = c.mrz_string_ptr(v.v) orelse return error.TypeMismatch;
+                        break :blk p[0..@intCast(c.mrz_string_len(v.v))];
+                    }
+                }
+                @compileError("unsupported slice type for fromValue: " ++ @typeName(T));
+            },
+            else => @compileError("unsupported pointer type for fromValue: " ++ @typeName(T)),
+        },
+        else => @compileError("unsupported type for fromValue: " ++ @typeName(T)),
+    };
+}
+
+test "int roundtrip" {
+    const mruby = @import("mruby.zig");
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+    const v = toValue(vm.mrb, @as(i32, -42));
+    try std.testing.expectEqual(@as(i32, -42), try fromValue(i32, v));
+    try std.testing.expectEqual(@as(i64, -42), try fromValue(i64, v));
+}
+
+test "float and bool roundtrip" {
+    const mruby = @import("mruby.zig");
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+    const f = toValue(vm.mrb, 3.25);
+    try std.testing.expectEqual(@as(f64, 3.25), try fromValue(f64, f));
+
+    const t = toValue(vm.mrb, true);
+    const nul = toValue(vm.mrb, null);
+    try std.testing.expectEqual(true, try fromValue(bool, t));
+    try std.testing.expectEqual(false, try fromValue(bool, nul));
+    try std.testing.expectEqual(@as(?i64, null), try fromValue(?i64, nul));
+}
+
+test "string roundtrip" {
+    const mruby = @import("mruby.zig");
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+    const s = toValue(vm.mrb, @as([]const u8, "hello"));
+    try std.testing.expectEqualStrings("hello", try fromValue([]const u8, s));
+    const empty = toValue(vm.mrb, @as([]const u8, ""));
+    try std.testing.expectEqualStrings("", try fromValue([]const u8, empty));
+}
+
+test "big integers survive heap boxing" {
+    const mruby = @import("mruby.zig");
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+    // 2^62 does not fit an inline word-boxed fixnum; exercises the heap
+    // RInteger path through the shim.
+    const big: i64 = std.math.maxInt(i64);
+    const v = toValue(vm.mrb, big);
+    try std.testing.expectEqual(big, try fromValue(i64, v));
+}

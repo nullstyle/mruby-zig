@@ -68,14 +68,12 @@ pub const mrb_data_type = extern struct {
 
 pub const mrb_func_t = *const fn (?*mrb_state, mrb_value) callconv(.c) mrb_value;
 
-/// Argument spec bit for mrb_define_method / mrb_get_args "any/rest" marker.
-pub const MRB_ARGS_ANY: mrb_aspec = 1 << 12;
-pub const MRB_ARGS_REQ: mrb_aspec = 1 << 13;
-pub const MRB_ARGS_OPT: mrb_aspec = 1 << 14;
-pub const MRB_ARGS_REST: mrb_aspec = 1 << 15;
-pub const MRB_ARGS_POST: mrb_aspec = 1 << 16;
-pub const MRB_ARGS_KEY: mrb_aspec = 1 << 17;
-pub const MRB_ARGS_BLOCK: mrb_aspec = 1 << 18;
+/// Argument specifiers for mrb_define_method (mruby 4.0 bit layout):
+/// REQ(n) = n<<18, OPT(n) = n<<13, REST = 1<<12, POST(n) = n<<7, BLOCK = 1.
+pub const MRB_ARGS_NONE: mrb_aspec = 0;
+pub const MRB_ARGS_REST: mrb_aspec = 1 << 12;
+pub const MRB_ARGS_BLOCK: mrb_aspec = 1;
+pub const MRB_ARGS_ANY: mrb_aspec = MRB_ARGS_REST;
 
 // ---- state ------------------------------------------------------------
 
@@ -105,6 +103,7 @@ pub extern fn mrb_define_global_const(mrb: *mrb_state, name: [*:0]const u8, val:
 // ---- method arguments (variadic; see Args in the safe layer) ----------
 
 pub extern fn mrb_get_args(mrb: *mrb_state, format: [*:0]const u8, ...) mrb_int;
+pub extern fn mrb_get_args_a(mrb: *mrb_state, format: [*:0]const u8, args: [*]?*anyopaque) mrb_int;
 
 // ---- calling ----------------------------------------------------------
 
@@ -154,6 +153,9 @@ pub extern fn mrb_mod_cv_set(mrb: *mrb_state, c: *RClass, sym: mrb_sym, v: mrb_v
 
 pub extern fn mrb_data_object_alloc(mrb: *mrb_state, klass: *RClass, datap: ?*anyopaque, dt: *const mrb_data_type) *RData;
 pub extern fn mrb_data_get_ptr(mrb: *mrb_state, obj: mrb_value, dt: *const mrb_data_type) ?*anyopaque;
+pub extern fn mrb_data_check_get_ptr(mrb: *mrb_state, obj: mrb_value, dt: *const mrb_data_type) ?*anyopaque;
+pub extern fn mrb_class_get_under(mrb: *mrb_state, outer: *RClass, name: [*:0]const u8) *RClass;
+pub extern fn mrb_const_get(mrb: *mrb_state, outer: mrb_value, sym: mrb_sym) mrb_value;
 
 // ---- exceptions -------------------------------------------------------
 
@@ -172,6 +174,10 @@ pub extern fn mrz_gc_arena_save(mrb: *mrb_state) c_int;
 pub extern fn mrz_gc_arena_restore(mrb: *mrb_state, idx: c_int) void;
 pub extern fn mrz_exc_value(mrb: *mrb_state) mrb_value;
 pub extern fn mrz_exc_clear(mrb: *mrb_state) void;
+pub extern fn mrz_exc_set(mrb: *mrb_state, exc: mrb_value) void;
+pub extern fn mrz_set_instance_tt(cls: *RClass, tt: mrb_vtype) void;
+pub extern fn mrz_dbg_globals(mrb: *mrb_state) ?*anyopaque;
+pub extern fn mrz_dbg_symidx(mrb: *mrb_state) u32;
 
 pub extern fn mrz_type(v: mrb_value) mrb_vtype;
 pub extern fn mrz_nil_p(v: mrb_value) bool;

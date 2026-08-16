@@ -27,6 +27,18 @@ mrb_value mrz_exc_value(mrb_state *mrb) {
   return mrb->exc ? mrb_obj_value(mrb->exc) : mrb_nil_value();
 }
 void mrz_exc_clear(mrb_state *mrb) { mrb->exc = NULL; }
+void mrz_exc_set(mrb_state *mrb, mrb_value exc) {
+  mrb->exc = mrb_obj_ptr(exc);
+}
+
+/* instance type of a class (MRB_SET_INSTANCE_TT macro) */
+void mrz_set_instance_tt(struct RClass *c, enum mrb_vtype tt) {
+  MRB_SET_INSTANCE_TT(c, tt);
+}
+
+/* debug introspection */
+void *mrz_dbg_globals(mrb_state *mrb) { return mrb->globals; }
+mrb_sym mrz_dbg_symidx(mrb_state *mrb) { return mrb->symidx; }
 
 /* ---- value classification ---- */
 
