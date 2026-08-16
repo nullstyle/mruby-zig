@@ -167,6 +167,11 @@ pub extern fn mrb_protect_error(mrb: *mrb_state, body: *const fn (*mrb_state, ?*
 // ---- misc -------------------------------------------------------------
 
 pub extern fn mrb_obj_freeze(mrb: *mrb_state, obj: mrb_value) mrb_value;
+pub extern fn mrb_undef_method(mrb: *mrb_state, cla: *RClass, name: [*:0]const u8) void;
+pub extern fn mrb_undef_class_method(mrb: *mrb_state, cla: *RClass, name: [*:0]const u8) void;
+pub extern fn mrb_const_remove(mrb: *mrb_state, mod: *RClass, sym: mrb_sym) void;
+pub extern fn mrb_dump_irep(mrb: *mrb_state, irep: ?*const anyopaque, flags: u8, bin: *?[*]u8, bin_size: *usize) c_int;
+pub extern fn mrb_load_irep_buf(mrb: *mrb_state, buf: [*]const u8, size: usize) mrb_value;
 
 // ---- shim (src/shim.c): layout-safe accessors -------------------------
 
@@ -176,6 +181,17 @@ pub extern fn mrz_exc_value(mrb: *mrb_state) mrb_value;
 pub extern fn mrz_exc_clear(mrb: *mrb_state) void;
 pub extern fn mrz_exc_set(mrb: *mrb_state, exc: mrb_value) void;
 pub extern fn mrz_set_instance_tt(cls: *RClass, tt: mrb_vtype) void;
+pub extern fn mrz_set_code_fetch_hook(mrb: *mrb_state, hook: ?*const fn (?*mrb_state, ?*const anyopaque, ?*const anyopaque, ?*anyopaque) callconv(.c) void) void;
+pub extern fn mrz_ci_depth(mrb: *mrb_state) c_int;
+pub extern fn mrz_pc_catchable(irep: ?*const anyopaque, pc: ?*const anyopaque) c_int;
+pub extern fn mrz_get_ud(mrb: *mrb_state) ?*anyopaque;
+pub extern fn mrz_set_ud(mrb: *mrb_state, ud: ?*anyopaque) void;
+pub extern fn mrz_proc_irep(proc: *const anyopaque) ?*const anyopaque;
+pub extern fn mrz_parse_nerr(p: ?*const anyopaque) c_int;
+pub extern fn mrb_parse_nstring(mrb: *mrb_state, s: [*]const u8, len: usize, cxt: ?*mrb_ccontext) ?*anyopaque;
+pub extern fn mrb_parser_free(p: ?*anyopaque) void;
+pub extern fn mrb_generate_code(mrb: *mrb_state, p: ?*anyopaque) ?*anyopaque;
+pub extern fn mrz_gc_live(mrb: *mrb_state) usize;
 
 pub extern fn mrz_type(v: mrb_value) mrb_vtype;
 pub extern fn mrz_nil_p(v: mrb_value) bool;

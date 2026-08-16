@@ -1,92 +1,73 @@
-# mruby-zig: production-grade mruby embedding for Zig
+# Sandboxing for mruby-zig — v8-isolate parity, then better
 
-Design + implementation of a from-scratch Zig package (repo `mruby-zig/`, currently empty) that embeds **mruby 4.0.0** into Zig applications with **no Ruby toolchain required at build time** — the entire mruby build (normally Rake-driven) is replicated in `build.zig` and executed by `zig cc`.
+Add a `mruby.sandbox` module delivering what V8 isolates give (separate heaps, per-isolate memory limits, async termination from any thread, no ambient authority) **plus** things V8 doesn't have: deterministic instruction-gas budgets, a real capability model with object-model freezing, un-rescuable termination semantics, and precompiled-irep snapshots for mass spawn. The out-of-process tier (worker processes with IPC — OS-level separation beyond v8) is explicitly out of scope for v1 and will be documented as the follow-up architecture.
 
-## Locked-in decisions
+## Verified mechanisms (from mruby 4.0 source research)
 
-- **Zig**: master (0.17.0-dev), tracked with **mise** (`.mise.toml`); pin an exact dev snapshot for reproducibility, `mise up` to move forward. CI uses the same pinned snapshot.
-- **mruby**: **4.0.0** tarball fetched as a `build.zig.zon` dependency (`zig fetch --save`, GitHub release archive). No git submodule, no vendored copy, no rake.
-- **Default gems**: "Standard" set — core + `mruby-compiler` + metaprog (`mruby-metaprog`, `mruby-method`, `mruby-eval`) + stdlib-ext gems (`string/array/hash/enum/range/numeric/class/object/symbol/proc/kernel/toplevel/compar-ext`, `mruby-sprintf`, `mruby-struct`, `mruby-data`, `mruby-random`, `mruby-time`, `mruby-pack`). Configurable via build options; io/socket/dir/errno/print excluded from defaults (portability).
-- **Bindings**: hand-written `extern` declarations in `c.zig` (mruby headers use C bitfields Zig can't represent; avoids deprecated `@cImport`), with an idiomatic safe Zig layer on top.
+- `mrb->code_fetch_hook` (`MRB_USE_DEBUG_HOOK`): NULL-guarded function pointer invoked **once per VM instruction** in both dispatch modes (`src/vm.c:1519-1556`). Raising from the hook is valid — it longjmps to the interpreter's internal `MRB_TRY`, so `rescue`/`ensure` semantics work normally.
+- `mrb_basic_alloc_func` (already ours): every non-object allocation flows through it → per-isolate caps enforced there. On NULL, mruby does full-GC + one retry, then raises pre-allocated `NoMemoryError` (rescuable — so we escalate via sticky flags).
+- `mrb_undef_method` (C-string variant doesn't raise if absent), `mrb_const_remove`, and `mrb_obj_freeze` on core classes (frozen classes raise `FrozenError` from `def`/`include`) → capability stripping.
+- `mrb_dump_irep` / `mrb_load_irep_buf` (buffer APIs, no stdio) → snapshot images. Caveat handled: each irep load leaks one RProc unless arena-rooted.
+- mruby's fixed limits (call depth 512, value stack ~256K) exist; `gc.live` and `ci` depth are readable for per-isolate tighter enforcement.
 
-## How mruby 4.0.0 builds without Ruby (the core problem)
-
-Rake normally generates four things; we generate all of them in Zig:
-
-1. **presym tables** — 4.0 removed `MRB_NO_PRESYM`, so `include/mruby/presym/id.h` + `table.h` must be generated. Rake's algorithm (port from `lib/mruby/presym.rb`): preprocess every C source with `-DMRB_PRESYM_SCANNING` (turns `MRB_SYM(x)` into `<@! "x" !@>` markers), scan `mrblib/*.rb` and gem `.rb` files for symbol names, union all names, sort by (byte-length, name), emit an enum (`MRB_PRESYM__...`) plus length-grouped string tables. Only *internal consistency* is required, not upstream's exact numbering. Exact id assignment is deterministic.
-2. **mrblib bytecode** — build a **host `mrbc`** with `zig cc` (core `src/*.c` + `mrbgems/mruby-compiler/core/{codegen.c,y.tab.c}` + `mrbc.c`, whose checked-in empty `mrb_init_mrblib`/`mrb_init_mrbgems` stubs break the bootstrap cycle), then run it on `mrblib/*.rb` and gem `.rb` files with `-B<sym> -o out.c -S -s` (cdump format, used because presym is on) via `b.addSystemCommand` + `addOutputFileArg` (cached by Zig).
-3. **per-gem `gem_init.c`** — fixed template: `GENERATED_TMP_mrb_<gem>_gem_init/_final` wrapping `mrb_<gem>_gem_init/_final` + `mrb_load_proc`.
-4. **top-level `gem_init.c`** — fixed template: init/final function table driven `mrb_init_mrbgems`.
-
-## Architecture
-
-```
-mruby-zig/
-├── .mise.toml                 # zig master snapshot pin
-├── build.zig                  # full pipeline (below), exposes `mruby` module + static libmruby
-├── build.zig.zon              # fingerprint, deps: mruby 4.0.0 tarball (hash-pinned)
-├── build/                     # build-script modules (@import-ed by build.zig)
-│   ├── gems.zig               # gem catalog: name → {c sources, mrblib rb files, build option sets}
-│   ├── presym.zig             # presym scanner + id.h/table.h emitter
-│   ├── gen.zig                # gem_init/mrblib wrapper C templates
-│   └── sources.zig            # 4.0.0 core/compiler source lists
-├── src/
-│   ├── mruby.zig              # public API root (re-exports)
-│   ├── c.zig                  # hand-written extern bindings (mrb_state opaque-ish, mrb_value extern struct)
-│   ├── vm.zig                 # Vm: init/deinit, Zig-allocator-backed allocf, loadString/loadFile
-│   ├── value.zig              # Value: type queries, to/from int/float/bool/string/symbol/nil
-│   ├── class.zig              # defineClass/defineModule/defineMethod (+ userdata), constants, ivars
-│   ├── data.zig               # mrb_data_object_alloc wrapper: Ruby objects wrapping Zig types
-│   ├── error.zig              # protected evaluation (mrb_protect), exception capture, raise from Zig
-│   ├── arena.zig              # GC arena save/restore scopes (RAII via defer)
-│   ├── convert.zig            # Zig↔Ruby marshaling (primitives, strings, slices, optionals)
-│   └── output.zig             # print/puts redirection to a std.Io.Writer interface
-├── examples/                  # quickstart, host_functions (Ruby→Zig calls), exceptions
-├── tests/                     # unit tests colocated in src files + ruby/ integration scripts
-├── tools/                     # mruby-bin: `zig build mruby-repl` eval/REPL helper
-├── .github/workflows/ci.yml   # linux+macos required / windows best-effort; zig fmt + build + test
-├── README.md, LICENSE (MIT), CHANGELOG.md, .gitignore
-```
-
-**Safe-layer API sketch** (layered: raw `c.zig` stays importable for power users):
+## Public API (new `src/sandbox.zig`)
 
 ```zig
-var vm = try mruby.Vm.init(gpa);       defer vm.deinit();
-const result = try vm.loadString("2 + 2");   // error.RubyException on raise, details via vm.lastException()
-const four = try result.asInt();             // i32
-try vm.class("Math").defineMethod("dist", hostFn, ctx);  // Zig fns callable from Ruby
-var scope = vm.arenaScope(); defer scope.restore();      // GC safety for held Values
+const iso = try mruby.sandbox.Isolate.spawn(.{
+    .limits = .{
+        .instructions  = 10_000_000,            // deterministic gas (v8 has no analog)
+        .wall_time_ns  = 250 * std.time.ns_per_ms,
+        .memory_bytes  = 8 * 1024 * 1024,       // hard per-isolate cap
+        .call_depth    = 64,                    // tighter than mruby's 512
+    },
+    .capabilities = .{
+        .eval = false,                          // Kernel#eval, instance_eval, binding
+        .send = false,                          // send/__send__/public_send
+        .introspection = false,                 // instance_variable_* etc.
+        .object_space = false,                  // ObjectSpace removed
+        .freeze_object_model = true,            // core classes frozen (def → FrozenError)
+        .random_seed = 42,                      // deterministic Random (optional)
+        .clock_epoch_s = 1_700_000_000,         // frozen Time.now (optional)
+    },
+});
+defer iso.deinit();
+
+const result = iso.run(script) catch |err| switch (err) {
+    error.ScriptTerminated,                     // iso.terminate() from any thread
+    error.DeadlineExceeded,
+    error.GasExhausted,
+    error.MemoryLimitExceeded => ...,           // mapped from hidden exception classes
+    error.RubyException => ...,                 // ordinary script error: iso.vm.lastError()
+};
+
+iso.terminate();                    // thread-safe, takes effect next instruction
+_ = iso.stats();                    // .instructions .peak_memory_bytes .peak_call_depth .wall_time_ns
+
+const image = try mruby.sandbox.compile(script);   // []u8 irep binary (snapshot)
+const iso2 = try mruby.sandbox.Isolate.spawn(policy);
+_ = try iso2.runImage(image);                      // no re-parse/compile
 ```
 
-Key design points: `mrb_get_args` variadic bridging via comptime arity switch; method userdata via registered `Data` objects; `mrb_value` extern-struct layout pinned to our chosen boxing config (upstream default, no-boxing) with a **runtime ABI sanity test** (fixnum/float/string roundtrips) to catch any mismatch immediately.
+## Enforcement design
 
-## Build pipeline in build.zig
+**Instruction hook (Zig, `callconv(.c)`)** — installed per isolate:
+- `terminate` atomic checked every instruction (relaxed load, ~free); wall-clock every 1024 instructions; gas decremented per instruction; per-isolate `call_depth` via shim-read ci depth; `gc.live` observed for peak stats.
+- Violations raise dedicated exception classes under a hidden `MRubyZigSandbox::` namespace. Termination is **un-rescuable**: sticky flags make the hook re-raise on the next instruction if a script catches it, while `ensure` blocks still run (better than mruby 4.0's task-stop, which skips them). Our `run()` maps those classes to the distinct Zig errors above.
 
-```
-zon dep mruby 4.0.0 ─► [scan] zig cc -E (presym markers) + .rb token scan ─► generate id.h/table.h
-                  └─► [stage 1] host mrbc (zig cc, MRB_NO_GEMS-ish nested config, own presym set as rake does)
-                        └─► [stage 2] run mrbc on mrblib/*.rb + gem rb files ─► cdump .c files
-                              └─► [stage 3] WriteFiles: gem_init.c wrappers + top-level gem_init.c
-                                    └─► [stage 4] libmruby.a (all C sources + generated, -I include + generated dir)
-                                          └─► [stage 5] `mruby` module (linkLibrary), tests, examples, repl tool
-```
+**Memory caps (in `src/alloc.zig`)** — thread-local "current isolate" cell bracketed at `Isolate` entry points (spawn/run/runImage/call/deinit; sound because a Vm is single-thread-at-a-time, our existing documented constraint). Soft cap → allocation fails once (mruby raises rescuable `NoMemoryError`); sticky soft-OOM seen by the hook escalates to `MemoryLimitExceeded` termination; hard cap → allocator fails permanently + immediate termination. Host gets an `on_limit` callback. Raw `Vm` usage keeps today's global accounting untouched (back-compat).
 
-Implementation details to resolve at start by reading the 4.0.0 tarball (fidelity oracles): `lib/mruby/presym.rb` (exact scanning algorithm), `lib/mruby/build.rb` `create_mrbc_build` (how the nested mrbc build configures presym in 4.0), `include/mruby.h` (whether custom allocf is still installable at open time in 4.0 — `mrb_open_allocf` was removed; if gone, set the `allocf` field directly or fall back to default allocator, decided by what the header exposes), and `tasks/mrblib.rake` cdump wrapper text.
+**Capabilities** — applied after gem init at spawn: `mrb_undef_method` on Kernel/BasicObject per policy, `mrb_const_remove(Object, :ObjectSpace)`, freezing of the core class list when `freeze_object_model`, `srand(seed)` for determinism, and a Zig-defined `Time.now` returning a cached `Time.at(epoch)` when `clock_epoch_s` is set.
 
-## Milestones
+**Documented caveat (same class as v8):** the hook fires only on bytecode — long-running pure-C operations and host Zig callbacks aren't instruction-interruptible; memory caps still bound them, and hosts should keep callbacks bounded.
 
-1. **Scaffold**: git init, `.mise.toml` (zig master snapshot; `mise install`), LICENSE, README stub, `build.zig.zon` with mruby 4.0.0 fetched and hash-pinned, `.gitignore` (`zig-pkg/`, caches).
-2. **Pipeline bring-up**: stage-1 mrbc builds and runs under `zig cc`; presym scanner port + emitters; core+compiler libmruby with stub gems first — validated by a Zig test doing `mrb_open` + eval `"1+1"` == 2.
-3. **Gem machinery**: per-gem mrblib compilation, gem_init generation, Standard set enabled; validate `String#start_with?`, `Struct`, `sprintf`, `Random` etc. work.
-4. **Bindings + safe layer**: `c.zig`, then vm/value/class/data/error/arena/convert/output, with ABI sanity test.
-5. **Tests + examples**: unit tests per file (per-file `refAllDecls`), Ruby integration suite (`tests/ruby/*.rb` run through the VM with Zig-side asserts), three examples.
-6. **Polish**: REPL/eval tool, README (quickstart, gem configuration, API tour, consumer `zig fetch` instructions), CHANGELOG, CI workflow, final `zig fmt` + full `zig build test` green.
+## Implementation steps
 
-## Risks & mitigations
+1. Build/shim/binds: `-DMRB_USE_DEBUG_HOOK` in `build.zig` lib+scan flags; `mrz_set_code_fetch_hook` / `mrz_ci_depth` / `mrz_gc_live` in `src/shim.c`; bind `mrb_undef_method`, `mrb_undef_class_method`, `mrb_const_remove`, `mrb_dump_irep`, `mrb_load_irep_buf` in `src/c.zig`.
+2. `alloc.zig`: per-isolate attribution cells + soft/hard caps + callback (unit-tested independently of mruby).
+3. `sandbox.zig` core: Policy/Isolate/hook/termination classes/error mapping; `Vm` gains an opaque `sandbox_ctx` field for hook→isolate lookup via the existing registry.
+4. Tests: external `terminate()` killing `while true; end`; deadline; exact gas determinism; memory cap with escalation; capability strips (`eval`/`send` → NoMethodError, `ObjectSpace` gone, `def` on frozen core → FrozenError); determinism (seeded Random sequence); nested `run` from a method callback; two isolates on separate threads with different policies; snapshot compile→runImage roundtrip; stats sanity.
+5. Docs: README "Sandboxing" section rewritten around the real API (incl. the process-tier follow-up architecture sketch and the cfunc caveat); CHANGELOG; `zig fmt`; full test + example runs on standard, minimal, and `-Dwithout-gems` configs.
 
-- **Presym port fidelity** → algorithm is small and deterministic; only internal consistency matters; validated by mrblib loading + integration suite. (If Ruby is available locally at dev time, diff against rake output as an oracle; never required for consumer builds.)
-- **Zig master churn** → pin an exact snapshot via mise; keep library code off fragile std surfaces; CI on the pin.
-- **Running mrbc during build** → proven `addSystemCommand` + `addOutputFileArg` pattern, cached.
-- **Windows cross-compile** → Standard gem set avoids io/socket; core should build under `zig cc -target x86_64-windows-gnu`; CI marks Windows best-effort.
+## Out of scope (documented follow-up)
 
-Consumers end up with: `zig fetch --save=mruby https://github.com/<you>/mruby-zig/archive/refs/tags/v0.1.0.tar.gz`, then `exe.root_module.addImport("mruby", b.dependency("mruby", .{}).module("mruby"))` — everything else (fetching mruby, presym, bytecode, compilation) is self-contained in one `zig build`.
+Out-of-process isolates (re-exec worker mode, pipe IPC with run/call/terminate/stats, structured value transfer, crash recovery) — designed to layer on `Isolate` without API changes; irep snapshotting already gives it cheap worker warm-starts.

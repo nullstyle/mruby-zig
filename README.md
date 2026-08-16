@@ -183,20 +183,67 @@ Note that without `mruby-bigint`, integer *literals* beyond the int32 pool
 range raise `RangeError` at load time (upstream 4.0 behavior); computed
 values up to ±2^63 work fine.
 
-## Sandboxing and limits
+## Sandboxing
 
-The default gem set is deliberately **compute-only**: no `io`, `socket`,
-`dir`, `errno`, or process gems, so scripts cannot touch the filesystem,
-network, or spawn processes unless the host adds those gems or exposes
-such capability through Zig methods. What the host must still manage:
+`mruby.sandbox.Isolate` wraps a private `Vm` (its own heap, symbols, and
+globals — nothing is shared between isolates) with an enforced policy:
 
-- **CPU**: an infinite loop in a script cannot be interrupted; run
-  untrusted scripts on a worker thread with your own timeout/kill policy.
-- **Memory**: allocations are observable via `mruby.alloc.liveBytes()` /
-  `liveAllocs()`; enforcing a quota (failing `mrb_basic_alloc_func` past a
-  limit) is a natural extension.
-- Deep recursion is safely caught (mruby raises `SystemStackError`, which
-  surfaces as `error.RubyException` like any other exception).
+```zig
+const iso = try mruby.sandbox.Isolate.spawn(.{
+    .limits = .{
+        .instructions = 10_000_000,           // deterministic gas budget
+        .wall_time_ns = 250 * std.time.ns_per_ms,
+        .memory_bytes = 8 * 1024 * 1024,      // soft cap -> hard cap
+        .call_depth = 64,
+    },
+    .capabilities = .{
+        .eval = false,             // no eval/instance_eval/binding
+        .send = false,             // no send/__send__/public_send
+        .introspection = false,    // no instance_variable_*/methods
+        .object_space = false,     // ObjectSpace removed
+        .freeze_object_model = true, // def/include on core classes -> FrozenError
+        .random_seed = 42,         // reproducible rand sequences
+        .clock_epoch_s = 1_700_000_000, // frozen Time.now
+    },
+});
+defer iso.deinit();
+
+const result = iso.run(script) catch |err| switch (err) {
+    error.ScriptTerminated,   // iso.terminate() from any thread
+    error.DeadlineExceeded,
+    error.GasExhausted,
+    error.MemoryLimitExceeded,
+    error.CallDepthExceeded => ...,
+    error.RubyException => ..., // ordinary script error: iso.lastError()
+};
+```
+
+- **Termination** (`iso.terminate()`) is thread-safe and takes effect at the
+  next interpreter instruction. `ensure` blocks run during unwind; a
+  `rescue` can catch the termination only briefly (a bounded instruction
+  grace), never suppress it — the distinct error always surfaces to the
+  host, and total execution past a termination is bounded
+  (grace + uncovered-wait budgets).
+- **Memory**: the soft cap fails the next allocation (mruby raises the
+  rescuable `NoMemoryError`, then the hook escalates); the hard cap
+  (default soft + max(1 MiB, soft/2)) fails allocations permanently and
+  terminates immediately. `iso.stats()` reports
+  instructions/peak-memory/peak-depth/live-objects/wall-time; the isolate
+  cell exposes an `on_limit` callback for quota accounting.
+- **Snapshots**: `mruby.sandbox.compile(src)` compiles without executing
+  into a Rite irep image; `iso.runImage(image)` runs it (limits apply)
+  with no parse/codegen — the v8-snapshot analogue for mass spawn.
+- **CPU/loops**: the instruction hook fires only on bytecode. Long pure-C
+  operations and host Zig callbacks are not instruction-interruptible
+  (memory caps still bound them); keep callbacks bounded or poll
+  `iso.pendingTermination()` from them.
+
+**Not covered by the in-process tier** (by design, same as v8 isolates):
+no address-space separation from the host. The planned out-of-process
+tier (worker processes with IPC: run/call/terminate/stats plus structured
+value transfer, OS-level memory separation and optional seccomp/pledge)
+fronts this same API; irep snapshots already give those workers cheap
+warm-starts.
 
 ## Layout
 

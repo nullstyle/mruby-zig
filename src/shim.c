@@ -12,9 +12,13 @@
 */
 
 #include <mruby.h>
+#include <mruby/irep.h>
+#include <mruby/internal.h>
 #include <mruby/class.h>
 #include <mruby/error.h>
 #include <mruby/string.h>
+#include <mruby/proc.h>
+#include <mruby/compile.h>
 
 /* ---- GC arena (macros over mrb->gc.arena_idx) ---- */
 
@@ -30,6 +34,47 @@ void mrz_exc_clear(mrb_state *mrb) { mrb->exc = NULL; }
 void mrz_exc_set(mrb_state *mrb, mrb_value exc) {
   if (mrb_immediate_p(exc)) return; /* not a heap object */
   mrb->exc = mrb_obj_ptr(exc);
+}
+
+/* mrb->ud auxiliary pointer (sandbox backreference) */
+void *mrz_get_ud(mrb_state *mrb) { return mrb->ud; }
+void mrz_set_ud(mrb_state *mrb, void *ud) { mrb->ud = ud; }
+
+/* irep of an irep-proc (for snapshot dump) */
+const mrb_irep *mrz_proc_irep(const struct RProc *p) { return p->body.irep; }
+
+/* parse error count */
+int mrz_parse_nerr(const struct mrb_parser_state *p) { return (int)p->nerr; }
+
+/* code fetch hook (only exists under MRB_USE_DEBUG_HOOK, same defines) */
+void mrz_set_code_fetch_hook(mrb_state *mrb, void (*hook)(struct mrb_state*, const struct mrb_irep *, const mrb_code *, mrb_value *)) {
+  mrb->code_fetch_hook = hook;
+}
+
+/* Would an exception raised at this program counter be caught by any
+ * catch handler of this irep? Mirrors catch_handler_find's coverage rule
+ * (pc must be strictly after begin and at/before end), any handler type. */
+int mrz_pc_catchable(const struct mrb_irep *irep, const mrb_code *pc) {
+  if (irep == NULL || irep->clen < 1) return 0;
+  ptrdiff_t xpc = pc - irep->iseq;
+  if (!(xpc > 0 && xpc <= (ptrdiff_t)irep->ilen)) return 0;
+  const struct mrb_irep_catch_handler *e = mrb_irep_catch_handler_table(irep);
+  for (uint16_t i = 0; i < irep->clen; i++, e++) {
+    ptrdiff_t beg = (ptrdiff_t)((uint32_t)e->begin[0] << 24 | (uint32_t)e->begin[1] << 16 | (uint32_t)e->begin[2] << 8 | (uint32_t)e->begin[3]);
+    ptrdiff_t end = (ptrdiff_t)((uint32_t)e->end[0] << 24 | (uint32_t)e->end[1] << 16 | (uint32_t)e->end[2] << 8 | (uint32_t)e->end[3]);
+    if (xpc > beg && xpc <= end) return 1;
+  }
+  return 0;
+}
+
+/* interpreter call depth: ci - cibase */
+int mrz_ci_depth(mrb_state *mrb) {
+  return (int)(mrb->c->ci - mrb->c->cibase);
+}
+
+/* live object count from the GC */
+size_t mrz_gc_live(mrb_state *mrb) {
+  return mrb->gc.live;
 }
 
 /* instance type of a class (MRB_SET_INSTANCE_TT macro) */

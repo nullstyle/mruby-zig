@@ -146,7 +146,14 @@ pub fn build(b: *std.Build) !void {
     }
     for (generated_c.items) |g| try lib_scan.append(arena, .{ .lp = g.lp, .pp_name = g.pp_name });
 
-    const lib_presym_dir = try presymHeaders(b, presym_gen, arena, lib_scan.items, gem_defines.items, root, triple);
+    // Keep the presym scan consistent with the compile-time defines.
+    const lib_scan_defines = defines: {
+        var d: std.ArrayList([]const u8) = .empty;
+        try d.appendSlice(arena, gem_defines.items);
+        try d.append(arena, "-DMRB_USE_DEBUG_HOOK");
+        break :defines d.items;
+    };
+    const lib_presym_dir = try presymHeaders(b, presym_gen, arena, lib_scan.items, lib_scan_defines, root, triple);
 
     // ============================= stage 5 =================================
     // The `mruby` module carries the entire C library (core + compiler +
@@ -157,6 +164,9 @@ pub fn build(b: *std.Build) !void {
     const lib_flags = flags: {
         var f: std.ArrayList([]const u8) = .empty;
         try f.append(arena, "-w");
+        // Enables mrb->code_fetch_hook (NULL-guarded per-instruction call
+        // site) used by the sandboxing layer for limits and termination.
+        try f.append(arena, "-DMRB_USE_DEBUG_HOOK");
         try f.appendSlice(arena, gem_defines.items);
         break :flags f.items;
     };
@@ -177,7 +187,7 @@ pub fn build(b: *std.Build) !void {
         mruby_mod.addCSourceFile(.{ .file = g.lp, .flags = lib_flags });
     }
     // ABI shim: exposes mruby's macro-only inline APIs as plain functions.
-    mruby_mod.addCSourceFile(.{ .file = b.path("src/shim.c"), .flags = &.{"-w"} });
+    mruby_mod.addCSourceFile(.{ .file = b.path("src/shim.c"), .flags = &.{ "-w", "-DMRB_USE_DEBUG_HOOK" } });
     mruby_mod.addIncludePath(try root.join(arena, "include"));
     mruby_mod.addIncludePath(lib_presym_dir);
     for (gem_include_dirs.items) |dir| mruby_mod.addIncludePath(dir);

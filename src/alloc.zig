@@ -45,8 +45,82 @@ pub fn liveAllocs() usize {
     return live_allocs.load(.monotonic);
 }
 
+/// Per-isolate accounting for the sandboxing layer. The allocator
+/// attributes every allocation to the cell installed on the executing
+/// thread (`enter`/`exit`); sound because a Vm/isolate runs on one thread
+/// at a time (the package's standing threading constraint).
+///
+/// Caps are enforced on the post-realloc net usage. Hitting the soft cap
+/// makes the next allocation fail (mruby full-GCs, retries once, then
+/// raises the rescuable NoMemoryError) and sets the sticky `soft_oom` so
+/// the instruction hook can escalate. The hard cap fails permanently.
+pub const IsolateCell = struct {
+    live_bytes: usize = 0,
+    live_allocs: usize = 0,
+    soft_cap: ?usize = null,
+    hard_cap: ?usize = null,
+    soft_oom: bool = false,
+    hard_oom: bool = false,
+    peak_bytes: usize = 0,
+    on_limit: ?*const fn (ctx: ?*anyopaque, kind: LimitKind, attempted: usize) void = null,
+    on_limit_ctx: ?*anyopaque = null,
+
+    pub const LimitKind = enum { soft, hard };
+};
+
+threadlocal var current_cell: ?*IsolateCell = null;
+
+/// Attribute subsequent allocations on this thread to `cell` (nesting is
+/// not supported: one isolate per thread at a time).
+pub fn enterIsolate(cell: *IsolateCell) void {
+    current_cell = cell;
+}
+
+/// Drop attribution on this thread (restores process-global accounting
+/// only).
+pub fn exitIsolate() void {
+    current_cell = null;
+}
+
+/// The isolate currently attributed on this thread, if any.
+pub fn currentIsolateCell() ?*IsolateCell {
+    return current_cell;
+}
+
+/// Internal-use alias so the sandbox (same module family) can route
+/// frees of mruby-allocated buffers through the header-prefixed path.
+pub const mrb_basic_alloc_func_pub = mrb_basic_alloc_func;
+
 export fn mrb_basic_alloc_func(p: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
     any_allocation.store(true, .release);
+
+    // Per-isolate accounting/caps (no-ops without an entered cell). Frees
+    // (size == 0) always proceed — caps only gate allocation/growth.
+    const cell = current_cell;
+    if (cell) |ic| {
+        if (size != 0) {
+            const old: usize = if (p != null) blk: {
+                const raw: [*]u8 = @ptrCast(p.?);
+                break :blk readHeader(raw - header_bytes);
+            } else 0;
+            if (ic.hard_oom) return null;
+            const new_live = ic.live_bytes - old + size;
+            if (ic.hard_cap) |cap| {
+                if (new_live > cap) {
+                    ic.hard_oom = true;
+                    if (ic.on_limit) |cb| cb(ic.on_limit_ctx, .hard, size);
+                    return null;
+                }
+            }
+            if (ic.soft_cap) |cap| {
+                if (new_live > cap) {
+                    ic.soft_oom = true;
+                    if (ic.on_limit) |cb| cb(ic.on_limit_ctx, .soft, size);
+                    return null;
+                }
+            }
+        }
+    }
 
     if (size == 0) {
         if (p) |user_ptr| {
@@ -55,6 +129,10 @@ export fn mrb_basic_alloc_func(p: ?*anyopaque, size: usize) callconv(.c) ?*anyop
             gpa.rawFree(raw[0 .. old + header_bytes], .fromByteUnits(header_align), @returnAddress());
             _ = live_bytes.fetchSub(old, .monotonic);
             _ = live_allocs.fetchSub(1, .monotonic);
+            if (cell) |ic| {
+                ic.live_bytes -|= old;
+                ic.live_allocs -|= 1;
+            }
         }
         return null;
     }
@@ -68,6 +146,10 @@ export fn mrb_basic_alloc_func(p: ?*anyopaque, size: usize) callconv(.c) ?*anyop
             writeHeader(new_raw, size);
             _ = live_bytes.fetchSub(old, .monotonic);
             _ = live_bytes.fetchAdd(size, .monotonic);
+            if (cell) |ic| {
+                ic.live_bytes = ic.live_bytes - old + size;
+                if (ic.live_bytes > ic.peak_bytes) ic.peak_bytes = ic.live_bytes;
+            }
             return @ptrCast(new_raw + header_bytes);
         }
 
@@ -77,6 +159,10 @@ export fn mrb_basic_alloc_func(p: ?*anyopaque, size: usize) callconv(.c) ?*anyop
         writeHeader(new_raw, size);
         _ = live_bytes.fetchSub(old, .monotonic);
         _ = live_bytes.fetchAdd(size, .monotonic);
+        if (cell) |ic| {
+            ic.live_bytes = ic.live_bytes - old + size;
+            if (ic.live_bytes > ic.peak_bytes) ic.peak_bytes = ic.live_bytes;
+        }
         return @ptrCast(new_raw + header_bytes);
     }
 
@@ -84,7 +170,52 @@ export fn mrb_basic_alloc_func(p: ?*anyopaque, size: usize) callconv(.c) ?*anyop
     writeHeader(raw, size);
     _ = live_bytes.fetchAdd(size, .monotonic);
     _ = live_allocs.fetchAdd(1, .monotonic);
+    if (cell) |ic| {
+        ic.live_bytes += size;
+        ic.live_allocs += 1;
+        if (ic.live_bytes > ic.peak_bytes) ic.peak_bytes = ic.live_bytes;
+    }
     return @ptrCast(raw + header_bytes);
+}
+
+test "isolate cells cap attribution without touching global accounting" {
+    const a = std.testing.allocator;
+    const prev = gpa;
+    gpa = a;
+    defer gpa = prev;
+
+    var counts = [2]usize{ 0, 0 };
+    var cell = IsolateCell{
+        .soft_cap = 100,
+        .hard_cap = 200,
+        .on_limit = struct {
+            fn cb(ctx: ?*anyopaque, kind: IsolateCell.LimitKind, attempted: usize) void {
+                const seen: *[2]usize = @ptrCast(@alignCast(ctx.?));
+                seen[@backingInt(kind)] += attempted;
+            }
+        }.cb,
+        .on_limit_ctx = &counts,
+    };
+    enterIsolate(&cell);
+    defer exitIsolate();
+
+    const p1 = mrb_basic_alloc_func(null, 60) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 60), cell.live_bytes);
+    // net 60+60 > soft(100): soft refusal, sticky flag, no allocation
+    try std.testing.expect(mrb_basic_alloc_func(null, 60) == null);
+    try std.testing.expect(cell.soft_oom);
+    try std.testing.expect(!cell.hard_oom);
+    try std.testing.expectEqual(@as(usize, 60), counts[0]);
+    // free path always works, even under sticky soft oom
+    _ = mrb_basic_alloc_func(p1, 0);
+    try std.testing.expectEqual(@as(usize, 0), cell.live_bytes);
+    cell.soft_oom = false; // reset stickiness for the hard-cap check
+    // 250 > hard(200): permanent refusal
+    try std.testing.expect(mrb_basic_alloc_func(null, 250) == null);
+    try std.testing.expect(cell.hard_oom);
+    try std.testing.expect(mrb_basic_alloc_func(null, 1) == null); // sticky
+    try std.testing.expectEqual(@as(usize, 250), counts[1]);
+    try std.testing.expectEqual(@as(usize, 60), cell.peak_bytes);
 }
 
 fn writeHeader(raw: [*]u8, size: usize) void {

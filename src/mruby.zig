@@ -23,6 +23,7 @@ pub const data = @import("data.zig");
 pub const output = @import("output.zig");
 pub const convert = @import("convert.zig");
 pub const alloc = @import("alloc.zig");
+pub const sandbox = @import("sandbox.zig");
 
 /// Raw C bindings + shim; public for power users, but the safe layer above
 /// is the supported surface.
@@ -36,4 +37,5 @@ test {
     _ = @import("class.zig");
     _ = @import("convert.zig");
     _ = @import("alloc.zig");
+    _ = @import("sandbox.zig");
 }

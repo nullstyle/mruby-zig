@@ -447,6 +447,263 @@ test "init failure diagnostics are queryable" {
     _ = mruby.Vm.lastInitFailure();
 }
 
+// ---- sandboxing ---------------------------------------------------------------
+
+const sandbox = mruby.sandbox;
+
+test "sandbox: external terminate stops an infinite loop" {
+    const iso = try sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+
+    const Stopper = struct {
+        fn run(target: *sandbox.Isolate) void {
+            mruby.sandbox.sleepNs(80 * std.time.ns_per_ms);
+            target.terminate();
+        }
+    };
+    var t = try std.Thread.spawn(.{}, Stopper.run, .{iso});
+    defer t.join();
+
+    try std.testing.expectError(error.ScriptTerminated, iso.run("while true; end"));
+}
+
+test "sandbox: wall-clock deadline" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .wall_time_ns = 60 * std.time.ns_per_ms } });
+    defer iso.deinit();
+    try std.testing.expectError(error.DeadlineExceeded, iso.run("while true; end"));
+}
+
+test "sandbox: instruction gas exhausts and is deterministic" {
+    const script = "x = 0\nwhile x < 500\n  x += 1\nend\nx";
+    const iso1 = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 100_000 } });
+    defer iso1.deinit();
+    const r = try iso1.run(script);
+    try std.testing.expectEqual(@as(i64, 500), try r.asInt());
+
+    const iso2 = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 100_000 } });
+    defer iso2.deinit();
+    _ = try iso2.run(script);
+    try std.testing.expectEqual(iso1.instr_count, iso2.instr_count);
+
+    const iso3 = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 200 } });
+    defer iso3.deinit();
+    try std.testing.expectError(error.GasExhausted, iso3.run(script));
+}
+
+test "sandbox: un-rescuable termination still runs ensure" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 5_000 } });
+    defer iso.deinit();
+    // An unfinishable counted loop (an empty `while true; end` compiles to
+    // a jump-to-self at the catch region start, where no raise can be
+    // delivered catchably — see sandbox.zig).
+    try std.testing.expectError(error.GasExhausted, iso.run(
+        \\$ensured = false
+        \\y = 0
+        \\begin
+        \\  while y < 1000000000
+        \\    y += 1
+        \\  end
+        \\ensure
+        \\  $ensured = true
+        \\end
+    ));
+    const ensured = try iso.vm.getGlobal("ensured");
+    try std.testing.expect(ensured.isTruthy());
+}
+
+test "sandbox: termination cannot be suppressed by rescue" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 3_000 } });
+    defer iso.deinit();
+    // A rescue that catches the termination grants only a bounded grace
+    // budget of further execution (handler + immediate continuation);
+    // the termination always surfaces to the host.
+    try std.testing.expectError(error.GasExhausted, iso.run(
+        \\$after = false
+        \\y = 0
+        \\begin
+        \\  while y < 1000000000
+        \\    y += 1
+        \\  end
+        \\rescue Exception
+        \\  $after = :rescued
+        \\end
+        \\$after = :continued
+    ));
+    // Bounded execution: the run cannot have looped or continued freely.
+    try std.testing.expect(iso.instr_count <= 3_000 + 2_048);
+
+    // And a long post-rescue continuation is cut off by the grace budget.
+    const iso2 = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 3_000 } });
+    defer iso2.deinit();
+    try std.testing.expectError(error.GasExhausted, iso2.run(
+        \\y = 0
+        \\begin
+        \\  while y < 1000000000
+        \\    y += 1
+        \\  end
+        \\rescue Exception
+        \\  z = 0
+        \\  while z < 1000000000
+        \\    z += 1
+        \\  end
+        \\end
+    ));
+    try std.testing.expect(iso2.instr_count <= 3_000 + 1_024 + 4_096 + 64);
+}
+
+test "sandbox: memory cap escalates to MemoryLimitExceeded" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .memory_bytes = 2 * 1024 * 1024 } });
+    defer iso.deinit();
+    // Grow a string well past the cap; the host survives.
+    try std.testing.expectError(error.MemoryLimitExceeded, iso.run(
+        \\s = ""
+        \\2000.times { s += "0123456789abcdef0123456789abcdef" }
+        \\s.size
+    ));
+    try std.testing.expect(iso.cell.soft_oom or iso.cell.hard_oom);
+}
+
+test "sandbox: call-depth limit" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .call_depth = 8 } });
+    defer iso.deinit();
+    try std.testing.expectError(error.CallDepthExceeded, iso.run(
+        \\def r(n)
+        \\  r(n + 1)
+        \\end
+        \\r(0)
+    ));
+}
+
+test "sandbox: capabilities strip eval, send, introspection, ObjectSpace" {
+    const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{
+        .eval = false,
+        .send = false,
+        .introspection = false,
+        .object_space = false,
+    } });
+    defer iso.deinit();
+
+    try std.testing.expectError(error.RubyException, iso.run("eval('1 + 1')"));
+    iso.vm.clearError();
+    try std.testing.expectError(error.RubyException, iso.run("[1, 2].send(:size)"));
+    iso.vm.clearError();
+    try std.testing.expectError(error.RubyException, iso.run("@x = 1; instance_variable_get(:@x)"));
+    iso.vm.clearError();
+    // mruby's `defined?` on a removed constant raises NameError (not nil);
+    // either way, the constant is unreachable from scripts.
+    const gone = try iso.run(
+        \\begin
+        \\  ObjectSpace
+        \\  :reachable
+        \\rescue NameError
+        \\  :gone
+        \\end
+    );
+    const gone_sym = try iso.call(gone, "to_s", .{});
+    try std.testing.expectEqualStrings("gone", try gone_sym.asString());
+}
+
+test "sandbox: frozen object model blocks def on core classes" {
+    const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .freeze_object_model = true } });
+    defer iso.deinit();
+    try std.testing.expectError(error.RubyException, iso.run("class String; def boom; end; end"));
+    const exc = iso.lastError().?;
+    const cls = exc.className();
+    defer mruby.alloc.gpa.free(cls);
+    try std.testing.expectEqualStrings("FrozenError", cls);
+}
+
+test "sandbox: deterministic RNG and frozen clock" {
+    const run_pair = struct {
+        fn sample(seed: u64) !i64 {
+            const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .random_seed = seed } });
+            defer iso.deinit();
+            const v = try iso.run("rand(1 << 40)");
+            return v.asInt();
+        }
+    }.sample;
+    try std.testing.expectEqual(try run_pair(42), try run_pair(42));
+
+    const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .clock_epoch_s = 1_700_000_000 } });
+    defer iso.deinit();
+    const t = try iso.run("Time.now.to_i");
+    try std.testing.expectEqual(@as(i64, 1_700_000_000), try t.asInt());
+    const same = try iso.run("Time.now.equal?(MRubyZigSandbox::FROZEN_TIME)");
+    try std.testing.expect(same.isTruthy());
+}
+
+test "sandbox: nested run from a method callback" {
+    const iso = try sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+
+    const Outer = struct {
+        var inner: ?*sandbox.Isolate = null;
+        fn call(m: *mruby.Vm, self: mruby.Value, n: i64) anyerror!mruby.Value {
+            _ = self;
+            const r = inner.?.run("'nested'") catch return error.NestedFailed;
+            const s = r.asString() catch return error.NestedFailed;
+            _ = m.stringValue(s);
+            return m.intValue(n * 2);
+        }
+    };
+    Outer.inner = iso;
+    const cls = try iso.vm.defineClass("Nested", null);
+    cls.defineMethod("scale", "i", Outer.call);
+
+    const r = try iso.run("Nested.new.scale(21)");
+    try std.testing.expectEqual(@as(i64, 42), try r.asInt());
+}
+
+test "sandbox: concurrent isolates with independent policies" {
+    const Worker = struct {
+        fn gasLimited() !void {
+            const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 500 } });
+            defer iso.deinit();
+            try std.testing.expectError(error.GasExhausted, iso.run("while true; end"));
+        }
+        fn unlimited() !void {
+            const iso = try sandbox.Isolate.spawn(.{});
+            defer iso.deinit();
+            const v = try iso.run("(1..20).reduce(:+)");
+            if (try v.asInt() != 210) return error.TestUnexpectedResult;
+        }
+    };
+    var t1 = try std.Thread.spawn(.{}, Worker.gasLimited, .{});
+    var t2 = try std.Thread.spawn(.{}, Worker.unlimited, .{});
+    t1.join();
+    t2.join();
+}
+
+test "sandbox: irep snapshots compile and run" {
+    const image = try sandbox.compile("[1, 2, 3].map { |x| x * x }");
+    defer mruby.alloc.gpa.free(image);
+
+    const iso = try sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+    const r = try iso.runImage(image);
+    const arr = try iso.call(r, "join", .{iso.vm.stringValue(",")});
+    const str = try arr.asString();
+    try std.testing.expectEqualStrings("1,4,9", str);
+
+    // gas limits apply to image runs too
+    const iso2 = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 10 } });
+    defer iso2.deinit();
+    try std.testing.expectError(error.GasExhausted, iso2.runImage(image));
+
+    try std.testing.expectError(error.CompileFailed, sandbox.compile("def oops("));
+}
+
+test "sandbox: stats reflect execution" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .memory_bytes = 64 * 1024 * 1024 } });
+    defer iso.deinit();
+    _ = try iso.run("a = []\n1000.times { a << 'x' }\na.size");
+    const s = iso.stats();
+    try std.testing.expect(s.instructions > 1000);
+    try std.testing.expect(s.peak_memory_bytes > 0);
+    try std.testing.expect(s.live_objects > 0);
+    try std.testing.expect(!s.soft_memory_limit_hit);
+}
+
 // ---- allocator ---------------------------------------------------------------
 
 test "live allocations return to zero after teardown" {

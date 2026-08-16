@@ -41,3 +41,22 @@ Code-review hardening:
   semantics); `mrz_exc_set` ignores immediate values.
 - Presym scanner octal-escape handling now matches `presym.rb` exactly
   (`\0` + up to three digits).
+
+Sandboxing (v8-isolate parity and beyond):
+
+- `mruby.sandbox.Isolate`: private heap per isolate with enforced limits —
+  deterministic instruction gas, wall-clock deadlines, soft/hard
+  per-isolate memory caps with escalation, and call-depth ceilings.
+- Thread-safe `terminate()` delivered via the per-instruction fetch hook
+  (`MRB_USE_DEBUG_HOOK`): ensure blocks run, rescue cannot suppress, and
+  execution past a termination is bounded. Distinct Zig errors
+  (`ScriptTerminated`, `DeadlineExceeded`, `GasExhausted`,
+  `MemoryLimitExceeded`, `CallDepthExceeded`).
+- Capability model: strip eval/send/introspection/ObjectSpace, freeze the
+  core object model (`def` → FrozenError), pin RNG seed and clock for
+  reproducible runs.
+- `sandbox.compile`/`runImage`: precompiled irep snapshots for cheap
+  mass-spawn; limits apply to image runs.
+- `Isolate.stats()` (instructions, peak/live memory, peak depth, live
+  objects, wall time) and an allocator `on_limit` callback; concurrent
+  isolates with independent policies tested on separate threads.
