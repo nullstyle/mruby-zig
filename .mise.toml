@@ -1,0 +1,4 @@
+# Toolchain: track Zig master during development.
+# `mise install` resolves master to the current snapshot; `mise up` moves forward.
+[tools]
+zig = "master"

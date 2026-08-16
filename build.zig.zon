@@ -1,0 +1,22 @@
+.{
+    .name = .mruby_zig,
+    .version = "0.1.0",
+    .fingerprint = 0x71fe1b4dbfa0a63,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "build",
+        "src",
+        "examples",
+        "tests",
+        "tools",
+        "LICENSE",
+        "README.md",
+    },
+    .dependencies = .{
+        .mruby = .{
+            .url = "https://github.com/mruby/mruby/archive/refs/tags/4.0.0.tar.gz",
+            .hash = "N-V-__8AANTiWAB7SfrLfA6pKTaZPFOZT4biv9oK15dP3zUP",
+        },
+    },
+}

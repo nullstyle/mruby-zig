@@ -1,0 +1,11 @@
+# Zig build artifacts
+.zig-cache/
+zig-cache/
+zig-out/
+zig-pkg/
+
+# mise
+.mise.local.toml
+
+# macOS
+.DS_Store
