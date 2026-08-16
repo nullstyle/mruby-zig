@@ -7,6 +7,41 @@ test {
     _ = mruby;
 }
 
+// ---- ruby integration suite ----------------------------------------------
+
+const ruby_suites = .{
+    .{ .name = "core_language", .src = @embedFile("tests_ruby/core_language.rb") },
+    .{ .name = "numerics", .src = @embedFile("tests_ruby/numerics.rb") },
+};
+
+test "ruby integration suite" {
+    inline for (ruby_suites) |suite| {
+        const vm = try mruby.Vm.init();
+        defer vm.deinit();
+        _ = vm.loadString(suite.src) catch {
+            const exc = vm.lastError().?;
+            const cls = exc.className();
+            defer mruby.alloc.gpa.free(cls);
+            const msg = exc.message();
+            defer mruby.alloc.gpa.free(msg);
+            std.debug.print("ruby suite '{s}' failed: {s}: {s}\n", .{ suite.name, cls, msg });
+            // Bisect: report the first failing line.
+            var it = std.mem.splitScalar(u8, suite.src, '\n');
+            var line_no: usize = 0;
+            while (it.next()) |line| : (line_no += 1) {
+                if (line.len == 0) continue;
+                const line_vm = mruby.Vm.init() catch break;
+                defer line_vm.deinit();
+                _ = line_vm.loadString(line) catch {
+                    std.debug.print("  first failing line {d}: {s}\n", .{ line_no + 1, line });
+                    break;
+                };
+            }
+            return error.RubySuiteFailed;
+        };
+    }
+}
+
 // ---- evaluation ----------------------------------------------------------
 
 test "evaluates arithmetic" {

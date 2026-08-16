@@ -195,7 +195,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_unit_tests.step);
 
     // Examples.
-    const ex_names = [_][]const u8{ "quickstart", "debug" };
+    const ex_names = [_][]const u8{ "quickstart", "host_functions", "exceptions" };
     for (ex_names) |ex_name| {
         const ex_mod = b.createModule(.{
             .root_source_file = b.path(b.fmt("examples/{s}.zig", .{ex_name})),
@@ -205,6 +205,11 @@ pub fn build(b: *std.Build) !void {
         ex_mod.addImport("mruby", mruby_mod);
         const ex = b.addExecutable(.{ .name = ex_name, .root_module = ex_mod });
         b.installArtifact(ex);
+
+        const run_cmd = b.addRunArtifact(ex);
+        run_cmd.step.dependOn(b.getInstallStep());
+        const run_step = b.step(b.fmt("run-{s}", .{ex_name}), b.fmt("run the {s} example", .{ex_name}));
+        run_step.dependOn(&run_cmd.step);
     }
 }
 

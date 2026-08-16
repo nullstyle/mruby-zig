@@ -79,7 +79,17 @@ pub const Vm = struct {
     /// expression. All Ruby exceptions (compile or runtime) are reported as
     /// `error.RubyException`; call `vm.lastError()` for details.
     pub fn loadString(vm: *Vm, src: []const u8) !Value {
-        var ctx = ProtectedLoad{ .src = src };
+        // mruby's lexer reads to a NUL sentinel (mrb_load_nstring's length is
+        // not a hard bound in 4.0), so the source is always copied into a
+        // NUL-terminated buffer first.
+        var stack_buf: [4096]u8 = undefined;
+        const taken = src.len < stack_buf.len;
+        const buf = if (taken) stack_buf[0..] else try alloc_mod.gpa.alloc(u8, src.len + 1);
+        defer if (!taken) alloc_mod.gpa.free(buf);
+        @memcpy(buf[0..src.len], src);
+        buf[src.len] = 0;
+
+        var ctx = ProtectedLoad{ .src = @as([*:0]const u8, @ptrCast(buf.ptr)) };
         const ai = c.mrz_gc_arena_save(vm.mrb);
         defer c.mrz_gc_arena_restore(vm.mrb, ai);
 
@@ -97,12 +107,12 @@ pub const Vm = struct {
         return .{ .mrb = vm.mrb, .v = v };
     }
 
-    const ProtectedLoad = struct { src: []const u8 };
+    const ProtectedLoad = struct { src: [*:0]const u8 };
 
     fn protectedLoad(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
         const m = mrb orelse return c.mrz_nil_value();
         const ctx: *ProtectedLoad = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
-        return c.mrb_load_nstring(m, ctx.src.ptr, ctx.src.len);
+        return c.mrb_load_string(m, ctx.src);
     }
 
     // ---- calling Ruby from Zig -------------------------------------------
