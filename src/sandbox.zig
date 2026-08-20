@@ -257,7 +257,11 @@ pub const Isolate = struct {
         try iso.prepare();
         return iso.bracketed(struct {
             fn body(iso_: *Isolate, image_: []const u8) !Value {
-                return Value{ .mrb = iso_.vm.mrb, .v = c.mrb_load_irep_buf(iso_.vm.mrb, image_.ptr, image_.len) };
+                // loadIrep runs under mrb_protect_error and checks mrb->exc, so
+                // a raising image surfaces as error.RubyException (mapped to a
+                // termination error when a limit fired) instead of returning
+                // the exception as a success value and poisoning the next run.
+                return iso_.vm.loadIrep(image_);
             }
         }.body, image);
     }

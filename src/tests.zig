@@ -854,3 +854,19 @@ test "alloc: shrinking realloc via the copy path preserves bytes" {
     try std.testing.expectEqual(@as(u8, 0xCD), b2[7]);
     _ = mruby.alloc.mrb_basic_alloc_func_pub(p2, 0);
 }
+
+test "sandbox: runImage surfaces an uncaught exception without poisoning the isolate" {
+    const image = try sandbox.compile("raise 'boom'");
+    defer mruby.alloc.gpa.free(image);
+    const iso = try sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+    // Pre-fix, runImage returned the RuntimeError as a successful Value and
+    // left mrb->exc pending. It must now report the raise as an error.
+    try std.testing.expectError(error.RubyException, iso.runImage(image));
+    const msg = iso.lastError().?.message();
+    defer mruby.alloc.gpa.free(msg);
+    try std.testing.expectEqualStrings("boom", msg);
+    // And the stale exception must not leak into the next run.
+    const ok = try iso.run("1 + 2");
+    try std.testing.expectEqual(@as(i64, 3), try ok.asInt());
+}

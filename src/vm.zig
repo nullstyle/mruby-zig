@@ -151,6 +151,36 @@ pub const Vm = struct {
         return c.mrb_load_string(m, ctx.src);
     }
 
+    /// Load and execute a compiled irep image (see `sandbox.compile`). Same
+    /// error and GC-rooting semantics as `loadString`: an uncaught exception
+    /// is reported as `error.RubyException` (never returned as a value), and
+    /// the pending exception is left set for `lastError()` rather than
+    /// leaking into the next call.
+    pub fn loadIrep(vm: *Vm, image: []const u8) !Value {
+        var ctx = ProtectedIrep{ .ptr = image.ptr, .len = image.len };
+        var err = false;
+        const v = c.mrb_protect_error(vm.mrb, protectedIrep, &ctx, &err);
+        if (err) {
+            c.mrz_exc_set(vm.mrb, v);
+            return error.RubyException;
+        }
+        // mrb_load_irep_buf returns the uncaught exception object as its result
+        // and leaves mrb->exc set (no longjmp), so this check — not `err` — is
+        // what catches a raising image.
+        if (!c.mrz_nil_p(c.mrz_exc_value(vm.mrb))) {
+            return error.RubyException;
+        }
+        return .{ .mrb = vm.mrb, .v = v };
+    }
+
+    const ProtectedIrep = struct { ptr: [*]const u8, len: usize };
+
+    fn protectedIrep(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
+        const m = mrb orelse return c.mrz_nil_value();
+        const ctx: *ProtectedIrep = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
+        return c.mrb_load_irep_buf(m, ctx.ptr, ctx.len);
+    }
+
     // ---- calling Ruby from Zig -------------------------------------------
 
     /// Call `name` on `recv` with up to 8 positional arguments (any type
