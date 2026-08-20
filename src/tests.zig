@@ -870,3 +870,30 @@ test "sandbox: runImage surfaces an uncaught exception without poisoning the iso
     const ok = try iso.run("1 + 2");
     try std.testing.expectEqual(@as(i64, 3), try ok.asInt());
 }
+
+test "sandbox: wall_time_ns is recorded even when a run is terminated" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .wall_time_ns = 20 * std.time.ns_per_ms } });
+    defer iso.deinit();
+    try std.testing.expectError(error.DeadlineExceeded, iso.run("while true; end"));
+    // Pre-fix, elapsed_ns was assigned only on the success path, so a killed
+    // run reported 0. A deadline kill runs for about the budget.
+    try std.testing.expect(iso.stats().wall_time_ns >= 10 * std.time.ns_per_ms);
+}
+
+test "class: bool 'b' method argument round-trips" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+    const cls = try vm.defineClass("Flag", null);
+    // The documented 'b' spec was a compile error (bool != 0), so any method
+    // using it failed to build. Exercise it here.
+    cls.defineMethod("check", "b", struct {
+        fn f(m: *mruby.Vm, self: mruby.Value, flag: bool) anyerror!mruby.Value {
+            _ = self;
+            return m.stringValue(if (flag) "yes" else "no");
+        }
+    }.f);
+    const yes = try vm.loadString("Flag.new.check(true)");
+    try std.testing.expectEqualStrings("yes", try yes.asString());
+    const no = try vm.loadString("Flag.new.check(false)");
+    try std.testing.expectEqualStrings("no", try no.asString());
+}

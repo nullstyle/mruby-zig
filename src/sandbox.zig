@@ -316,6 +316,13 @@ pub const Isolate = struct {
     fn prepare(iso: *Isolate) !void {
         if (iso.capabilities_applied) return;
         iso.capabilities_applied = true;
+        // Attribute capability-application allocations (frozen-clock Time
+        // object, srand state, method (un)defs, freezes) to the isolate's
+        // cell so they count toward the memory caps and stats, like the
+        // bootstrap allocations spawn() folds in. This runs before bracketed()
+        // enters the cell, so without it these leaked to global accounting.
+        alloc_mod.enterIsolate(&iso.cell);
+        defer alloc_mod.exitIsolate();
         const caps_result: anyerror!void = iso.applyCapabilities();
         caps_result catch |err| switch (err) {
             error.RubyException => {
@@ -349,6 +356,10 @@ pub const Isolate = struct {
         } else if (iso.start_ns == 0) {
             iso.start_ns = monotonicNs();
         }
+        // Record wall time on every exit path (success, script error, and
+        // termination) — a supervisor reads stats().wall_time_ns precisely
+        // after a kill, where the old success-only assignment left it stale.
+        defer iso.elapsed_ns = @intCast(@max(0, monotonicNs() - iso.start_ns));
 
         alloc_mod.enterIsolate(&iso.cell);
         defer alloc_mod.exitIsolate();
@@ -361,7 +372,6 @@ pub const Isolate = struct {
         if (iso.terminate_flag.load(.acquire)) {
             return terminationError(@fromBackingInt(@intCast(iso.pending_kind.load(.monotonic))));
         }
-        iso.elapsed_ns = @intCast(@max(0, monotonicNs() - iso.start_ns));
         return result;
     }
 

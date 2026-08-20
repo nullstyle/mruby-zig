@@ -313,7 +313,7 @@ fn Wrap(comptime fmt: []const u8, comptime func: anytype) type {
             const v = switch (specs[i]) {
                 .int_ => @as(i64, slots.ints[S.ordinal(.int_, i)]),
                 .float => @as(f64, slots.floats[S.ordinal(.float, i)]),
-                .boolean => slots.bools[S.ordinal(.boolean, i)] != 0,
+                .boolean => slots.bools[S.ordinal(.boolean, i)],
                 .nsymbol => @as(u32, slots.syms[S.ordinal(.nsymbol, i)]),
                 .object => @as(Value, .{ .mrb = vm.mrb, .v = slots.objs[S.ordinal(.object, i)] }),
                 .stringval => blk: {
