@@ -218,6 +218,15 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "run unit and integration tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // The integration suite above roots at src/tests.zig and pulls in the
+    // library as an imported module, so Zig never collects the `test` blocks
+    // that live *inside* the mruby module (src/convert.zig, src/alloc.zig,
+    // ...). Run those with the module itself as the test root; src/mruby.zig's
+    // aggregator (`_ = @import(...)`) reaches every test-bearing file.
+    const mod_tests = b.addTest(.{ .root_module = mruby_mod });
+    const run_mod_tests = b.addRunArtifact(mod_tests);
+    test_step.dependOn(&run_mod_tests.step);
+
     // Examples.
     const ex_names = [_][]const u8{ "quickstart", "host_functions", "exceptions" };
     for (ex_names) |ex_name| {

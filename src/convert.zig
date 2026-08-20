@@ -60,13 +60,11 @@ pub fn fromValue(comptime T: type, v: Value) !T {
         .optional => |opt| if (v.isNil()) null else try fromValue(opt.child, v),
         .pointer => |info| switch (info.size) {
             .slice => blk: {
-                if (info.size == .slice) {
-                    const Elem = @typeInfo(T).pointer.child;
-                    if (Elem == u8 and info.is_const) {
-                        if (!c.mrz_string_p(v.v)) return error.TypeMismatch;
-                        const p = c.mrz_string_ptr(v.v) orelse return error.TypeMismatch;
-                        break :blk p[0..@intCast(c.mrz_string_len(v.v))];
-                    }
+                const Elem = info.child;
+                if (Elem == u8 and info.attrs.@"const") {
+                    if (!c.mrz_string_p(v.v)) return error.TypeMismatch;
+                    const p = c.mrz_string_ptr(v.v) orelse return error.TypeMismatch;
+                    break :blk p[0..@intCast(c.mrz_string_len(v.v))];
                 }
                 @compileError("unsupported slice type for fromValue: " ++ @typeName(T));
             },
@@ -80,7 +78,7 @@ test "int roundtrip" {
     const mruby = @import("mruby.zig");
     const vm = try mruby.Vm.init();
     defer vm.deinit();
-    const v = toValue(vm.mrb, @as(i32, -42));
+    const v = try toValue(vm.mrb, @as(i32, -42));
     try std.testing.expectEqual(@as(i32, -42), try fromValue(i32, v));
     try std.testing.expectEqual(@as(i64, -42), try fromValue(i64, v));
 }
@@ -89,11 +87,11 @@ test "float and bool roundtrip" {
     const mruby = @import("mruby.zig");
     const vm = try mruby.Vm.init();
     defer vm.deinit();
-    const f = toValue(vm.mrb, 3.25);
+    const f = try toValue(vm.mrb, @as(f64, 3.25));
     try std.testing.expectEqual(@as(f64, 3.25), try fromValue(f64, f));
 
-    const t = toValue(vm.mrb, true);
-    const nul = toValue(vm.mrb, null);
+    const t = try toValue(vm.mrb, true);
+    const nul = try toValue(vm.mrb, null);
     try std.testing.expectEqual(true, try fromValue(bool, t));
     try std.testing.expectEqual(false, try fromValue(bool, nul));
     try std.testing.expectEqual(@as(?i64, null), try fromValue(?i64, nul));
@@ -103,9 +101,9 @@ test "string roundtrip" {
     const mruby = @import("mruby.zig");
     const vm = try mruby.Vm.init();
     defer vm.deinit();
-    const s = toValue(vm.mrb, @as([]const u8, "hello"));
+    const s = try toValue(vm.mrb, @as([]const u8, "hello"));
     try std.testing.expectEqualStrings("hello", try fromValue([]const u8, s));
-    const empty = toValue(vm.mrb, @as([]const u8, ""));
+    const empty = try toValue(vm.mrb, @as([]const u8, ""));
     try std.testing.expectEqualStrings("", try fromValue([]const u8, empty));
 }
 
@@ -116,6 +114,6 @@ test "big integers survive heap boxing" {
     // 2^62 does not fit an inline word-boxed fixnum; exercises the heap
     // RInteger path through the shim.
     const big: i64 = std.math.maxInt(i64);
-    const v = toValue(vm.mrb, big);
+    const v = try toValue(vm.mrb, big);
     try std.testing.expectEqual(big, try fromValue(i64, v));
 }
