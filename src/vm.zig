@@ -123,9 +123,12 @@ pub const Vm = struct {
         buf[src.len] = 0;
 
         var ctx = ProtectedLoad{ .src = @as([*:0]const u8, @ptrCast(buf.ptr)) };
-        const ai = c.mrz_gc_arena_save(vm.mrb);
-        defer c.mrz_gc_arena_restore(vm.mrb, ai);
-
+        // mrb_protect_error already restores the arena to its own entry index
+        // and re-roots `v` via mrb_gc_protect, so the result is left rooted at
+        // exactly one arena slot. An outer save+restore here would pop that
+        // slot, un-rooting the returned Value (a use-after-free once a later
+        // allocation triggers GC). Callers that loop should bound growth with
+        // `vm.arenaScope()`.
         var err = false;
         const v = c.mrb_protect_error(vm.mrb, protectedLoad, &ctx, &err);
         if (err) {
@@ -170,9 +173,9 @@ pub const Vm = struct {
         }
 
         const ctx = ProtectedCall{ .recv = recv.v, .sym = sym, .argc = n, .argv = argv };
-        const ai = c.mrz_gc_arena_save(vm.mrb);
-        defer c.mrz_gc_arena_restore(vm.mrb, ai);
-
+        // mrb_protect_error re-roots its result in the arena; an outer
+        // save+restore would pop that slot and un-root the returned Value.
+        // See loadString for the full rationale.
         var err = false;
         const v = c.mrb_protect_error(vm.mrb, protectedCall, @ptrCast(@constCast(&ctx)), &err);
         if (err) {

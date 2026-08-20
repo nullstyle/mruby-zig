@@ -148,9 +148,10 @@ defaults to the thread-safe `std.heap.c_allocator`.
 
 Two lifetime rules keep you safe:
 
-- Values returned by `loadString` are not GC-rooted once the call returns;
-  root anything you keep across further Ruby execution (a global/ivar, or
-  a `vm.arenaScope()` around a tight loop of calls).
+- Values returned by `loadString`/`call` stay GC-rooted in the arena, so
+  they are safe to hold across further Ruby execution. Each returned value
+  occupies one arena slot, so bracket a tight loop of calls with
+  `vm.arenaScope()` to keep the arena from growing.
 - String slices are **borrowed**: `Value.asString`, the `S`/`s`/`z` method
   parameters, and `Rest.get` point into the Ruby heap and are valid only
   until the next interpreter call — use `Value.dupeString(allocator)` to

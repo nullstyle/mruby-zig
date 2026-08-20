@@ -318,6 +318,11 @@ fn Wrap(comptime fmt: []const u8, comptime func: anytype) type {
                 .object => @as(Value, .{ .mrb = vm.mrb, .v = slots.objs[S.ordinal(.object, i)] }),
                 .stringval => blk: {
                     const sv = slots.strs[S.ordinal(.stringval, i)];
+                    // An omitted optional 'S' leaves the slot at nil (its
+                    // init value); mrz_string_ptr applies RSTRING_PTR to the
+                    // value and would deref a non-string, so gate on the type
+                    // first and yield the empty-string default.
+                    if (!c.mrz_string_p(sv)) break :blk @as([]const u8, "");
                     const p = c.mrz_string_ptr(sv) orelse break :blk @as([]const u8, "");
                     break :blk p[0..@intCast(c.mrz_string_len(sv))];
                 },

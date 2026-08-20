@@ -63,7 +63,9 @@ pub const Limits = struct {
 /// already compute-only (no io/socket/dir/process); these strip
 /// language-level escape hatches and ambient introspection.
 pub const Capabilities = struct {
-    /// Kernel#eval / #instance_eval / #instance_exec / #binding.
+    /// Strip the string-eval and metaprogramming-eval entry points:
+    /// Kernel#eval / #binding, BasicObject#instance_eval / #instance_exec,
+    /// and Module#class_eval / #module_eval.
     eval: bool = true,
     /// send / __send__ / public_send.
     send: bool = true,
@@ -322,6 +324,16 @@ pub const Isolate = struct {
 
     fn bracketed(iso: *Isolate, comptime body: anytype, ctx: anytype) !Value {
         if (iso.running) return body(iso, ctx); // nested: already bracketed
+        // A terminated isolate is dead for good: refuse further script and
+        // re-report the termination. Without this, a re-entered run()/call()
+        // resets grace_armed and re-arms a fresh handler_grace window
+        // (raiseTerm, once handler_grace hits 0), so a host looping on a
+        // terminated isolate would execute another ~1024-instruction burst of
+        // script per call — bounding execution per-call instead of per-isolate.
+        if (iso.cell.hard_oom) return error.MemoryLimitExceeded;
+        if (iso.terminate_flag.load(.acquire)) {
+            return terminationError(@fromBackingInt(@intCast(iso.pending_kind.load(.monotonic))));
+        }
         iso.running = true;
         defer iso.running = false;
 
@@ -357,30 +369,25 @@ pub const Isolate = struct {
         return RubyError.fromValue(iso.vm.mrb, iso.last_exc);
     }
 
-    /// Policy terminations are raised as hidden exception classes; map
-    /// them (and memory-limit NoMemoryError) to distinct Zig errors.
+    /// Map a failed run to a distinct Zig error. Policy terminations are
+    /// classified **only** by the authoritative `terminate_flag`/`pending_kind`
+    /// the hook sets (and the memory-cap flags), never by the raised
+    /// exception's class name: the `MRubyZigSandbox::*` classes are
+    /// script-visible and a script can `raise` them (or spoof their `to_s`),
+    /// so trusting the name would let a script forge a termination the host
+    /// then acts on. `raiseTerm` always calls `noteTerm` before raising, so a
+    /// genuine termination is fully covered by the flag check below.
     fn mapError(iso: *Isolate, err: anyerror) anyerror {
         if (err != error.RubyException) return err;
         if (iso.cell.soft_oom or iso.cell.hard_oom) {
             return error.MemoryLimitExceeded;
         }
-        // Stash the exception value and clear the pending state before
-        // funcalling (class/to_s) — mruby funcalls disturb a pending exc.
+        // Stash the exception for lastError(); clear the pending state (a
+        // later class/to_s funcall would otherwise disturb it).
         iso.last_exc = c.mrz_exc_value(iso.vm.mrb);
         c.mrz_exc_clear(iso.vm.mrb);
         if (iso.terminate_flag.load(.acquire)) {
             return terminationError(@fromBackingInt(@intCast(iso.pending_kind.load(.monotonic))));
-        }
-        if (c.mrz_nil_p(iso.last_exc)) return err;
-        const exc = RubyError.fromValue(iso.vm.mrb, iso.last_exc);
-        const cls = exc.className();
-        defer alloc_mod.gpa.free(cls);
-        if (std.mem.startsWith(u8, cls, "MRubyZigSandbox::")) {
-            if (std.mem.endsWith(u8, cls, "::ScriptTerminated")) return error.ScriptTerminated;
-            if (std.mem.endsWith(u8, cls, "::DeadlineExceeded")) return error.DeadlineExceeded;
-            if (std.mem.endsWith(u8, cls, "::GasExhausted")) return error.GasExhausted;
-            if (std.mem.endsWith(u8, cls, "::MemoryLimitExceeded")) return error.MemoryLimitExceeded;
-            if (std.mem.endsWith(u8, cls, "::CallDepthExceeded")) return error.CallDepthExceeded;
         }
         return err;
     }
@@ -413,10 +420,22 @@ pub const Isolate = struct {
 
         if (!caps.eval) {
             const kernel = try iso.vm.getClass("Kernel");
+            const basic = try iso.vm.getClass("BasicObject");
+            const module = try iso.vm.getClass("Module");
             undef(kernel, "eval");
+            undef(kernel, "binding");
+            // instance_eval/instance_exec are defined on BasicObject, not
+            // Kernel; a BasicObject-receiver call (whose ancestry excludes
+            // Kernel) would bypass a Kernel-only strip. Undef on both.
             undef(kernel, "instance_eval");
             undef(kernel, "instance_exec");
-            undef(kernel, "binding");
+            undef(basic, "instance_eval");
+            undef(basic, "instance_exec");
+            // Module#class_eval / #module_eval accept a source string and are
+            // a full string-eval escape; they live on the module class,
+            // untouched by the Kernel/BasicObject strips above.
+            undef(module, "class_eval");
+            undef(module, "module_eval");
         }
         if (!caps.send) {
             const kernel = try iso.vm.getClass("Kernel");
@@ -448,23 +467,47 @@ pub const Isolate = struct {
         if (caps.random_seed) |seed| {
             var buf: [64]u8 = undefined;
             const src = std.fmt.bufPrint(&buf, "srand({d})", .{seed}) catch unreachable;
-            _ = iso.vm.loadString(src) catch iso.vm.clearError();
+            // Fail loudly (prepare maps this to CapabilityApplicationFailed) if
+            // mruby-random is absent: silently skipping srand would leave the
+            // isolate non-deterministic while the host believes the pin applied.
+            _ = try iso.vm.loadString(src);
         }
         if (caps.clock_epoch_s) |epoch| {
-            iso.installFrozenClock(epoch) catch iso.vm.clearError();
+            try iso.installFrozenClock(epoch);
         }
         if (caps.freeze_object_model) {
+            // Freeze the core object model so `def`/`include`/const changes on
+            // these raise FrozenError. The immediate-value singletons
+            // (NilClass/TrueClass/FalseClass), Numeric, and the core Exception
+            // hierarchy are included: omitting them left a script able to
+            // reopen e.g. `class NilClass` under a supposedly frozen model.
+            // Classes absent from a trimmed gem set are skipped (catch continue).
             const frozen_classes = [_][]const u8{
-                "Object", "BasicObject", "Kernel",     "Module",
-                "Class",  "Comparable",  "Enumerable", "String",
-                "Symbol", "Integer",     "Float",      "Array",
-                "Hash",   "Range",       "Proc",       "Exception",
+                "BasicObject",       "Object",              "Module",
+                "Class",             "Kernel",              "Comparable",
+                "Enumerable",        "NilClass",            "TrueClass",
+                "FalseClass",        "Numeric",             "Integer",
+                "Float",             "String",              "Symbol",
+                "Array",             "Hash",                "Range",
+                "Proc",              "Struct",              "Exception",
+                "StandardError",     "RuntimeError",        "ArgumentError",
+                "TypeError",         "NameError",           "NoMethodError",
+                "IndexError",        "KeyError",            "RangeError",
+                "ZeroDivisionError", "FrozenError",         "StopIteration",
+                "ScriptError",       "NotImplementedError", "LocalJumpError",
             };
             for (frozen_classes) |name| {
                 const cls = iso.vm.getClass(name) catch continue;
-                _ = c.mrb_obj_freeze(m, .{ .w = @intFromPtr(cls.class) });
+                _ = c.mrb_obj_freeze(m, c.mrz_obj_value(@ptrCast(cls.class)));
             }
         }
+
+        // The sandbox's own module is a script-visible constant (scripts may
+        // read MRubyZigSandbox::FROZEN_TIME). Freeze it so a script cannot
+        // reassign or remove its constants (e.g. repoint FROZEN_TIME to defeat
+        // the clock pin) or reopen it to add methods: mrb_check_frozen guards
+        // const-set, const-remove, and method definition on a frozen module.
+        _ = c.mrb_obj_freeze(m, c.mrz_obj_value(@ptrCast(iso.hidden)));
     }
 
     fn undef(cls: anytype, name: []const u8) void {

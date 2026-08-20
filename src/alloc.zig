@@ -91,6 +91,20 @@ pub fn currentIsolateCell() ?*IsolateCell {
 /// frees of mruby-allocated buffers through the header-prefixed path.
 pub const mrb_basic_alloc_func_pub = mrb_basic_alloc_func;
 
+/// Projected cell live-bytes after a realloc from `old` to `size`.
+///
+/// `old` can exceed `ic.live_bytes` when the block was allocated while no
+/// cell was entered (e.g. via `iso.vm` before the first `run`, or during
+/// capability application) and is later resized inside a cell. Subtracting
+/// `old` directly would underflow `usize` — panicking in safe builds, and in
+/// release wrapping huge to trip the cap and permanently poison the isolate.
+/// Only subtract what we plausibly counted: for an attributed block
+/// (`old <= live_bytes`) this is exact; otherwise we start counting the block
+/// at its new size (its eventual free saturates via `-|=`, so it balances).
+fn projectedLive(ic: *IsolateCell, old: usize, size: usize) usize {
+    return if (old <= ic.live_bytes) ic.live_bytes - old + size else ic.live_bytes + size;
+}
+
 export fn mrb_basic_alloc_func(p: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
     any_allocation.store(true, .release);
 
@@ -104,7 +118,7 @@ export fn mrb_basic_alloc_func(p: ?*anyopaque, size: usize) callconv(.c) ?*anyop
                 break :blk readHeader(raw - header_bytes);
             } else 0;
             if (ic.hard_oom) return null;
-            const new_live = ic.live_bytes - old + size;
+            const new_live = projectedLive(ic, old, size);
             if (ic.hard_cap) |cap| {
                 if (new_live > cap) {
                     ic.hard_oom = true;
@@ -154,13 +168,17 @@ export fn mrb_basic_alloc_func(p: ?*anyopaque, size: usize) callconv(.c) ?*anyop
         }
 
         const new_raw = gpa.rawAlloc(size + header_bytes, .fromByteUnits(header_align), @returnAddress()) orelse return null;
-        @memcpy(new_raw[header_bytes..][0..@min(old, size)], old_raw[header_bytes..][0..old]);
+        // Copy only what fits the new buffer: on a shrink (size < old) both
+        // slices must be `size` long — @memcpy requires equal lengths, so the
+        // source must be clamped too, not just the destination.
+        const copy_len = @min(old, size);
+        @memcpy(new_raw[header_bytes..][0..copy_len], old_raw[header_bytes..][0..copy_len]);
         gpa.rawFree(old_raw[0 .. old + header_bytes], .fromByteUnits(header_align), @returnAddress());
         writeHeader(new_raw, size);
         _ = live_bytes.fetchSub(old, .monotonic);
         _ = live_bytes.fetchAdd(size, .monotonic);
         if (cell) |ic| {
-            ic.live_bytes = ic.live_bytes - old + size;
+            ic.live_bytes = projectedLive(ic, old, size);
             if (ic.live_bytes > ic.peak_bytes) ic.peak_bytes = ic.live_bytes;
         }
         return @ptrCast(new_raw + header_bytes);

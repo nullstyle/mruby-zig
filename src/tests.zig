@@ -704,6 +704,59 @@ test "sandbox: stats reflect execution" {
     try std.testing.expect(!s.soft_memory_limit_hit);
 }
 
+test "sandbox: eval strip closes class_eval and BasicObject#instance_eval" {
+    const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .eval = false } });
+    defer iso.deinit();
+    // Module#class_eval / #module_eval take a source string and were a full
+    // eval escape the old Kernel-only strip missed.
+    try std.testing.expectError(error.RubyException, iso.run("Integer.class_eval(\"1 + 1\")"));
+    iso.vm.clearError();
+    try std.testing.expectError(error.RubyException, iso.run("Integer.module_eval(\"1 + 1\")"));
+    iso.vm.clearError();
+    // instance_eval is defined on BasicObject; a BasicObject receiver bypassed
+    // a Kernel-only strip.
+    try std.testing.expectError(error.RubyException, iso.run("BasicObject.new.instance_eval(\"1\")"));
+}
+
+test "sandbox: frozen clock pin cannot be reassigned by a script" {
+    const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .clock_epoch_s = 1_700_000_000 } });
+    defer iso.deinit();
+    // The hidden module is frozen: repointing FROZEN_TIME must raise, not
+    // silently defeat the determinism pin.
+    try std.testing.expectError(error.RubyException, iso.run("MRubyZigSandbox::FROZEN_TIME = Time.at(0)"));
+    iso.vm.clearError();
+    const t = try iso.run("Time.now.to_i");
+    try std.testing.expectEqual(@as(i64, 1_700_000_000), try t.asInt());
+}
+
+test "sandbox: script cannot forge a policy termination" {
+    const iso = try sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+    // Raising the sandbox's own termination class from script must surface as
+    // an ordinary RubyException, never the host-trusted error.GasExhausted
+    // (no real limit was hit, so terminate_flag stays clear).
+    try std.testing.expectError(error.RubyException, iso.run("raise MRubyZigSandbox::GasExhausted, 'fake'"));
+}
+
+test "sandbox: frozen object model also freezes the immediate-value singletons" {
+    const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .freeze_object_model = true } });
+    defer iso.deinit();
+    try std.testing.expectError(error.RubyException, iso.run("class NilClass; def boom; end; end"));
+    iso.vm.clearError();
+    try std.testing.expectError(error.RubyException, iso.run("class FalseClass; def boom; end; end"));
+}
+
+test "sandbox: a terminated isolate refuses further runs" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 2_000 } });
+    defer iso.deinit();
+    try std.testing.expectError(error.GasExhausted, iso.run("while true; end"));
+    // The isolate is dead: a second run must execute no script (no fresh grace
+    // window) and re-report the termination immediately.
+    const before = iso.stats().instructions;
+    try std.testing.expectError(error.GasExhausted, iso.run("$x = 1"));
+    try std.testing.expectEqual(before, iso.stats().instructions);
+}
+
 // ---- allocator ---------------------------------------------------------------
 
 test "live allocations return to zero after teardown" {
@@ -714,4 +767,90 @@ test "live allocations return to zero after teardown" {
         try std.testing.expect(mruby.alloc.liveAllocs() > 0);
     }
     try std.testing.expectEqual(@as(usize, 0), mruby.alloc.liveAllocs());
+}
+
+// ---- crash regressions -------------------------------------------------------
+
+test "vm: loadString/call results stay rooted across a later GC" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+    const s = try vm.loadString("'hello ' + 'world'");
+    const up = try vm.call(s, "upcase", .{});
+    // Churn the heap and force a full GC. Pre-fix, the outer arena restore
+    // popped the slot mrb_protect_error used to root each result, so these
+    // heap strings were collectible here — a use-after-free on the next read.
+    _ = try vm.loadString("a = []; 3000.times { |i| a << i.to_s }; GC.start");
+    try std.testing.expectEqualStrings("hello world", try s.asString());
+    try std.testing.expectEqualStrings("HELLO WORLD", try up.asString());
+}
+
+test "class: omitted optional |S argument yields empty string, not a NULL deref" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+    const cls = try vm.defineClass("Greeter", null);
+    cls.defineMethod("greet", "|S", struct {
+        fn f(m: *mruby.Vm, self: mruby.Value, name: []const u8) anyerror!mruby.Value {
+            _ = self;
+            var buf: [64]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "hi:{s}", .{name}) catch "hi";
+            return m.stringValue(msg);
+        }
+    }.f);
+    // No argument: the 'S' slot stays nil, which pre-fix dereferenced NULL
+    // inside mrz_string_ptr. It must now default to the empty string.
+    const r = try vm.loadString("Greeter.new.greet");
+    try std.testing.expectEqualStrings("hi:", try r.asString());
+    const r2 = try vm.loadString("Greeter.new.greet('bob')");
+    try std.testing.expectEqualStrings("hi:bob", try r2.asString());
+}
+
+test "sandbox: reallocating a pre-run buffer does not underflow accounting" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .memory_bytes = 64 * 1024 * 1024 } });
+    defer iso.deinit();
+    // Allocate a large buffer via iso.vm before the first run: no cell is
+    // entered yet, so it is not attributed to iso.cell.
+    _ = try iso.vm.loadString("$buf = 'x' * 5_000_000");
+    // Growing it inside a run reallocs a block whose `old` exceeds the cell's
+    // tracked bytes; the pre-fix `live_bytes - old` underflowed (Debug panic;
+    // release wrapped huge and poisoned the isolate).
+    _ = try iso.run("$buf << ('y' * 100); $buf.size");
+    try std.testing.expect(!iso.stats().hard_memory_limit_hit);
+}
+
+test "alloc: shrinking realloc via the copy path preserves bytes" {
+    // An allocator whose remap always fails, forcing the alloc+memcpy+free
+    // fallback: the path where a shrink previously @memcpy'd mismatched slice
+    // lengths (dest @min(old,size), src old) and panicked.
+    const NoRemap = struct {
+        child: std.mem.Allocator,
+        fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawAlloc(len, a, ra);
+        }
+        fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn free(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.child.rawFree(buf, a, ra);
+        }
+        const vtable = std.mem.Allocator.VTable{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    };
+    var nr = NoRemap{ .child = std.testing.allocator };
+    const prev = mruby.alloc.gpa;
+    mruby.alloc.gpa = .{ .ptr = &nr, .vtable = &NoRemap.vtable };
+    defer mruby.alloc.gpa = prev;
+
+    const p1 = mruby.alloc.mrb_basic_alloc_func_pub(null, 200) orelse return error.TestUnexpectedResult;
+    const b1: [*]u8 = @ptrCast(p1);
+    @memset(b1[0..200], 0xCD);
+    // Shrink 200 -> 8: remap returns null, so the copy path runs.
+    const p2 = mruby.alloc.mrb_basic_alloc_func_pub(p1, 8) orelse return error.TestUnexpectedResult;
+    const b2: [*]u8 = @ptrCast(p2);
+    try std.testing.expectEqual(@as(u8, 0xCD), b2[0]);
+    try std.testing.expectEqual(@as(u8, 0xCD), b2[7]);
+    _ = mruby.alloc.mrb_basic_alloc_func_pub(p2, 0);
 }
