@@ -161,13 +161,39 @@ pub fn build(b: *std.Build) !void {
     // themselves. The Zig-side allocator override (src/alloc.zig, which
     // exports mrb_basic_alloc_func) lives in the same module, which is why
     // src/allocf.c is not part of the build.
+    // mrbconf.h turns on MRB_USE_ETEXT_RO_DATA_P for every __linux__ build,
+    // which makes mruby's mrb_ro_data_p() compare pointers against `etext`
+    // and `edata` -- symbols the traditional GNU link supplies and Zig's
+    // linker does not, so every Linux link fails with "undefined symbol:
+    // etext". macOS takes the mach-o branch instead and never sees it, which
+    // is why this only ever showed up on the ubuntu CI leg. Turning the
+    // default off makes mrb_ro_data_p() answer FALSE, mruby's own documented
+    // fallback for platforms that cannot answer the question: it costs a
+    // string-literal fast path, not correctness.
+    //
+    // This must reach EVERY translation unit that includes value.h -- the
+    // core sources, the generated gem inits, and shim.c below -- or the
+    // inline function is defined inconsistently across the module.
+    const ro_data_flags: []const []const u8 = if (target.result.os.tag == .linux)
+        &.{"-DMRB_NO_DEFAULT_RO_DATA_P"}
+    else
+        &.{};
+
     const lib_flags = flags: {
         var f: std.ArrayList([]const u8) = .empty;
         try f.append(arena, "-w");
         // Enables mrb->code_fetch_hook (NULL-guarded per-instruction call
         // site) used by the sandboxing layer for limits and termination.
         try f.append(arena, "-DMRB_USE_DEBUG_HOOK");
+        try f.appendSlice(arena, ro_data_flags);
         try f.appendSlice(arena, gem_defines.items);
+        break :flags f.items;
+    };
+
+    const shim_flags = flags: {
+        var f: std.ArrayList([]const u8) = .empty;
+        try f.appendSlice(arena, &.{ "-w", "-DMRB_USE_DEBUG_HOOK" });
+        try f.appendSlice(arena, ro_data_flags);
         break :flags f.items;
     };
 
@@ -187,7 +213,7 @@ pub fn build(b: *std.Build) !void {
         mruby_mod.addCSourceFile(.{ .file = g.lp, .flags = lib_flags });
     }
     // ABI shim: exposes mruby's macro-only inline APIs as plain functions.
-    mruby_mod.addCSourceFile(.{ .file = b.path("src/shim.c"), .flags = &.{ "-w", "-DMRB_USE_DEBUG_HOOK" } });
+    mruby_mod.addCSourceFile(.{ .file = b.path("src/shim.c"), .flags = shim_flags });
     mruby_mod.addIncludePath(try root.join(arena, "include"));
     mruby_mod.addIncludePath(lib_presym_dir);
     for (gem_include_dirs.items) |dir| mruby_mod.addIncludePath(dir);

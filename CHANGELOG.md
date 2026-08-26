@@ -60,3 +60,13 @@ Sandboxing (v8-isolate parity and beyond):
 - `Isolate.stats()` (instructions, peak/live memory, peak depth, live
   objects, wall time) and an allocator `on_limit` callback; concurrent
   isolates with independent policies tested on separate threads.
+
+Platform fixes:
+
+- Linux builds link again. `mrbconf.h` enables `MRB_USE_ETEXT_RO_DATA_P` on
+  every `__linux__` target, making `mrb_ro_data_p()` compare pointers against
+  the `etext`/`edata` linker symbols that Zig's linker does not supply — every
+  Linux link failed with `undefined symbol: etext`. The build now defines
+  `MRB_NO_DEFAULT_RO_DATA_P` on Linux (mruby's documented fallback for
+  platforms that cannot answer the question), applied consistently to the core
+  sources, the generated gem inits, and `shim.c`.
