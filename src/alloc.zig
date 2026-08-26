@@ -161,7 +161,14 @@ export fn mrb_basic_alloc_func(p: ?*anyopaque, size: usize) callconv(.c) ?*anyop
             _ = live_bytes.fetchSub(old, .monotonic);
             _ = live_bytes.fetchAdd(size, .monotonic);
             if (cell) |ic| {
-                ic.live_bytes = ic.live_bytes - old + size;
+                // Must be projectedLive, not `live_bytes - old + size`: a
+                // buffer allocated before this cell was entered is not in
+                // ic.live_bytes, so `old` can exceed it and the subtraction
+                // underflows. The copy path below already used the helper;
+                // this in-place path did not, and only Linux noticed --
+                // rawRemap succeeds far more often there, so macOS almost
+                // always took the copy path and hid it.
+                ic.live_bytes = projectedLive(ic, old, size);
                 if (ic.live_bytes > ic.peak_bytes) ic.peak_bytes = ic.live_bytes;
             }
             return @ptrCast(new_raw + header_bytes);

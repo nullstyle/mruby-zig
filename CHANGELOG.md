@@ -70,3 +70,10 @@ Platform fixes:
   `MRB_NO_DEFAULT_RO_DATA_P` on Linux (mruby's documented fallback for
   platforms that cannot answer the question), applied consistently to the core
   sources, the generated gem inits, and `shim.c`.
+- Fixed an integer-overflow panic in per-isolate memory accounting. The
+  in-place-remap branch of `mrb_basic_alloc_func` computed
+  `live_bytes - old + size` directly, which underflows when a buffer allocated
+  before the cell was entered is reallocated inside it. It now uses
+  `projectedLive`, the guard the copy branch already used. Linux-only in
+  practice: `rawRemap` succeeds far more often there, so macOS almost always
+  took the copy path.
