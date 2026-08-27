@@ -54,7 +54,10 @@ Sandboxing (v8-isolate parity and beyond):
   `MemoryLimitExceeded`, `CallDepthExceeded`).
 - Capability model: strip eval/send/introspection/ObjectSpace, freeze the
   core object model (`def` → FrozenError), pin RNG seed and clock for
-  reproducible runs.
+  reproducible runs. The object-model freeze is also public and movable:
+  `Isolate.sealModel()` applies the same class list at a host-chosen time,
+  the two-phase form for hosts that load a script image on the unfrozen
+  model (so its top-level class definitions land) and seal right after.
 - `sandbox.compile`/`runImage`: precompiled irep snapshots for cheap
   mass-spawn; limits apply to image runs.
 - `Isolate.stats()` (instructions, peak/live memory, peak depth, live

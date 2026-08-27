@@ -489,32 +489,7 @@ pub const Isolate = struct {
         if (caps.clock_epoch_s) |epoch| {
             try iso.installFrozenClock(epoch);
         }
-        if (caps.freeze_object_model) {
-            // Freeze the core object model so `def`/`include`/const changes on
-            // these raise FrozenError. The immediate-value singletons
-            // (NilClass/TrueClass/FalseClass), Numeric, and the core Exception
-            // hierarchy are included: omitting them left a script able to
-            // reopen e.g. `class NilClass` under a supposedly frozen model.
-            // Classes absent from a trimmed gem set are skipped (catch continue).
-            const frozen_classes = [_][]const u8{
-                "BasicObject",       "Object",              "Module",
-                "Class",             "Kernel",              "Comparable",
-                "Enumerable",        "NilClass",            "TrueClass",
-                "FalseClass",        "Numeric",             "Integer",
-                "Float",             "String",              "Symbol",
-                "Array",             "Hash",                "Range",
-                "Proc",              "Struct",              "Exception",
-                "StandardError",     "RuntimeError",        "ArgumentError",
-                "TypeError",         "NameError",           "NoMethodError",
-                "IndexError",        "KeyError",            "RangeError",
-                "ZeroDivisionError", "FrozenError",         "StopIteration",
-                "ScriptError",       "NotImplementedError", "LocalJumpError",
-            };
-            for (frozen_classes) |name| {
-                const cls = iso.vm.getClass(name) catch continue;
-                _ = c.mrb_obj_freeze(m, c.mrz_obj_value(@ptrCast(cls.class)));
-            }
-        }
+        if (caps.freeze_object_model) iso.sealModel();
 
         // The sandbox's own module is a script-visible constant (scripts may
         // read MRubyZigSandbox::FROZEN_TIME). Freeze it so a script cannot
@@ -522,6 +497,44 @@ pub const Isolate = struct {
         // the clock pin) or reopen it to add methods: mrb_check_frozen guards
         // const-set, const-remove, and method definition on a frozen module.
         _ = c.mrb_obj_freeze(m, c.mrz_obj_value(@ptrCast(iso.hidden)));
+    }
+
+    /// Freeze the core object model so `def`/`include`/const changes on
+    /// these raise FrozenError. The immediate-value singletons
+    /// (NilClass/TrueClass/FalseClass), Numeric, and the core Exception
+    /// hierarchy are included: omitting them left a script able to reopen
+    /// e.g. `class NilClass` under a supposedly frozen model. Classes
+    /// absent from a trimmed gem set are skipped (catch continue).
+    ///
+    /// This is the same list and operation the `freeze_object_model`
+    /// capability applies at the first run; exposed as a public method so
+    /// hosts can seal at a time of their choosing -- the two-phase form.
+    /// The canonical consumer loads a script image on the unfrozen model
+    /// (so its top-level `class` definitions land) and calls this right
+    /// after, giving every later run a frozen model with load-time
+    /// definitions intact. Idempotent: `mrb_obj_freeze` on an
+    /// already-frozen class is a no-op, so a host may also combine both
+    /// phases defensively.
+    pub fn sealModel(iso: *Isolate) void {
+        const m = iso.vm.mrb;
+        const frozen_classes = [_][]const u8{
+            "BasicObject",       "Object",              "Module",
+            "Class",             "Kernel",              "Comparable",
+            "Enumerable",        "NilClass",            "TrueClass",
+            "FalseClass",        "Numeric",             "Integer",
+            "Float",             "String",              "Symbol",
+            "Array",             "Hash",                "Range",
+            "Proc",              "Struct",              "Exception",
+            "StandardError",     "RuntimeError",        "ArgumentError",
+            "TypeError",         "NameError",           "NoMethodError",
+            "IndexError",        "KeyError",            "RangeError",
+            "ZeroDivisionError", "FrozenError",         "StopIteration",
+            "ScriptError",       "NotImplementedError", "LocalJumpError",
+        };
+        for (frozen_classes) |name| {
+            const cls = iso.vm.getClass(name) catch continue;
+            _ = c.mrb_obj_freeze(m, c.mrz_obj_value(@ptrCast(cls.class)));
+        }
     }
 
     fn undef(cls: anytype, name: []const u8) void {

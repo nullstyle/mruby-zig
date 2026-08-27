@@ -763,6 +763,31 @@ test "sandbox: frozen object model also freezes the immediate-value singletons" 
     try std.testing.expectError(error.RubyException, iso.run("class FalseClass; def boom; end; end"));
 }
 
+test "sandbox: sealModel is the two-phase freeze_object_model" {
+    // Phase 1: the model is unfrozen while the host loads its script, so
+    // top-level definitions -- including reopening a core class -- land.
+    const iso = try sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+    _ = try iso.run("class LoadTime; end");
+    _ = try iso.run("class String; def load_time_helper; 7; end; end");
+
+    // Phase 2: seal at a host-chosen time; every later run sees the same
+    // frozen model the capability produces, and the load-time definitions
+    // survive and stay callable.
+    iso.sealModel();
+    try std.testing.expectError(error.RubyException, iso.run("class String; def later; end; end"));
+    iso.vm.clearError();
+    try std.testing.expectError(error.RubyException, iso.run("class NilClass; def boom; end; end"));
+    iso.vm.clearError();
+    const got = try iso.run("'x'.load_time_helper");
+    try std.testing.expectEqual(@as(i64, 7), try got.asInt());
+    _ = try iso.run("LoadTime.new");
+
+    // Idempotent: sealing again changes nothing.
+    iso.sealModel();
+    try std.testing.expectError(error.RubyException, iso.run("class String; def later; end; end"));
+}
+
 test "sandbox: a terminated isolate refuses further runs" {
     const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 2_000 } });
     defer iso.deinit();
