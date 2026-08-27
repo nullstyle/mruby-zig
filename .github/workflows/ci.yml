@@ -14,8 +14,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
         with:
           install: true
       - run: mise install
@@ -42,8 +42,8 @@ jobs:
           - target: x86_64-linux-musl
           - target: x86_64-windows-gnu # best effort
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
         with:
           install: true
       - run: mise install
@@ -58,8 +58,8 @@ jobs:
       matrix:
         gem_set: [standard, minimal]
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
         with:
           install: true
       - run: mise install
