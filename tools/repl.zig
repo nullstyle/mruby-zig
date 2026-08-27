@@ -9,7 +9,7 @@
 const std = @import("std");
 const mruby = @import("mruby");
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
 
@@ -57,20 +57,21 @@ pub fn main(init: std.process.Init) !void {
         try out.print("{s}: {s}\n", .{ cls, msg });
         try out.flush();
         vm.printError();
-        return;
+        return 1;
     };
     if (!result.isNil()) {
         const inspected = vm.call(result, "inspect", .{}) catch {
             try out.writeAll("<uninspectable>\n");
             try out.flush();
-            return;
+            return 1;
         };
         const s = inspected.asString() catch {
             try out.writeAll("<non-string>\n");
             try out.flush();
-            return;
+            return 1;
         };
         try out.print("{s}\n", .{s});
     }
     try out.flush();
+    return 0;
 }

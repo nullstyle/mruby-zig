@@ -77,3 +77,13 @@ Platform fixes:
   `projectedLive`, the guard the copy branch already used. Linux-only in
   practice: `rawRemap` succeeds far more often there, so macOS almost always
   took the copy path.
+
+CI and developer tooling:
+
+- Gem-set tests now distinguish the complete standard fixtures from tests that
+  are valid for trimmed configurations, so `minimal` and dependency-cascade
+  builds exercise their compatible test coverage without requiring omitted
+  gems. The REPL exits nonzero on evaluation or inspection errors, making CI
+  smoke checks trustworthy.
+- Added a checked-in `act` configuration and `mise run ci` task for running all
+  Linux GitHub Actions jobs locally, including on Apple Silicon.

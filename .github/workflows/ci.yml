@@ -27,6 +27,9 @@ jobs:
           ./zig-out/bin/host_functions
           ./zig-out/bin/exceptions
           ./zig-out/bin/mruby-repl -e '[1,2,3].sum'
+          if ./zig-out/bin/mruby-repl -e "raise 'expected failure'"; then
+            exit 1
+          fi
 
   cross:
     name: cross compile (${{ matrix.target }})
@@ -51,6 +54,7 @@ jobs:
     name: gem set (${{ matrix.gem_set }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         gem_set: [standard, minimal]
     steps:
@@ -60,8 +64,24 @@ jobs:
           install: true
       - run: mise install
       - run: mise x -- zig build test -Dgem-set=${{ matrix.gem_set }}
+      - if: matrix.gem_set == 'minimal'
+        run: mise x -- zig build -Dgem-set=minimal
+      - if: matrix.gem_set == 'minimal'
+        run: ./zig-out/bin/mruby-repl -e "raise 'minimal eval failed' unless eval('40 + 2') == 42"
       # dependency cascade: removing enumerator must also remove its
       # dependents (enum-lazy, set) and still produce a working interpreter
-      - run: mise x -- zig build -Dwithout-gems=mruby-enumerator
-      - run: ./zig-out/bin/mruby-repl -e '[1,2].sum'
-      - run: mise x -- zig build test -Dwithout-gems=mruby-pack
+      - if: matrix.gem_set == 'standard'
+        run: mise x -- zig build test -Dwithout-gems=mruby-enumerator
+      - if: matrix.gem_set == 'standard'
+        run: mise x -- zig build -Dwithout-gems=mruby-enumerator
+      - if: matrix.gem_set == 'standard'
+        run: >-
+          ./zig-out/bin/mruby-repl -e
+          "raise 'dependency cascade failed' if Object.const_defined?(:Enumerator) || Object.const_defined?(:Set);
+          raise 'core enum failed' unless [1,2].sum == 3"
+      - if: matrix.gem_set == 'standard'
+        run: mise x -- zig build test -Dwithout-gems=mruby-pack
+      - if: matrix.gem_set == 'standard'
+        run: mise x -- zig build -Dwithout-gems=mruby-pack
+      - if: matrix.gem_set == 'standard'
+        run: ./zig-out/bin/mruby-repl -e "raise 'pack removal failed' if [1].respond_to?(:pack)"

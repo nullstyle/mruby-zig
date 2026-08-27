@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const mruby = @import("mruby");
+const test_config = @import("test_config");
 
 test {
     _ = mruby;
@@ -10,8 +11,8 @@ test {
 // ---- ruby integration suite ----------------------------------------------
 
 const ruby_suites = .{
-    .{ .name = "core_language", .src = @embedFile("tests_ruby/core_language.rb") },
-    .{ .name = "numerics", .src = @embedFile("tests_ruby/numerics.rb") },
+    .{ .name = "core_language", .src = @embedFile("tests_ruby/core_language.rb"), .enabled = test_config.has_core_language_suite },
+    .{ .name = "numerics", .src = @embedFile("tests_ruby/numerics.rb"), .enabled = test_config.has_numerics_suite },
 };
 
 fn countLines(s: []const u8) usize {
@@ -23,7 +24,13 @@ fn countLines(s: []const u8) usize {
 }
 
 test "ruby integration suite" {
+    // Each broad Ruby fixture declares its gem requirements in build.zig.
+    // Trimmed configurations run every compatible fixture and Zig test while
+    // skipping only fixtures that require gems they deliberately omit.
+    if (!test_config.has_core_language_suite and !test_config.has_numerics_suite) return error.SkipZigTest;
+
     inline for (ruby_suites) |suite| {
+        if (!suite.enabled) continue;
         const vm = try mruby.Vm.init();
         defer vm.deinit();
         _ = vm.loadString(suite.src) catch {
@@ -105,6 +112,8 @@ test "syntax errors are ruby exceptions" {
 }
 
 test "stdlib gems are loaded" {
+    if (!test_config.has_string_ext) return error.SkipZigTest;
+
     const vm = try mruby.Vm.init();
     defer vm.deinit();
     const v = try vm.loadString("'mruby-zig'.start_with?('mruby')");
@@ -245,8 +254,10 @@ test "vm.call invokes ruby methods" {
     const up = try vm.call(str, "upcase", .{});
     try std.testing.expectEqualStrings("HELLO", try up.asString());
 
-    const sqrt = try vm.call(try vm.loadString("Math"), "sqrt", .{@as(f64, 144.0)});
-    try std.testing.expectEqual(@as(f64, 12.0), try sqrt.asFloat());
+    if (test_config.has_math) {
+        const sqrt = try vm.call(try vm.loadString("Math"), "sqrt", .{@as(f64, 144.0)});
+        try std.testing.expectEqual(@as(f64, 12.0), try sqrt.asFloat());
+    }
 
     try std.testing.expectError(error.RubyException, vm.call(str, "nope", .{}));
 }
@@ -260,7 +271,8 @@ test "globals and ivars" {
     try vm.setGlobal("name", vm.stringValue("zig"));
     try std.testing.expectEqualStrings("zig", try (try vm.loadString("$name")).asString());
 
-    const obj = try vm.loadString("Object.new.tap { |o| o.instance_variable_set(:@v, 7) }");
+    const obj = try vm.loadString("Object.new");
+    try vm.setIvar(obj, "@v", vm.intValue(7));
     try std.testing.expectEqual(@as(i64, 7), try vm.getIvar(obj, "@v").asInt());
 }
 
@@ -270,13 +282,10 @@ test "class lookup and constants" {
     const vm = try mruby.Vm.init();
     defer vm.deinit();
 
-    const math = try vm.getClass("Math");
-    math.defineConst("MRB_ZIG", vm.intValue(1));
-    try std.testing.expectEqual(@as(i64, 1), try (try vm.loadString("Math::MRB_ZIG")).asInt());
-
-    // nested lookup through ::
-    const lazy = try vm.getClass("Enumerator::Lazy");
-    _ = lazy;
+    _ = try vm.loadString("module LookupOuter; class Inner; end; end");
+    const inner = try vm.getClass("LookupOuter::Inner");
+    inner.defineConst("MRB_ZIG", vm.intValue(1));
+    try std.testing.expectEqual(@as(i64, 1), try (try vm.loadString("LookupOuter::Inner::MRB_ZIG")).asInt());
 
     try std.testing.expectError(error.UnknownClass, vm.getClass("NoSuchThing"));
     try std.testing.expectError(error.UnknownClass, vm.getClass("Enumerator::Nope"));
@@ -614,22 +623,28 @@ test "sandbox: frozen object model blocks def on core classes" {
 }
 
 test "sandbox: deterministic RNG and frozen clock" {
-    const run_pair = struct {
-        fn sample(seed: u64) !i64 {
-            const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .random_seed = seed } });
-            defer iso.deinit();
-            const v = try iso.run("rand(1 << 40)");
-            return v.asInt();
-        }
-    }.sample;
-    try std.testing.expectEqual(try run_pair(42), try run_pair(42));
+    if (!test_config.has_random and !test_config.has_time) return error.SkipZigTest;
 
-    const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .clock_epoch_s = 1_700_000_000 } });
-    defer iso.deinit();
-    const t = try iso.run("Time.now.to_i");
-    try std.testing.expectEqual(@as(i64, 1_700_000_000), try t.asInt());
-    const same = try iso.run("Time.now.equal?(MRubyZigSandbox::FROZEN_TIME)");
-    try std.testing.expect(same.isTruthy());
+    if (test_config.has_random) {
+        const run_pair = struct {
+            fn sample(seed: u64) !i64 {
+                const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .random_seed = seed } });
+                defer iso.deinit();
+                const v = try iso.run("rand(1 << 40)");
+                return v.asInt();
+            }
+        }.sample;
+        try std.testing.expectEqual(try run_pair(42), try run_pair(42));
+    }
+
+    if (test_config.has_time) {
+        const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .clock_epoch_s = 1_700_000_000 } });
+        defer iso.deinit();
+        const t = try iso.run("Time.now.to_i");
+        try std.testing.expectEqual(@as(i64, 1_700_000_000), try t.asInt());
+        const same = try iso.run("Time.now.equal?(MRubyZigSandbox::FROZEN_TIME)");
+        try std.testing.expect(same.isTruthy());
+    }
 }
 
 test "sandbox: nested run from a method callback" {
@@ -719,6 +734,8 @@ test "sandbox: eval strip closes class_eval and BasicObject#instance_eval" {
 }
 
 test "sandbox: frozen clock pin cannot be reassigned by a script" {
+    if (!test_config.has_time) return error.SkipZigTest;
+
     const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .clock_epoch_s = 1_700_000_000 } });
     defer iso.deinit();
     // The hidden module is frozen: repointing FROZEN_TIME must raise, not
@@ -805,15 +822,27 @@ test "class: omitted optional |S argument yields empty string, not a NULL deref"
 }
 
 test "sandbox: reallocating a pre-run buffer does not underflow accounting" {
+    const test_c = struct {
+        extern fn mrb_str_cat(mrb: *mruby.c.mrb_state, str: mruby.c.mrb_value, p: [*]const u8, len: usize) mruby.c.mrb_value;
+    };
+
     const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .memory_bytes = 64 * 1024 * 1024 } });
     defer iso.deinit();
     // Allocate a large buffer via iso.vm before the first run: no cell is
     // entered yet, so it is not attributed to iso.cell.
-    _ = try iso.vm.loadString("$buf = 'x' * 5_000_000");
-    // Growing it inside a run reallocs a block whose `old` exceeds the cell's
-    // tracked bytes; the pre-fix `live_bytes - old` underflowed (Debug panic;
-    // release wrapped huge and poisoned the isolate).
-    _ = try iso.run("$buf << ('y' * 100); $buf.size");
+    const bytes = try std.testing.allocator.alloc(u8, 5_000_000);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'x');
+    const buf = iso.vm.stringValue(bytes);
+    try iso.vm.setGlobal("buf", buf);
+
+    // Growing it under the isolate cell reallocs a block whose `old` exceeds
+    // the cell's tracked bytes; the pre-fix `live_bytes - old` underflowed
+    // (Debug panic; release wrapped huge and poisoned the isolate).
+    const suffix = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy";
+    mruby.alloc.enterIsolate(&iso.cell);
+    defer mruby.alloc.exitIsolate();
+    _ = test_c.mrb_str_cat(iso.vm.mrb, buf.v, suffix.ptr, suffix.len);
     try std.testing.expect(!iso.stats().hard_memory_limit_hit);
 }
 

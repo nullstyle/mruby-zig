@@ -239,6 +239,24 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     });
     test_mod.addImport("mruby", mruby_mod);
+    const test_config = b.addOptions();
+    test_config.addOption(bool, "has_core_language_suite", hasAllGemsExcept(selected_gems, &gems_mod.standard, &.{
+        "mruby-enumerator",
+        "mruby-enum-lazy",
+        "mruby-set",
+        "mruby-pack",
+    }));
+    test_config.addOption(bool, "has_numerics_suite", hasNamedGems(selected_gems, &.{
+        "mruby-eval",
+        "mruby-numeric-ext",
+        "mruby-string-ext",
+        "mruby-math",
+    }));
+    test_config.addOption(bool, "has_string_ext", hasGem(selected_gems, "mruby-string-ext"));
+    test_config.addOption(bool, "has_math", hasGem(selected_gems, "mruby-math"));
+    test_config.addOption(bool, "has_random", hasGem(selected_gems, "mruby-random"));
+    test_config.addOption(bool, "has_time", hasGem(selected_gems, "mruby-time"));
+    test_mod.addOptions("test_config", test_config);
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "run unit and integration tests");
@@ -358,6 +376,34 @@ fn selectGems(
     // inserting each one just before its first dependent.
     resolveDeps(arena, &list);
     return list.items;
+}
+
+fn hasGem(enabled_gems: []const gems_mod.Gem, name: []const u8) bool {
+    for (enabled_gems) |gem| {
+        if (std.mem.eql(u8, gem.name, name)) return true;
+    }
+    return false;
+}
+
+fn hasAllGemsExcept(enabled_gems: []const gems_mod.Gem, required: []const gems_mod.Gem, exceptions: []const []const u8) bool {
+    for (required) |gem| {
+        var excepted = false;
+        for (exceptions) |exception| {
+            if (std.mem.eql(u8, gem.name, exception)) {
+                excepted = true;
+                break;
+            }
+        }
+        if (!excepted and !hasGem(enabled_gems, gem.name)) return false;
+    }
+    return true;
+}
+
+fn hasNamedGems(enabled_gems: []const gems_mod.Gem, required: []const []const u8) bool {
+    for (required) |name| {
+        if (!hasGem(enabled_gems, name)) return false;
+    }
+    return true;
 }
 
 fn selected(list: std.ArrayList(gems_mod.Gem), name: []const u8) bool {

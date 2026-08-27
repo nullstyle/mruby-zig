@@ -2,3 +2,8 @@
 # `mise install` resolves master to the current snapshot; `mise up` moves forward.
 [tools]
 zig = "master"
+
+[tasks.ci]
+description = "Run the Linux GitHub Actions jobs locally with act"
+tools = { act = "0.2.89" }
+run = "act push --workflows .github/workflows/ci.yml"

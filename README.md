@@ -31,6 +31,27 @@ mise x -- zig build test     # unit + Ruby integration suites
 mise x -- zig build run-quickstart
 ```
 
+## Running CI locally
+
+With a running [Docker Engine](https://docs.docker.com/get-docker/), run the
+Linux GitHub Actions jobs from the repository root:
+
+```sh
+mise run ci
+```
+
+The mise task installs a task-local, pinned version of
+[`act`](https://nektosact.com/installation/index.html), and the checked-in
+`.actrc` selects an `ubuntu-latest` runner image. It follows Docker's native
+architecture; on Apple Silicon, forcing `linux/amd64` can make Zig fail under
+emulation. `act` skips the macOS matrix entry because Docker cannot emulate a
+GitHub-hosted macOS runner, so GitHub Actions remains authoritative for that
+leg. To iterate on one job or matrix entry:
+
+```sh
+mise run ci -- --job gem-sets --matrix gem_set:minimal --pull=false
+```
+
 In your application:
 
 ```zig
