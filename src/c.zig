@@ -12,6 +12,15 @@
 //!  - The library is compiled by this package's build with fixed config
 //!    flags; this file binds exactly that build.
 
+comptime {
+    // The handwritten mrb_value/mrb_int ABI below intentionally targets the
+    // package's supported 64-bit word-boxing configuration. Failing clearly
+    // is safer than silently truncating StateCapsule integers on 32-bit mruby.
+    if (@bitSizeOf(usize) != 64) {
+        @compileError("mruby-zig currently requires a 64-bit target");
+    }
+}
+
 pub const mrb_int = i64;
 pub const mrb_float = f64;
 pub const mrb_sym = u32;
@@ -87,6 +96,9 @@ pub extern fn mrb_incremental_gc(mrb: *mrb_state) void;
 
 pub extern fn mrb_load_string(mrb: *mrb_state, s: [*:0]const u8) mrb_value;
 pub extern fn mrb_load_nstring(mrb: *mrb_state, s: [*]const u8, len: usize) mrb_value;
+pub extern fn mrb_ccontext_new(mrb: *mrb_state) ?*mrb_ccontext;
+pub extern fn mrb_ccontext_free(mrb: *mrb_state, context: *mrb_ccontext) void;
+pub extern fn mrb_ccontext_filename(mrb: *mrb_state, context: *mrb_ccontext, filename: [*:0]const u8) ?[*:0]const u8;
 
 // ---- classes, modules, methods ----------------------------------------
 
@@ -182,6 +194,7 @@ pub extern fn mrb_obj_freeze(mrb: *mrb_state, obj: mrb_value) mrb_value;
 pub extern fn mrb_undef_method(mrb: *mrb_state, cla: *RClass, name: [*:0]const u8) void;
 pub extern fn mrb_undef_class_method(mrb: *mrb_state, cla: *RClass, name: [*:0]const u8) void;
 pub extern fn mrb_const_remove(mrb: *mrb_state, mod: *RClass, sym: mrb_sym) void;
+pub const MRB_DUMP_DEBUG_INFO: u8 = 1;
 pub extern fn mrb_dump_irep(mrb: *mrb_state, irep: ?*const anyopaque, flags: u8, bin: *?[*]u8, bin_size: *usize) c_int;
 pub extern fn mrb_load_irep_buf(mrb: *mrb_state, buf: [*]const u8, size: usize) mrb_value;
 
@@ -240,3 +253,130 @@ pub extern fn mrz_float_value(mrb: *mrb_state, f: mrb_float) mrb_value;
 pub extern fn mrz_sym_value(s: mrb_sym) mrb_value;
 pub extern fn mrz_obj_value(p: *anyopaque) mrb_value;
 pub extern fn mrz_cptr_value(mrb: *mrb_state, p: *anyopaque) mrb_value;
+
+// ---- artifact graph inspection / materialization ----------------------
+
+/// Exact-core container classifications. A subclass or an object with a
+/// singleton class is intentionally reported as unsupported.
+pub const MRZ_ARTIFACT_NODE_UNSUPPORTED: u8 = 0;
+pub const MRZ_ARTIFACT_NODE_STRING: u8 = 1;
+pub const MRZ_ARTIFACT_NODE_ARRAY: u8 = 2;
+pub const MRZ_ARTIFACT_NODE_HASH: u8 = 3;
+
+pub const mrz_artifact_pair = extern struct {
+    key: mrb_value,
+    value: mrb_value,
+};
+
+pub const mrz_artifact_hash_state = extern struct {
+    has_default: u8,
+    has_default_proc: u8,
+    has_extra_ivars: u8,
+    reserved: u8,
+    default_value: mrb_value,
+};
+
+pub extern fn mrz_artifact_container_kind(mrb: *mrb_state, value: mrb_value) u8;
+pub extern fn mrz_artifact_frozen_p(value: mrb_value) bool;
+/// Copy the exact binary64 representation without routing heap NaNs through
+/// a floating-point expression that may canonicalize their payload bits.
+pub extern fn mrz_artifact_float_bits(value: mrb_value, out: *u64) bool;
+pub extern fn mrz_artifact_identity(value: mrb_value) ?*anyopaque;
+pub extern fn mrz_artifact_array_len(value: mrb_value) usize;
+pub extern fn mrz_artifact_array_ptr(value: mrb_value) ?[*]const mrb_value;
+pub extern fn mrz_artifact_hash_len(value: mrb_value) usize;
+pub extern fn mrz_artifact_hash_copy_pairs(
+    mrb: *mrb_state,
+    value: mrb_value,
+    pairs: ?[*]mrz_artifact_pair,
+    capacity: usize,
+) bool;
+pub extern fn mrz_artifact_hash_state_get(
+    mrb: *mrb_state,
+    value: mrb_value,
+    out: *mrz_artifact_hash_state,
+) bool;
+pub extern fn mrz_artifact_has_extra_ivars(mrb: *mrb_state, value: mrb_value) bool;
+
+pub const MRZ_ARTIFACT_REF_NIL: u8 = 0;
+pub const MRZ_ARTIFACT_REF_FALSE: u8 = 1;
+pub const MRZ_ARTIFACT_REF_TRUE: u8 = 2;
+pub const MRZ_ARTIFACT_REF_I64: u8 = 3;
+pub const MRZ_ARTIFACT_REF_F64: u8 = 4;
+pub const MRZ_ARTIFACT_REF_SYMBOL: u8 = 5;
+pub const MRZ_ARTIFACT_REF_NODE: u8 = 6;
+
+pub const MRZ_ARTIFACT_NODE_FROZEN: u8 = 1;
+pub const MRZ_ARTIFACT_HASH_HAS_DEFAULT: u8 = 2;
+
+pub const mrz_artifact_ref = extern struct {
+    tag: u8,
+    reserved: [3]u8,
+    /// Non-zero only for symbol byte references.
+    length: u32,
+    /// Signed integer bits, binary64 bits, node ID, or symbol byte pointer.
+    payload: u64,
+};
+
+/// Node array order is the zero-based object ID. Array edges are elements;
+/// Hash edges are key/value pairs followed by an optional default edge.
+pub const mrz_artifact_node = extern struct {
+    kind: u8,
+    flags: u8,
+    reserved: u16,
+    edge_offset: u32,
+    edge_count: u32,
+    bytes_ptr: ?[*]const u8,
+    bytes_len: u32,
+};
+
+pub const mrz_artifact_graph = extern struct {
+    nodes: ?[*]const mrz_artifact_node,
+    edges: ?[*]const mrz_artifact_ref,
+    node_count: u32,
+    edge_count: u32,
+    root: mrz_artifact_ref,
+};
+
+pub const MRZ_ARTIFACT_MATERIALIZE_OK: u32 = 0;
+pub const MRZ_ARTIFACT_MATERIALIZE_INVALID: u32 = 1;
+pub const MRZ_ARTIFACT_MATERIALIZE_OOM: u32 = 2;
+pub const MRZ_ARTIFACT_MATERIALIZE_UNEXPECTED: u32 = 3;
+
+pub const mrz_artifact_materialize_result = extern struct {
+    value: mrb_value,
+    status: u32,
+    /// Successful heap roots leave one arena slot; immediate roots leave zero.
+    arena_roots: u32,
+};
+
+comptime {
+    // Keep the hand-written normalized graph ABI synchronized with shim.c.
+    // This package intentionally rejects non-64-bit targets above, so these
+    // sizes and offsets are part of the supported C/Zig boundary.
+    if (@sizeOf(mrz_artifact_pair) != 16 or
+        @sizeOf(mrz_artifact_hash_state) != 16 or
+        @offsetOf(mrz_artifact_hash_state, "default_value") != 8 or
+        @sizeOf(mrz_artifact_ref) != 16 or
+        @offsetOf(mrz_artifact_ref, "length") != 4 or
+        @offsetOf(mrz_artifact_ref, "payload") != 8 or
+        @sizeOf(mrz_artifact_node) != 32 or
+        @offsetOf(mrz_artifact_node, "edge_offset") != 4 or
+        @offsetOf(mrz_artifact_node, "bytes_ptr") != 16 or
+        @offsetOf(mrz_artifact_node, "bytes_len") != 24 or
+        @sizeOf(mrz_artifact_graph) != 40 or
+        @offsetOf(mrz_artifact_graph, "root") != 24 or
+        @sizeOf(mrz_artifact_materialize_result) != 16)
+    {
+        @compileError("StateCapsule C/Zig normalized graph ABI drifted");
+    }
+}
+
+/// Materialize a fully normalized graph in one C protection frame. On any
+/// failure the entry arena is restored and mrb->exc is clear, so no mruby
+/// longjmp can cross a live Zig frame.
+pub extern fn mrz_artifact_materialize(
+    mrb: *mrb_state,
+    graph: *const mrz_artifact_graph,
+    out: *mrz_artifact_materialize_result,
+) void;

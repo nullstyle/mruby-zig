@@ -637,6 +637,946 @@ test "sandbox: instruction gas exhausts and is deterministic" {
     try std.testing.expectError(error.GasExhausted, iso3.run(script));
 }
 
+test "sandbox: typed RITE compiles and runs through the artifact interface" {
+    var image = try mruby.sandbox.compileRite(
+        std.testing.allocator,
+        "6 * 7",
+        .{},
+    );
+    defer image.deinit(std.testing.allocator);
+
+    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+
+    const result = try iso.runRite(image.view());
+    try std.testing.expectEqual(@as(i64, 42), try result.asInt());
+}
+
+test "sandbox: typed RITE source name is stable across debug modes" {
+    inline for (.{ false, true }) |include_debug| {
+        var image = try mruby.sandbox.compileRite(
+            std.testing.allocator,
+            "__FILE__",
+            .{
+                .include_debug = include_debug,
+                .source_name = "worker.rb",
+            },
+        );
+        defer image.deinit(std.testing.allocator);
+
+        const has_debug = std.mem.indexOf(u8, image.encoded, "DBG\x00") != null;
+        try std.testing.expectEqual(include_debug, has_debug);
+
+        const iso = try mruby.sandbox.Isolate.spawn(.{});
+        defer iso.deinit();
+        const result = try iso.runRite(image.view());
+        try std.testing.expectEqualStrings("worker.rb", try result.asString());
+    }
+}
+
+test "sandbox: typed RITE rejects embedded NUL in source name" {
+    try std.testing.expectError(
+        error.InvalidSourceName,
+        mruby.sandbox.compileRite(
+            std.testing.allocator,
+            "1",
+            .{ .source_name = "bad\x00name" },
+        ),
+    );
+}
+
+test "sandbox: legacy raw RITE retains its null source-name semantics" {
+    const image = try mruby.sandbox.compile("__FILE__");
+    defer mruby.alloc.gpa.free(image);
+    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+    try std.testing.expectEqualStrings("(null)", try (try iso.runImage(image)).asString());
+}
+
+test "sandbox: invalid typed RITE leaves execution lifecycle untouched" {
+    var image = try mruby.sandbox.compileRite(
+        std.testing.allocator,
+        "42",
+        .{},
+    );
+    defer image.deinit(std.testing.allocator);
+    const iso = try mruby.sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 10_000 },
+    } });
+    defer iso.deinit();
+
+    image.encoded[image.encoded.len - 1] ^= 1;
+    try std.testing.expectError(error.ChecksumMismatch, iso.runRite(image.view()));
+    const rejected = iso.stats();
+    try std.testing.expectEqual(@as(u64, 0), rejected.instructions);
+    try std.testing.expectEqual(@as(u64, 0), rejected.wall_time_ns);
+    try std.testing.expectEqual(@as(u64, 0), rejected.gas.?.generation);
+    try std.testing.expect(iso.lastError() == null);
+
+    image.encoded[image.encoded.len - 1] ^= 1;
+    try std.testing.expectEqual(@as(i64, 42), try (try iso.runRite(image.view())).asInt());
+    try std.testing.expectEqual(@as(u64, 1), iso.stats().gas.?.generation);
+}
+
+test "sandbox: invalid typed RITE preserves a prior Ruby error" {
+    var image = try mruby.sandbox.compileRite(std.testing.allocator, "42", .{});
+    defer image.deinit(std.testing.allocator);
+    const iso = try mruby.sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 10_000 },
+    } });
+    defer iso.deinit();
+
+    try std.testing.expectError(error.RubyException, iso.run("raise 'RITE sentinel'"));
+    const before = iso.stats();
+    image.encoded[image.encoded.len - 1] ^= 1;
+    try std.testing.expectError(error.ChecksumMismatch, iso.runRite(image.view()));
+    const after = iso.stats();
+    try std.testing.expectEqual(before.instructions, after.instructions);
+    try std.testing.expectEqual(before.wall_time_ns, after.wall_time_ns);
+    try std.testing.expectEqual(before.gas.?.generation, after.gas.?.generation);
+    try std.testing.expectEqual(before.gas.?.used, after.gas.?.used);
+    const message = iso.lastError().?.message();
+    defer mruby.alloc.gpa.free(message);
+    try std.testing.expectEqualStrings("RITE sentinel", message);
+}
+
+test "sandbox: concurrent operations on one isolate fail instead of racing" {
+    const Gate = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var release = std.atomic.Value(bool).init(false);
+
+        fn block(m: *mruby.Vm, self: mruby.Value) !mruby.Value {
+            _ = self;
+            entered.store(true, .release);
+            while (!release.load(.acquire)) std.atomic.spinLoopHint();
+            return m.nilValue();
+        }
+    };
+    const Runner = struct {
+        iso: *mruby.sandbox.Isolate,
+        failure: ?anyerror = null,
+
+        fn run(runner: *@This()) void {
+            _ = runner.iso.run("ConcurrentGate.block") catch |err| {
+                runner.failure = err;
+                return;
+            };
+        }
+    };
+
+    Gate.entered.store(false, .release);
+    Gate.release.store(false, .release);
+    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+    const class = try iso.vm.defineClass("ConcurrentGate", null);
+    class.defineClassMethod("block", "", Gate.block);
+
+    var runner = Runner{ .iso = iso };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&runner});
+    var joined = false;
+    defer if (!joined) {
+        Gate.release.store(true, .release);
+        thread.join();
+    };
+
+    while (!Gate.entered.load(.acquire)) std.atomic.spinLoopHint();
+    try std.testing.expectError(error.IsolateThreadBusy, iso.run("1"));
+
+    Gate.release.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expect(runner.failure == null);
+}
+
+test "sandbox: StateCapsule transfers supported scalar values between isolates" {
+    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    defer producer.deinit();
+    const root = try producer.run(
+        "[nil, false, true, -9, 1.5, :ready, \"a\\x00b\"]",
+    );
+
+    var capsule = try producer.exportValue(
+        std.testing.allocator,
+        root,
+        .{},
+    );
+    defer capsule.deinit(std.testing.allocator);
+
+    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    defer consumer.deinit();
+    const restored = try consumer.importValue(capsule.view(), .{});
+    try consumer.vm.setGlobal("restored", restored);
+    const matches = try consumer.run(
+        "$restored == [nil, false, true, -9, 1.5, :ready, \"a\\x00b\"]",
+    );
+    try std.testing.expect(matches.isTruthy());
+}
+
+test "sandbox: StateCapsule export cleans up every caller allocation failure" {
+    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    defer producer.deinit();
+    const root = try producer.run(
+        \\key = "key".freeze
+        \\shared = [1, 2, 3]
+        \\{key => shared, :alias => shared}
+    );
+
+    const Harness = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            iso: *mruby.sandbox.Isolate,
+            value: mruby.Value,
+        ) !void {
+            var capsule = try iso.exportValue(allocator, value, .{});
+            defer capsule.deinit(allocator);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        Harness.run,
+        .{ producer, root },
+    );
+}
+
+test "sandbox: StateCapsule copies distinct inline symbol names during export" {
+    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    defer producer.deinit();
+    // Names of four bytes or fewer use mruby's shared mutable symbol scratch
+    // buffer. Retaining the borrowed pointers would turn every entry into the
+    // final name before the payload is encoded.
+    const root = try producer.run("[:a, :b, :c, :zzzz]");
+    var capsule = try producer.exportValue(std.testing.allocator, root, .{});
+    defer capsule.deinit(std.testing.allocator);
+
+    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    defer consumer.deinit();
+    const restored = try consumer.importValue(capsule.view(), .{});
+    try consumer.vm.setGlobal("inline_symbols", restored);
+    try std.testing.expect((try consumer.run("$inline_symbols == [:a, :b, :c, :zzzz]")).isTruthy());
+}
+
+test "sandbox: StateCapsule full-i64 Hash keys survive hash-table materialization" {
+    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    defer producer.deinit();
+    try producer.vm.setGlobal("maximum_key", producer.vm.intValue(std.math.maxInt(i64)));
+    try producer.vm.setGlobal("minimum_key", producer.vm.intValue(std.math.minInt(i64)));
+    const root = try producer.run(
+        \\mapping = {}
+        \\index = 0
+        \\while index < 20
+        \\  mapping[index] = index
+        \\  index += 1
+        \\end
+        \\mapping[$maximum_key] = :maximum
+        \\mapping[$minimum_key] = :minimum
+        \\mapping
+    );
+    var capsule = try producer.exportValue(std.testing.allocator, root, .{});
+    defer capsule.deinit(std.testing.allocator);
+
+    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    defer consumer.deinit();
+    const restored = try consumer.importValue(capsule.view(), .{});
+    try consumer.vm.setGlobal("wide_integer_keys", restored);
+    try consumer.vm.setGlobal("maximum_key", consumer.vm.intValue(std.math.maxInt(i64)));
+    try consumer.vm.setGlobal("minimum_key", consumer.vm.intValue(std.math.minInt(i64)));
+    const matches = try consumer.run(
+        \\$wide_integer_keys.size == 22 &&
+        \\  $wide_integer_keys[$maximum_key] == :maximum &&
+        \\  $wide_integer_keys[$minimum_key] == :minimum &&
+        \\  (($wide_integer_keys[$maximum_key] = :updated) == :updated) &&
+        \\  $wide_integer_keys.size == 22 &&
+        \\  $wide_integer_keys[$maximum_key] == :updated
+    );
+    try std.testing.expect(matches.isTruthy());
+}
+
+test "sandbox: StateCapsule export enforces Hash insertion work admission" {
+    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+    // Seed through the C ABI because this pinned parser rejects some decimal
+    // literals outside its immediate-integer range even though mrb_int is i64.
+    try iso.vm.setGlobal("hash_collision_stride", iso.vm.intValue(0x1_0000_0000));
+    const collision_hash = try iso.run(
+        \\mapping = {}
+        \\index = 0
+        \\while index < 24
+        \\  mapping[index * $hash_collision_stride] = nil
+        \\  index += 1
+        \\end
+        \\mapping
+    );
+    try std.testing.expectError(error.CapsuleLimitExceeded, iso.exportValue(
+        std.testing.allocator,
+        collision_hash,
+        .{},
+    ));
+    const diagnostic = iso.lastArtifactError().?;
+    try std.testing.expectEqual(
+        mruby.sandbox.ArtifactDiagnostic.Kind.limit_exceeded,
+        diagnostic.kind,
+    );
+    try std.testing.expectEqualStrings("$#0.key[23]", diagnostic.graph_path.?);
+    try std.testing.expect(diagnostic.encoded_offset == null);
+}
+
+test "sandbox: StateCapsule Symbol-heavy Hash uses inert name hashing" {
+    if (!test_config.has_core_language_suite) return error.SkipZigTest;
+    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    defer producer.deinit();
+    const mapping = try producer.run(
+        \\mapping = {}
+        \\index = 0
+        \\while index < 64
+        \\  mapping[("symbol" + index.to_s).to_sym] = index
+        \\  index += 1
+        \\end
+        \\mapping
+    );
+    var capsule = try producer.exportValue(std.testing.allocator, mapping, .{});
+    defer capsule.deinit(std.testing.allocator);
+
+    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    defer consumer.deinit();
+    const restored = try consumer.importValue(capsule.view(), .{});
+    try consumer.vm.setGlobal("symbol_hash", restored);
+    try std.testing.expect((try consumer.run(
+        "$symbol_hash.size == 64 && $symbol_hash[:symbol0] == 0 && $symbol_hash[:symbol63] == 63",
+    )).isTruthy());
+}
+
+test "sandbox: StateCapsule catches OOM while protecting a materialized result" {
+    const test_c = struct {
+        extern fn mrz_artifact_test_fill_arena(mrb: *mruby.c.mrb_state) c_int;
+    };
+
+    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    defer producer.deinit();
+    var capsule = try producer.exportValue(
+        std.testing.allocator,
+        try producer.run("'arena-result'"),
+        .{},
+    );
+    defer capsule.deinit(std.testing.allocator);
+
+    // Bootstrap happens before policy caps are installed, so the first
+    // attributed arena growth is deterministically refused by this cap.
+    const consumer = try mruby.sandbox.Isolate.spawn(.{ .limits = .{
+        .hard_memory_bytes = 1,
+    } });
+    defer consumer.deinit();
+    const entry_arena = test_c.mrz_artifact_test_fill_arena(consumer.vm.mrb);
+    defer mruby.c.mrz_gc_arena_restore(consumer.vm.mrb, entry_arena);
+
+    try std.testing.expectError(error.MemoryLimitExceeded, consumer.importValue(
+        capsule.view(),
+        .{},
+    ));
+    try std.testing.expect(consumer.cell.hardOom());
+    try std.testing.expect(mruby.c.mrz_nil_p(mruby.c.mrz_exc_value(consumer.vm.mrb)));
+}
+
+test "sandbox: StateCapsule import distinguishes soft policy refusal" {
+    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    defer producer.deinit();
+    const source_bytes = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(source_bytes);
+    @memset(source_bytes, 's');
+    var capsule = try producer.exportValue(
+        std.testing.allocator,
+        producer.vm.stringValue(source_bytes),
+        .{},
+    );
+    defer capsule.deinit(std.testing.allocator);
+
+    // Bootstrap precedes cap installation, so a one-byte soft ceiling makes
+    // the first graph-construction allocation deterministically fail without
+    // setting the separate hard-limit bit.
+    const consumer = try mruby.sandbox.Isolate.spawn(.{ .limits = .{
+        .memory_bytes = 1,
+    } });
+    defer consumer.deinit();
+    try std.testing.expectError(error.MemoryLimitExceeded, consumer.importValue(
+        capsule.view(),
+        .{},
+    ));
+    try std.testing.expect(consumer.cell.softOom());
+    try std.testing.expect(!consumer.cell.hardOom());
+    try std.testing.expect(mruby.c.mrz_nil_p(mruby.c.mrz_exc_value(consumer.vm.mrb)));
+}
+
+test "sandbox: StateCapsule process allocation failures stay contained" {
+    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    defer producer.deinit();
+    const root = try producer.run(
+        \\key = "key".freeze
+        \\cycle = []
+        \\mapping = {key => cycle, :alias => cycle}
+        \\cycle << mapping
+        \\mapping
+    );
+    var capsule = try producer.exportValue(std.testing.allocator, root, .{});
+    defer capsule.deinit(std.testing.allocator);
+
+    const previous_allocator = mruby.alloc.gpa;
+    var measurement = std.testing.FailingAllocator.init(previous_allocator, .{});
+    {
+        const consumer = try mruby.sandbox.Isolate.spawn(.{});
+        defer consumer.deinit();
+        const result = blk: {
+            mruby.alloc.gpa = measurement.allocator();
+            defer mruby.alloc.gpa = previous_allocator;
+            break :blk consumer.importValue(capsule.view(), .{});
+        };
+        _ = try result;
+    }
+    const allocation_count = measurement.alloc_index;
+    try std.testing.expect(allocation_count > 0);
+
+    for (0..allocation_count) |fail_index| {
+        const consumer = try mruby.sandbox.Isolate.spawn(.{});
+        defer consumer.deinit();
+        var failing = std.testing.FailingAllocator.init(previous_allocator, .{
+            .fail_index = fail_index,
+        });
+        const result = blk: {
+            mruby.alloc.gpa = failing.allocator();
+            defer mruby.alloc.gpa = previous_allocator;
+            break :blk consumer.importValue(capsule.view(), .{});
+        };
+        try std.testing.expectError(error.OutOfMemory, result);
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expect(mruby.c.mrz_nil_p(mruby.c.mrz_exc_value(consumer.vm.mrb)));
+    }
+}
+
+fn duplicateZeroHashKeyCapsule(
+    allocator: std.mem.Allocator,
+) !mruby.artifact.StateCapsule {
+    // A canonical one-node Hash whose two keys are +0.0 and -0.0. The frame
+    // and checksum are valid; only the mruby-compatible key semantics make it
+    // invalid.
+    var payload: [49]u8 = undefined;
+    var writer = mruby.artifact.Writer.init(&payload);
+    try mruby.artifact.writeStatePrelude(&writer, .{
+        .node_count = 1,
+        .edge_count = 4,
+        .root = .{ .node_ref = 0 },
+    });
+    try mruby.artifact.writeNodeRecordHeader(&writer, .{
+        .id = 0,
+        .kind = .hash,
+        .flags = 0,
+        .body_len = 24,
+    });
+    try writer.writeU32(2);
+    try mruby.artifact.writeValueRef(&writer, .{ .float = 0x0000_0000_0000_0000 });
+    try mruby.artifact.writeValueRef(&writer, .{ .nil = {} });
+    try mruby.artifact.writeValueRef(&writer, .{ .float = 0x8000_0000_0000_0000 });
+    try mruby.artifact.writeValueRef(&writer, .{ .nil = {} });
+    try writer.finish();
+    return mruby.artifact.wrapState(allocator, &payload, .{});
+}
+
+fn immediateFloatCapsule(
+    allocator: std.mem.Allocator,
+    bits: u64,
+) !mruby.artifact.StateCapsule {
+    var payload: [17]u8 = undefined;
+    var writer = mruby.artifact.Writer.init(&payload);
+    try mruby.artifact.writeStatePrelude(&writer, .{
+        .node_count = 0,
+        .edge_count = 0,
+        .root = .{ .float = bits },
+    });
+    try writer.finish();
+    return mruby.artifact.wrapState(allocator, &payload, .{});
+}
+
+test "sandbox: StateCapsule preserves cycles aliases defaults order and frozen state" {
+    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    defer producer.deinit();
+    const root = try producer.run(
+        \\shared = "a\\x00b".freeze
+        \\equal_but_distinct = "a\\x00b".freeze
+        \\cycle = []
+        \\cycle << cycle
+        \\mapping = {}
+        \\mapping[:first] = shared
+        \\mapping[:second] = shared
+        \\mapping[:equal] = equal_but_distinct
+        \\mapping[:cycle] = cycle
+        \\mapping.default = "fallback".freeze
+        \\mapping.freeze
+        \\[mapping, shared, equal_but_distinct].freeze
+    );
+
+    var capsule = try producer.exportValue(std.testing.allocator, root, .{});
+    defer capsule.deinit(std.testing.allocator);
+
+    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    defer consumer.deinit();
+    const restored = try consumer.importValue(capsule.view(), .{});
+    // A successful heap import deliberately leaves one ordinary arena root.
+    // Prove the graph survives a full collection before the host publishes it
+    // into a longer-lived Ruby root such as a global.
+    mruby.alloc.enterIsolate(&consumer.cell);
+    mruby.c.mrb_full_gc(consumer.vm.mrb);
+    mruby.alloc.exitIsolate();
+    try consumer.vm.setGlobal("restored_graph", restored);
+    const matches = try consumer.run(
+        \\mapping = $restored_graph[0]
+        \\$restored_graph.frozen? &&
+        \\  mapping.frozen? &&
+        \\  mapping.keys == [:first, :second, :equal, :cycle] &&
+        \\  mapping[:first].equal?(mapping[:second]) &&
+        \\  !mapping[:first].equal?(mapping[:equal]) &&
+        \\  mapping[:first] == "a\\x00b" &&
+        \\  mapping[:first].frozen? &&
+        \\  mapping[:cycle].equal?(mapping[:cycle][0]) &&
+        \\  mapping[:missing] == "fallback" &&
+        \\  mapping.default.frozen?
+    );
+    try std.testing.expect(matches.isTruthy());
+}
+
+test "sandbox: StateCapsule preserves binary64 NaN payloads and signed zero" {
+    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    defer producer.deinit();
+    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    defer consumer.deinit();
+
+    const cases = [_]u64{
+        0x7ff8_1234_5678_9abc,
+        0xfff8_dead_beef_0042,
+        0x0000_0000_0000_0000,
+        0x8000_0000_0000_0000,
+    };
+    for (cases) |expected_bits| {
+        // Seed through the stable wire so host floating-point construction
+        // cannot canonicalize a NaN before it reaches the artifact seam.
+        var seed = try immediateFloatCapsule(std.testing.allocator, expected_bits);
+        defer seed.deinit(std.testing.allocator);
+        const original = try producer.importValue(seed.view(), .{});
+        try std.testing.expectEqual(expected_bits, @as(u64, @bitCast(try original.asFloat())));
+
+        var exported = try producer.exportValue(std.testing.allocator, original, .{});
+        defer exported.deinit(std.testing.allocator);
+        const restored = try consumer.importValue(exported.view(), .{});
+        try std.testing.expectEqual(expected_bits, @as(u64, @bitCast(try restored.asFloat())));
+    }
+}
+
+test "sandbox: StateCapsule schema admission is explicit and minor-compatible" {
+    const id = [_]u8{ 0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f };
+    const produced: mruby.artifact.Schema = .{ .id = id, .major = 3, .minor = 2 };
+
+    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    defer producer.deinit();
+    var capsule = try producer.exportValue(
+        std.testing.allocator,
+        try producer.run("[:schema, 42]"),
+        .{ .schema = produced },
+    );
+    defer capsule.deinit(std.testing.allocator);
+
+    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    defer consumer.deinit();
+    try std.testing.expectError(error.SchemaMismatch, consumer.importValue(capsule.view(), .{}));
+    try std.testing.expectEqual(
+        mruby.sandbox.ArtifactDiagnostic.Kind.schema_mismatch,
+        consumer.lastArtifactError().?.kind,
+    );
+    try std.testing.expectError(error.SchemaMismatch, consumer.importValue(capsule.view(), .{
+        .accepted_schema = .{ .id = id, .major = 3, .minor = 1 },
+    }));
+
+    const restored = try consumer.importValue(capsule.view(), .{
+        .accepted_schema = .{ .id = id, .major = 3, .minor = 7 },
+    });
+    try std.testing.expect(consumer.lastArtifactError() == null);
+    try consumer.vm.setGlobal("schema_value", restored);
+    try std.testing.expect((try consumer.run("$schema_value == [:schema, 42]")).isTruthy());
+}
+
+test "sandbox: StateCapsule policy and per-call limits can only tighten" {
+    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    defer producer.deinit();
+    const root = try producer.run("[1, 2]");
+
+    // The graph has exactly one node and two edges.
+    var boundary = try producer.exportValue(std.testing.allocator, root, .{
+        .limits = .{ .max_nodes = 1, .max_total_edges = 2 },
+    });
+    defer boundary.deinit(std.testing.allocator);
+    try std.testing.expectError(error.CapsuleLimitExceeded, producer.exportValue(
+        std.testing.allocator,
+        root,
+        .{ .limits = .{ .max_total_edges = 1 } },
+    ));
+    try std.testing.expectEqual(
+        mruby.sandbox.ArtifactDiagnostic.Kind.limit_exceeded,
+        producer.lastArtifactError().?.kind,
+    );
+
+    const constrained = try mruby.sandbox.Isolate.spawn(.{ .artifacts = .{
+        .limits = .{ .capsule = .{ .max_total_edges = 1 } },
+    } });
+    defer constrained.deinit();
+    try std.testing.expectError(error.CapsuleLimitExceeded, constrained.importValue(
+        boundary.view(),
+        .{ .limits = .{ .max_total_edges = 100 } },
+    ));
+
+    const per_call = try mruby.sandbox.Isolate.spawn(.{});
+    defer per_call.deinit();
+    try std.testing.expectError(error.CapsuleLimitExceeded, per_call.importValue(
+        boundary.view(),
+        .{ .limits = .{ .max_total_edges = 1 } },
+    ));
+    try std.testing.expectError(error.ArtifactLimitExceeded, per_call.importValue(
+        boundary.view(),
+        .{ .limits = .{ .max_encoded_bytes = boundary.encoded.len - 1 } },
+    ));
+}
+
+test "sandbox: StateCapsule rejects unsupported values and container state with paths" {
+    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+
+    const subclass = try iso.run("class ArtifactArray < Array; end; ArtifactArray.new");
+    try std.testing.expectError(error.UnsupportedContainerState, iso.exportValue(
+        std.testing.allocator,
+        subclass,
+        .{},
+    ));
+    try std.testing.expectEqual(
+        mruby.sandbox.ArtifactDiagnostic.Kind.unsupported_container_state,
+        iso.lastArtifactError().?.kind,
+    );
+    try std.testing.expectEqualStrings("$", iso.lastArtifactError().?.graph_path.?);
+
+    if (test_config.has_core_language_suite) {
+        // instance_variable_set is provided by mruby-object-ext, so exercise
+        // this branch whenever that standard integration surface is present.
+        const with_ivar = try iso.run(
+            "mapping = {}; mapping.instance_variable_set(:@artifact_note, 1); mapping",
+        );
+        try std.testing.expectError(error.UnsupportedContainerState, iso.exportValue(
+            std.testing.allocator,
+            with_ivar,
+            .{},
+        ));
+        try std.testing.expect(std.mem.startsWith(
+            u8,
+            iso.lastArtifactError().?.graph_path.?,
+            "$#0",
+        ));
+
+        const direct_ifnone = try iso.run(
+            "mapping = {}; mapping.instance_variable_set(:@ifnone, :hidden); mapping",
+        );
+        try std.testing.expectError(error.UnsupportedContainerState, iso.exportValue(
+            std.testing.allocator,
+            direct_ifnone,
+            .{},
+        ));
+
+        const singleton_container = try iso.run(
+            "value = []; def value.artifact_marker; :marker; end; value",
+        );
+        try std.testing.expectError(error.UnsupportedContainerState, iso.exportValue(
+            std.testing.allocator,
+            singleton_container,
+            .{},
+        ));
+    }
+
+    // mruby keeps an observable @ifnone ivar after assigning nil while its
+    // semantic default flag is clear. Reject that state instead of silently
+    // dropping the ivar from the capsule.
+    const nil_default = try iso.run("mapping = {}; mapping.default = nil; mapping");
+    try std.testing.expectError(error.UnsupportedContainerState, iso.exportValue(
+        std.testing.allocator,
+        nil_default,
+        .{},
+    ));
+
+    const default_proc = try iso.run("Hash.new { |hash, key| key }");
+    try std.testing.expectError(error.UnsupportedContainerState, iso.exportValue(
+        std.testing.allocator,
+        default_proc,
+        .{},
+    ));
+
+    const unsafe_key = try iso.run("{true => 1}");
+    try std.testing.expectError(error.UnsupportedHashKey, iso.exportValue(
+        std.testing.allocator,
+        unsafe_key,
+        .{},
+    ));
+    try std.testing.expectEqual(
+        mruby.sandbox.ArtifactDiagnostic.Kind.unsupported_hash_key,
+        iso.lastArtifactError().?.kind,
+    );
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        iso.lastArtifactError().?.graph_path.?,
+        ".key[0]",
+    ));
+
+    const unsupported = try iso.run("-> { 1 }");
+    try std.testing.expectError(error.UnsupportedValue, iso.exportValue(
+        std.testing.allocator,
+        unsupported,
+        .{},
+    ));
+}
+
+test "sandbox: StateCapsule rejects foreign values without inspecting their graph" {
+    const owner = try mruby.sandbox.Isolate.spawn(.{});
+    defer owner.deinit();
+    const other = try mruby.sandbox.Isolate.spawn(.{});
+    defer other.deinit();
+
+    try std.testing.expectError(error.ForeignValue, other.exportValue(
+        std.testing.allocator,
+        try owner.run("[1, 2, 3]"),
+        .{},
+    ));
+    const diagnostic = other.lastArtifactError().?;
+    try std.testing.expectEqual(mruby.sandbox.ArtifactDiagnostic.Kind.foreign_value, diagnostic.kind);
+    try std.testing.expectEqualStrings("$", diagnostic.graph_path.?);
+}
+
+test "sandbox: StateCapsule reports semantic duplicate encoded Hash keys" {
+    var capsule = try duplicateZeroHashKeyCapsule(std.testing.allocator);
+    defer capsule.deinit(std.testing.allocator);
+    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+
+    try std.testing.expectError(error.InvalidArtifact, iso.importValue(capsule.view(), .{}));
+    const diagnostic = iso.lastArtifactError().?;
+    try std.testing.expectEqual(
+        mruby.sandbox.ArtifactDiagnostic.Kind.duplicate_hash_key,
+        diagnostic.kind,
+    );
+    try std.testing.expectEqualStrings("$#0.key[1]", diagnostic.graph_path.?);
+    try std.testing.expect(diagnostic.encoded_offset != null);
+}
+
+test "sandbox: StateCapsule distinguishes framing and checksum failures" {
+    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    defer producer.deinit();
+    var capsule = try producer.exportValue(
+        std.testing.allocator,
+        try producer.run("[1, 2, 3]"),
+        .{},
+    );
+    defer capsule.deinit(std.testing.allocator);
+
+    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    defer consumer.deinit();
+    for (0..capsule.encoded.len) |cut| {
+        try std.testing.expectError(error.InvalidArtifact, consumer.importValue(.{
+            .bytes = capsule.encoded[0..cut],
+        }, .{}));
+        try std.testing.expectEqual(
+            mruby.sandbox.ArtifactDiagnostic.Kind.invalid_envelope,
+            consumer.lastArtifactError().?.kind,
+        );
+    }
+
+    const corrupted = try std.testing.allocator.dupe(u8, capsule.encoded);
+    defer std.testing.allocator.free(corrupted);
+    corrupted[corrupted.len - 1] ^= 0x80;
+    try std.testing.expectError(error.ChecksumMismatch, consumer.importValue(.{
+        .bytes = corrupted,
+    }, .{}));
+    try std.testing.expectEqual(
+        mruby.sandbox.ArtifactDiagnostic.Kind.checksum_mismatch,
+        consumer.lastArtifactError().?.kind,
+    );
+}
+
+test "sandbox: StateCapsule control operations preserve execution state and last error" {
+    const iso = try mruby.sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 100_000 },
+    } });
+    defer iso.deinit();
+    const root = try iso.run("[1, 2, 3]");
+    var capsule = try iso.exportValue(std.testing.allocator, root, .{});
+    defer capsule.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.RubyException, iso.run("raise 'artifact sentinel'"));
+    const before = iso.stats();
+    const before_message = iso.lastError().?.message();
+    defer mruby.alloc.gpa.free(before_message);
+    try std.testing.expectEqualStrings("artifact sentinel", before_message);
+
+    var second = try iso.exportValue(std.testing.allocator, root, .{});
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InvalidArtifact, iso.importValue(.{
+        .bytes = capsule.encoded[0 .. capsule.encoded.len - 1],
+    }, .{}));
+
+    const after = iso.stats();
+    try std.testing.expectEqual(before.instructions, after.instructions);
+    try std.testing.expectEqual(before.wall_time_ns, after.wall_time_ns);
+    try std.testing.expectEqual(before.gas.?.generation, after.gas.?.generation);
+    try std.testing.expectEqual(before.gas.?.used, after.gas.?.used);
+    try std.testing.expect(!iso.pendingTermination());
+    const after_message = iso.lastError().?.message();
+    defer mruby.alloc.gpa.free(after_message);
+    try std.testing.expectEqualStrings("artifact sentinel", after_message);
+}
+
+test "sandbox: StateCapsule construction does not dispatch guest overrides" {
+    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    defer producer.deinit();
+    const root = try producer.run(
+        \\key = "safe".freeze
+        \\{key => [1, 2, 3]}
+    );
+    _ = try producer.run(
+        \\class String
+        \\  def hash; raise "String#hash dispatched"; end
+        \\  def eql?(other); raise "String#eql? dispatched"; end
+        \\end
+    );
+    var capsule = try producer.exportValue(std.testing.allocator, root, .{});
+    defer capsule.deinit(std.testing.allocator);
+
+    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    defer consumer.deinit();
+    _ = try consumer.run(
+        \\class String
+        \\  def hash; raise "String#hash dispatched"; end
+        \\  def eql?(other); raise "String#eql? dispatched"; end
+        \\end
+        \\class Array
+        \\  def self.new(*args); raise "Array.new dispatched"; end
+        \\end
+        \\class Hash
+        \\  def self.new(*args); raise "Hash.new dispatched"; end
+        \\end
+        \\class Object
+        \\  def _dump(*args); raise "_dump dispatched"; end
+        \\  def method_missing(*args); raise "method_missing dispatched"; end
+        \\  def self._load(*args); raise "_load dispatched"; end
+        \\end
+    );
+    _ = try consumer.importValue(capsule.view(), .{});
+}
+
+test "sandbox: StateCapsule operations reject a concurrently running Isolate" {
+    const Gate = struct {
+        var entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+        var release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+        fn block(m: *mruby.Vm, self: mruby.Value) !mruby.Value {
+            _ = self;
+            entered.store(true, .release);
+            while (!release.load(.acquire)) std.atomic.spinLoopHint();
+            return m.nilValue();
+        }
+    };
+    const Runner = struct {
+        iso: *mruby.sandbox.Isolate,
+        failure: ?anyerror = null,
+
+        fn run(runner: *@This()) void {
+            _ = runner.iso.run("ArtifactConcurrentGate.block") catch |err| {
+                runner.failure = err;
+                return;
+            };
+        }
+    };
+
+    Gate.entered.store(false, .release);
+    Gate.release.store(false, .release);
+    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+    const class = try iso.vm.defineClass("ArtifactConcurrentGate", null);
+    class.defineClassMethod("block", "", Gate.block);
+    const root = try iso.run("[1, 2]");
+    var capsule = try iso.exportValue(std.testing.allocator, root, .{});
+    defer capsule.deinit(std.testing.allocator);
+
+    var runner = Runner{ .iso = iso };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&runner});
+    var joined = false;
+    defer if (!joined) {
+        Gate.release.store(true, .release);
+        thread.join();
+    };
+    while (!Gate.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    try std.testing.expectError(error.IsolateThreadBusy, iso.exportValue(
+        std.testing.allocator,
+        root,
+        .{},
+    ));
+    try std.testing.expectError(error.IsolateThreadBusy, iso.importValue(capsule.view(), .{}));
+    try std.testing.expect(iso.lastArtifactError() == null);
+
+    Gate.release.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expect(runner.failure == null);
+}
+
+test "sandbox: StateCapsule operations from same-Isolate callbacks are busy" {
+    const Callback = struct {
+        var isolate: ?*mruby.sandbox.Isolate = null;
+        var root: ?mruby.Value = null;
+        var capsule_view: ?mruby.artifact.StateCapsuleView = null;
+
+        fn exportBusy(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
+            _ = self;
+            var capsule = isolate.?.exportValue(
+                std.testing.allocator,
+                root.?,
+                .{},
+            ) catch |err| {
+                if (err == error.IsolateThreadBusy) return m.boolValue(true);
+                return err;
+            };
+            defer capsule.deinit(std.testing.allocator);
+            return m.boolValue(false);
+        }
+
+        fn importBusy(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
+            _ = self;
+            _ = isolate.?.importValue(capsule_view.?, .{}) catch |err| {
+                if (err == error.IsolateThreadBusy) return m.boolValue(true);
+                return err;
+            };
+            return m.boolValue(false);
+        }
+    };
+
+    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+    const root = try iso.run("[1, 2]");
+    var capsule = try iso.exportValue(std.testing.allocator, root, .{});
+    defer capsule.deinit(std.testing.allocator);
+    Callback.isolate = iso;
+    Callback.root = root;
+    Callback.capsule_view = capsule.view();
+    defer {
+        Callback.isolate = null;
+        Callback.root = null;
+        Callback.capsule_view = null;
+    }
+
+    const class = try iso.vm.defineClass("ArtifactCallback", null);
+    class.defineClassMethod("export_busy", "", Callback.exportBusy);
+    class.defineClassMethod("import_busy", "", Callback.importBusy);
+    try std.testing.expect((try iso.run("ArtifactCallback.export_busy")).isTruthy());
+    try std.testing.expect((try iso.run("ArtifactCallback.import_busy")).isTruthy());
+}
+
 test "sandbox: explicit per-isolate gas preserves sticky legacy behavior" {
     const iso = try sandbox.Isolate.spawn(.{ .limits = .{
         .gas = .{ .per_isolate = 2_000 },

@@ -23,7 +23,14 @@ pub const data = @import("data.zig");
 pub const output = @import("output.zig");
 pub const convert = @import("convert.zig");
 pub const alloc = @import("alloc.zig");
+pub const artifact = @import("artifact.zig");
 pub const sandbox = @import("sandbox.zig");
+
+/// Test-build-only access to private seams used by standalone fuzz targets.
+/// This declaration is empty in library and executable builds.
+pub const internal_test = if (@import("builtin").is_test) struct {
+    pub const artifact_value = @import("artifact_value.zig");
+} else struct {};
 
 /// Raw C bindings + shim; public for power users, but the safe layer above
 /// is the supported surface.
@@ -37,5 +44,7 @@ test {
     _ = @import("class.zig");
     _ = @import("convert.zig");
     _ = @import("alloc.zig");
+    _ = @import("artifact.zig");
+    _ = @import("artifact_value.zig");
     _ = @import("sandbox.zig");
 }

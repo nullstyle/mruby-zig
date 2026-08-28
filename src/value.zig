@@ -66,7 +66,9 @@ pub const Value = struct {
     /// Float value; error if this value is not a Float.
     pub fn asFloat(self: Value) !f64 {
         if (!c.mrz_float_p(self.v)) return error.TypeMismatch;
-        return c.mrz_float_v(self.v);
+        var bits: u64 = undefined;
+        if (!c.mrz_artifact_float_bits(self.v, &bits)) return error.TypeMismatch;
+        return @bitCast(bits);
     }
 
     /// String contents as a **borrowed** slice pointing into the Ruby heap.

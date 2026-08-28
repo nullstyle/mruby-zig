@@ -4,7 +4,8 @@
 //! which every presym-able macro invocation has expanded to a
 //! `<@! "name" !@>` marker, followed by the output directory as the final
 //! argument. Output: `<out-dir>/mruby/presym/{id.h,table.h}` plus
-//! `<out-dir>/presym.txt` (the sorted symbol list, for debugging).
+//! `<out-dir>/presym.txt` (the sorted symbol list, for debugging) and the raw
+//! 32-byte `<out-dir>/presym.digest` compatibility input.
 //!
 //! Only internal consistency is required (see presym.rb): symbols are
 //! deduplicated, sorted by (byte length, bytes), numbered from 1, and the
@@ -12,6 +13,7 @@
 //! that single ordering.
 
 const std = @import("std");
+const artifact_identity = @import("artifact_identity");
 
 /// Operator symbol → enum suffix, mirroring `MRuby::Presym::OPERATORS`.
 const operators = [_]struct { sym: []const u8, name: []const u8 }{
@@ -82,6 +84,7 @@ pub fn main(init: std.process.Init) !void {
 
     const list = syms.keys();
     std.mem.sort([]const u8, list, {}, symLessThan);
+    const table_digest = artifact_identity.presymTableDigest(list);
 
     var id_h: Emitter = .init(arena);
     var table_h: Emitter = .init(arena);
@@ -125,6 +128,10 @@ pub fn main(init: std.process.Init) !void {
     try cwd.writeFile(io, .{
         .sub_path = try std.fmt.allocPrint(arena, "{s}/presym.txt", .{out_dir}),
         .data = txt.slice(),
+    });
+    try cwd.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "{s}/presym.digest", .{out_dir}),
+        .data = &table_digest,
     });
 }
 

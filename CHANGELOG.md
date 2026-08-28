@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.0 (2026-08-28)
+
+Typed artifacts and portable value transfer:
+
+- Added `artifact.RiteImage` plus `sandbox.compileRite` and
+  `Isolate.runRite`. The stable outer envelope checks length, SHA-256
+  integrity, generated mruby/RITE compatibility, and optional exact
+  application identity before executing under the normal sandbox policy.
+  `source_name` gives compiled code a stable `__FILE__`; embedded NUL is
+  rejected.
+- Added bounded `artifact.StateCapsule` export/import for nil, booleans,
+  signed 64-bit integers, binary64 floats, symbols, exact-core Strings,
+  Arrays, and Hashes. Cycles, aliases, insertion order, frozen container state,
+  and non-proc Hash defaults are preserved without guest dispatch.
+- StateCapsule v1 restricts Hash keys to Integer, Float, Symbol, and frozen
+  exact-core String. Unsupported values, behavioral container state, default
+  procs, foreign roots, malformed graphs, schema mismatch, and resource limits
+  produce typed errors with best-effort artifact diagnostics.
+- Added optional application schemas and policy-cached artifact limits.
+  Per-operation capsule limits may tighten but cannot relax the Isolate's
+  acceptance policy. Owned artifacts contain only encoded bytes and must be
+  destroyed with the allocator used to create them.
+- Added symmetric export/import Hash-work preflight with non-relaxable pair,
+  probe, and String-comparison ceilings. Audited generated mruby patches give
+  full-width Integer keys numeric hashes and Symbols stable name-byte hashes;
+  their semantic markers participate in RITE compatibility identity.
+- Added deterministic non-blocking same-Isolate operation admission across
+  guest execution and artifact operations. Invalid typed RITE is rejected
+  without changing Ruby error, lifetime timing, gas, capability, or
+  termination state; `terminate()` remains lock-free.
+- Added a coverage-guided StateCapsule parser target with stable valid and
+  malformed corpus seeds, plus a golden producer/consumer subprocess fixture
+  that verifies byte stability and restoration into a separate OS process.
+- Deprecated raw `sandbox.compile` and `Isolate.runImage` for one compatibility
+  cycle. They still work but lack the typed envelope's complete compatibility
+  and application checks.
+
 ## 0.2.0 (2026-08-28)
 
 Gas policy and reusable Isolates:

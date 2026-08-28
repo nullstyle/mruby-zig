@@ -50,6 +50,17 @@ jobs:
       - run: mise x -- zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
         continue-on-error: ${{ matrix.target == 'x86_64-windows-gnu' }}
 
+  thread-sanitizer:
+    name: thread sanitizer (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+      - run: mise install
+      - run: mise x -- zig build test -Dsanitize-thread=true
+
   gem-sets:
     name: gem set (${{ matrix.gem_set }})
     runs-on: ubuntu-latest

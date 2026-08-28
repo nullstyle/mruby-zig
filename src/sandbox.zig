@@ -37,6 +37,9 @@ const value_mod = @import("value.zig");
 const error_mod = @import("error.zig");
 const alloc_mod = @import("alloc.zig");
 const gas_mod = @import("gas.zig");
+const artifact_mod = @import("artifact.zig");
+const artifact_value = @import("artifact_value.zig");
+const artifact_config = @import("artifact_config");
 
 pub const Vm = vm_mod.Vm;
 pub const Value = value_mod.Value;
@@ -45,6 +48,80 @@ pub const RubyError = error_mod.RubyError;
 pub const GasPolicy = gas_mod.Policy;
 pub const GasScope = gas_mod.Scope;
 pub const GasStats = gas_mod.Stats;
+
+pub const CompileRiteOptions = struct {
+    include_debug: bool = false,
+    source_name: []const u8 = "(mruby-zig)",
+    application: ?artifact_mod.ApplicationFingerprint = null,
+};
+
+pub const CompileRiteError = std.mem.Allocator.Error || error{
+    CompileFailed,
+    InvalidSourceName,
+};
+
+pub const RunRiteError = artifact_mod.RiteValidationError || error{
+    IsolatePreparing,
+    IsolateThreadBusy,
+    RubyException,
+    ScriptTerminated,
+    DeadlineExceeded,
+    GasExhausted,
+    MemoryLimitExceeded,
+    CallDepthExceeded,
+    CapabilityApplicationFailed,
+};
+
+pub const ExportValueOptions = struct {
+    limits: ?artifact_mod.CapsuleLimits = null,
+    schema: ?artifact_mod.Schema = null,
+};
+
+pub const ImportValueOptions = struct {
+    limits: ?artifact_mod.CapsuleLimits = null,
+    accepted_schema: ?artifact_mod.Schema = null,
+};
+
+pub const ValueCodecError = artifact_mod.FramingError || error{
+    ForeignValue,
+    UnsupportedValue,
+    UnsupportedContainerState,
+    UnsupportedHashKey,
+    NumericOutOfRange,
+    CapsuleLimitExceeded,
+    SchemaMismatch,
+    IsolatePreparing,
+    IsolateThreadBusy,
+    MemoryLimitExceeded,
+    ArtifactConstructionFailed,
+};
+
+pub const ExportValueError = std.mem.Allocator.Error || ValueCodecError;
+pub const ImportValueError = std.mem.Allocator.Error || ValueCodecError;
+
+pub const ArtifactDiagnostic = struct {
+    kind: Kind,
+    encoded_offset: ?usize = null,
+    graph_path: ?[]const u8 = null,
+    value_type: ?value_mod.Type = null,
+
+    pub const Kind = enum {
+        invalid_envelope,
+        checksum_mismatch,
+        unsupported_version,
+        limit_exceeded,
+        foreign_value,
+        unsupported_value,
+        unsupported_container_state,
+        unsupported_hash_key,
+        numeric_out_of_range,
+        schema_mismatch,
+        dangling_reference,
+        duplicate_object_id,
+        duplicate_hash_key,
+        construction_failed,
+    };
+};
 
 /// Enforced resource limits. All optional; unset fields are unbounded.
 pub const Limits = struct {
@@ -94,6 +171,7 @@ pub const Capabilities = struct {
 pub const Policy = struct {
     limits: Limits = .{},
     capabilities: Capabilities = .{},
+    artifacts: artifact_mod.Acceptance = .{},
 };
 
 pub const Stats = struct {
@@ -169,10 +247,15 @@ pub fn sleepNs(ns: u64) void {
 pub const Isolate = struct {
     vm: *Vm,
     policy: Policy,
+    artifact_acceptance: artifact_mod.Acceptance,
     resolved_gas: GasPolicy,
     gas_meter: ?gas_mod.Meter,
     last_gas: ?GasStats,
     cell: alloc_mod.IsolateCell = .{},
+    /// Serializes the public operations that can enter or inspect the mruby
+    /// state. It is deliberately non-blocking: accidental same-Isolate
+    /// concurrency is reported to the caller instead of stalling.
+    operation_lock: std.atomic.Mutex = .unlocked,
 
     // hook/runtime state (owned by the isolate's thread while running)
     termination_bits: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
@@ -221,6 +304,8 @@ pub const Isolate = struct {
     policy_exceptions: c.mrb_value,
     error_message: c.mrb_value,
     error_class: c.mrb_value,
+    artifact_diagnostic: ?ArtifactDiagnostic = null,
+    artifact_path: ?[]u8 = null,
 
     /// Spawn an isolate with a policy. The underlying `Vm` is fully
     /// initialized; capabilities apply lazily on the first `run`/`call`
@@ -252,6 +337,7 @@ pub const Isolate = struct {
         iso.* = .{
             .vm = vm,
             .policy = policy,
+            .artifact_acceptance = policy.artifacts,
             .resolved_gas = resolved_gas,
             .gas_meter = initial_meter,
             .last_gas = if (initial_meter) |meter| meter.snapshot() else null,
@@ -285,6 +371,7 @@ pub const Isolate = struct {
     }
 
     pub fn deinit(iso: *Isolate) void {
+        iso.clearArtifactDiagnostic();
         const attribution = alloc_mod.pushIsolate(&iso.cell);
         c.mrz_set_code_fetch_hook(iso.vm.mrb, null);
         c.mrz_set_ud(iso.vm.mrb, null);
@@ -306,7 +393,8 @@ pub const Isolate = struct {
         }.body, src);
     }
 
-    /// Run a snapshot produced by `compile` (no parse/codegen).
+    /// Deprecated compatibility operation: run an unframed snapshot produced
+    /// by `compile` (no compatibility or application checks). Use `runRite`.
     pub fn runImage(iso: *Isolate, image: []const u8) !Value {
         return iso.enterExecution(struct {
             fn body(iso_: *Isolate, image_: []const u8) !Value {
@@ -319,6 +407,34 @@ pub const Isolate = struct {
         }.body, image);
     }
 
+    /// Validate and execute a typed RITE image. Framing and compatibility
+    /// failures occur before the execution lifecycle mutates Isolate state.
+    pub fn runRite(
+        iso: *Isolate,
+        image: artifact_mod.RiteImageView,
+    ) RunRiteError!Value {
+        const admission = try iso.admitExecution();
+        const owns_lock = admission == .outer;
+        defer if (owns_lock) iso.operation_lock.unlock();
+
+        const payload = try artifact_mod.validateRite(image, .{
+            .compatibility = artifact_config.rite_compatibility_fingerprint,
+            .application = iso.artifact_acceptance.application,
+            .max_encoded_bytes = iso.artifact_acceptance.limits.max_rite_bytes,
+        });
+
+        const Body = struct {
+            fn load(iso_: *Isolate, bytes: []const u8) !Value {
+                return iso_.vm.loadIrep(bytes);
+            }
+        };
+        if (admission == .nested) {
+            return Body.load(iso, payload.bytes) catch |err| return @errorCast(err);
+        }
+        return iso.enterOuterExecution(Body.load, payload.bytes) catch |err|
+            return @errorCast(err);
+    }
+
     /// Call a Ruby method under the policy (same error mapping as `run`).
     pub fn call(iso: *Isolate, recv: Value, name: []const u8, args: anytype) !Value {
         return iso.enterExecution(struct {
@@ -326,6 +442,90 @@ pub const Isolate = struct {
                 return iso_.vm.call(ctx.recv, ctx.name, ctx.args);
             }
         }.body, .{ .recv = recv, .name = name, .args = args });
+    }
+
+    /// Export a bounded, inert Ruby value graph. The returned bytes are owned
+    /// by `allocator`; release them with `capsule.deinit(allocator)`.
+    pub fn exportValue(
+        iso: *Isolate,
+        allocator: std.mem.Allocator,
+        root: Value,
+        options: ExportValueOptions,
+    ) ExportValueError!artifact_mod.StateCapsule {
+        try iso.beginArtifactOperation();
+        defer iso.endArtifactOperation();
+
+        if (root.mrb != iso.vm.mrb) {
+            iso.setArtifactDiagnostic(.{
+                .kind = .foreign_value,
+                .value_type = root.typeOf(),
+            }, "$");
+            return error.ForeignValue;
+        }
+
+        var failure: artifact_value.Failure = .{};
+        return artifact_value.exportValue(
+            allocator,
+            iso.vm.mrb,
+            root.v,
+            .{
+                .limits = iso.artifact_acceptance.limits.capsule.tightened(options.limits),
+                .schema = options.schema,
+            },
+            &failure,
+        ) catch |err| {
+            iso.recordArtifactFailure(err, &failure);
+            return err;
+        };
+    }
+
+    /// Validate a complete StateCapsule before constructing its value graph in
+    /// this Isolate. Process scratch is freed before return; a successful heap
+    /// result retains exactly one mruby arena root.
+    pub fn importValue(
+        iso: *Isolate,
+        capsule: artifact_mod.StateCapsuleView,
+        options: ImportValueOptions,
+    ) ImportValueError!Value {
+        try iso.beginArtifactOperation();
+        defer iso.endArtifactOperation();
+
+        const limits = iso.artifact_acceptance.limits.capsule.tightened(options.limits);
+        var failure: artifact_value.Failure = .{};
+        var graph = artifact_value.parse(alloc_mod.gpa, capsule, .{
+            .limits = limits,
+            .accepted_schema = options.accepted_schema,
+        }, &failure) catch |err| {
+            iso.recordArtifactFailure(err, &failure);
+            return err;
+        };
+        defer graph.deinit(alloc_mod.gpa);
+
+        // A sticky destination cap cannot be relaxed by importing. Parsing is
+        // intentionally complete before this check and performs no mruby work.
+        if (iso.cell.anyOom()) {
+            iso.setArtifactDiagnostic(.{ .kind = .limit_exceeded }, "$");
+            return error.MemoryLimitExceeded;
+        }
+
+        const attribution = alloc_mod.pushIsolate(&iso.cell);
+        const outcome = artifact_value.materialize(iso.vm.mrb, &graph);
+        alloc_mod.restoreIsolate(attribution);
+
+        return switch (outcome) {
+            .ok => |result| Value{ .mrb = iso.vm.mrb, .v = result.value },
+            .out_of_memory => {
+                if (iso.cell.anyOom()) {
+                    iso.setArtifactDiagnostic(.{ .kind = .limit_exceeded }, "$");
+                    return error.MemoryLimitExceeded;
+                }
+                return error.OutOfMemory;
+            },
+            .invalid, .unexpected => {
+                iso.setArtifactDiagnostic(.{ .kind = .construction_failed }, "$");
+                return error.ArtifactConstructionFailed;
+            },
+        };
     }
 
     /// Request termination from any thread. The next bytecode fetch observes
@@ -342,6 +542,13 @@ pub const Isolate = struct {
     /// unwind for an external or already-recorded cause.
     pub fn pendingTermination(iso: *Isolate) bool {
         return iso.termination_bits.load(.acquire) != 0 or iso.cell.anyOom();
+    }
+
+    /// Details for the most recent admitted StateCapsule export/import
+    /// failure. Borrowed slices remain valid until the next admitted value
+    /// artifact operation or Isolate destruction.
+    pub fn lastArtifactError(iso: *const Isolate) ?ArtifactDiagnostic {
+        return iso.artifact_diagnostic;
     }
 
     pub fn stats(iso: *Isolate) Stats {
@@ -383,18 +590,151 @@ pub const Isolate = struct {
         return .unlimited;
     }
 
-    fn enterExecution(iso: *Isolate, comptime body: anytype, ctx: anytype) !Value {
-        switch (iso.phase) {
-            .running => return body(iso, ctx),
-            .preparing => return error.IsolatePreparing,
-            .idle => {},
-        }
-        // The running phase above is the only supported nested entry seam.
-        // At idle, even this isolate's cell may belong to an outer trusted
-        // allocator bracket; entering and exiting again would destroy that
-        // caller's TLS attribution because the allocator API is not stacked.
-        if (alloc_mod.currentIsolateCell() != null) return error.IsolateThreadBusy;
+    const ExecutionAdmission = enum { nested, outer };
 
+    fn clearArtifactDiagnostic(iso: *Isolate) void {
+        if (iso.artifact_path) |path| alloc_mod.gpa.free(path);
+        iso.artifact_path = null;
+        iso.artifact_diagnostic = null;
+    }
+
+    fn setArtifactDiagnostic(
+        iso: *Isolate,
+        diagnostic: ArtifactDiagnostic,
+        path: ?[]const u8,
+    ) void {
+        iso.clearArtifactDiagnostic();
+        var stored = diagnostic;
+        stored.graph_path = null;
+        if (path) |bytes| {
+            if (alloc_mod.gpa.dupe(u8, bytes)) |owned| {
+                iso.artifact_path = owned;
+                stored.graph_path = owned;
+            } else |_| {}
+        }
+        iso.artifact_diagnostic = stored;
+    }
+
+    fn recordArtifactFailure(
+        iso: *Isolate,
+        err: anyerror,
+        failure: *const artifact_value.Failure,
+    ) void {
+        const failure_kind: ?ArtifactDiagnostic.Kind = switch (failure.kind) {
+            .none => null,
+            .invalid_artifact => .invalid_envelope,
+            .artifact_limit_exceeded, .capsule_limit_exceeded => .limit_exceeded,
+            .unsupported_value => .unsupported_value,
+            .unsupported_hash_key => .unsupported_hash_key,
+            .unsupported_container_state => .unsupported_container_state,
+            .duplicate_hash_key => .duplicate_hash_key,
+        };
+        const error_kind = diagnosticKindForArtifactError(err);
+        // A codec refinement (notably duplicate_hash_key) is more actionable
+        // than the broad InvalidArtifact error. Conversely, envelope errors
+        // retain their precise checksum/version/schema classification instead
+        // of being flattened by the codec's generic invalid failure marker.
+        const kind = switch (failure.kind) {
+            .duplicate_hash_key,
+            .unsupported_value,
+            .unsupported_hash_key,
+            .unsupported_container_state,
+            => failure_kind.?,
+            else => error_kind orelse failure_kind orelse return,
+        };
+        iso.setArtifactDiagnostic(.{
+            .kind = kind,
+            .encoded_offset = failure.encoded_offset,
+            .value_type = if (failure.value_type) |raw|
+                @fromBackingInt(@intCast(raw))
+            else
+                null,
+        }, if (failure.path().len == 0) null else failure.path());
+    }
+
+    fn diagnosticKindForArtifactError(err: anyerror) ?ArtifactDiagnostic.Kind {
+        return switch (err) {
+            error.InvalidArtifact => .invalid_envelope,
+            error.ChecksumMismatch => .checksum_mismatch,
+            error.UnsupportedArtifactVersion => .unsupported_version,
+            error.ArtifactLimitExceeded, error.CapsuleLimitExceeded, error.MemoryLimitExceeded => .limit_exceeded,
+            error.ForeignValue => .foreign_value,
+            error.UnsupportedValue => .unsupported_value,
+            error.UnsupportedContainerState => .unsupported_container_state,
+            error.UnsupportedHashKey => .unsupported_hash_key,
+            error.NumericOutOfRange => .numeric_out_of_range,
+            error.SchemaMismatch => .schema_mismatch,
+            error.ArtifactConstructionFailed => .construction_failed,
+            else => null,
+        };
+    }
+
+    fn beginArtifactOperation(iso: *Isolate) !void {
+        if (alloc_mod.currentIsolateCell()) |cell| {
+            if (cell != &iso.cell) return error.IsolateThreadBusy;
+            return switch (iso.phase) {
+                .preparing => error.IsolatePreparing,
+                .running, .idle => error.IsolateThreadBusy,
+            };
+        }
+        if (!iso.operation_lock.tryLock()) return error.IsolateThreadBusy;
+        switch (iso.phase) {
+            .idle => {},
+            .preparing => {
+                iso.operation_lock.unlock();
+                return error.IsolatePreparing;
+            },
+            .running => {
+                iso.operation_lock.unlock();
+                return error.IsolateThreadBusy;
+            },
+        }
+        iso.phase = .preparing;
+        iso.clearArtifactDiagnostic();
+    }
+
+    fn endArtifactOperation(iso: *Isolate) void {
+        std.debug.assert(iso.phase == .preparing);
+        iso.phase = .idle;
+        iso.operation_lock.unlock();
+    }
+
+    fn admitExecution(iso: *Isolate) !ExecutionAdmission {
+        // Allocator TLS identifies legitimate same-thread re-entry without
+        // reading the non-atomic phase from an unrelated thread.
+        if (alloc_mod.currentIsolateCell()) |cell| {
+            if (cell != &iso.cell) return error.IsolateThreadBusy;
+            return switch (iso.phase) {
+                .running => .nested,
+                .preparing => error.IsolatePreparing,
+                // An idle attribution is a trusted host bracket, not nested
+                // execution. Entering would overwrite its attribution.
+                .idle => error.IsolateThreadBusy,
+            };
+        }
+
+        if (!iso.operation_lock.tryLock()) return error.IsolateThreadBusy;
+        return switch (iso.phase) {
+            .idle => .outer,
+            .preparing => {
+                iso.operation_lock.unlock();
+                return error.IsolatePreparing;
+            },
+            .running => {
+                iso.operation_lock.unlock();
+                return error.IsolateThreadBusy;
+            },
+        };
+    }
+
+    fn enterExecution(iso: *Isolate, comptime body: anytype, ctx: anytype) !Value {
+        const admission = try iso.admitExecution();
+        if (admission == .nested) return body(iso, ctx);
+        defer iso.operation_lock.unlock();
+        return iso.enterOuterExecution(body, ctx);
+    }
+
+    fn enterOuterExecution(iso: *Isolate, comptime body: anytype, ctx: anytype) !Value {
         iso.clearErrorView();
         iso.startTiming();
         defer iso.updateElapsed();
@@ -970,11 +1310,29 @@ fn defineTerminationClasses(m: *c.mrb_state, hidden: *c.RClass) void {
     }
 }
 
-/// Compile `src` to a snapshot image (Rite irep binary) without executing
-/// it. Run later with `Isolate.runImage`; images are per-build (bytecode
-/// version) but isolate- and policy-independent.
-pub fn compile(src: []const u8) ![]u8 {
-    const vm = try Vm.init();
+const RawRite = struct {
+    ptr: [*]u8,
+    len: usize,
+
+    fn bytes(raw: RawRite) []const u8 {
+        return raw.ptr[0..raw.len];
+    }
+
+    fn deinit(raw: *RawRite) void {
+        mrb_free_via_allocator(raw.ptr, raw.len);
+        raw.* = undefined;
+    }
+};
+
+fn compileRaw(
+    src: []const u8,
+    source_name: ?[]const u8,
+    dump_flags: u8,
+) CompileRiteError!RawRite {
+    const vm = Vm.init() catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.CompileFailed,
+    };
     defer vm.deinit();
 
     // NUL-terminate for the lexer (same discipline as Vm.loadString).
@@ -983,19 +1341,63 @@ pub fn compile(src: []const u8) ![]u8 {
     @memcpy(buf[0..src.len], src);
     buf[src.len] = 0;
 
-    const parser = c.mrb_parse_nstring(vm.mrb, buf.ptr, src.len, null) orelse return error.CompileFailed;
+    const context: ?*c.mrb_ccontext = if (source_name) |name| blk: {
+        if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidSourceName;
+        const created = c.mrb_ccontext_new(vm.mrb) orelse return error.OutOfMemory;
+        errdefer c.mrb_ccontext_free(vm.mrb, created);
+        const name_z = try alloc_mod.gpa.allocSentinel(u8, name.len, 0);
+        defer alloc_mod.gpa.free(name_z);
+        @memcpy(name_z[0..name.len], name);
+        _ = c.mrb_ccontext_filename(vm.mrb, created, name_z.ptr) orelse
+            return error.OutOfMemory;
+        break :blk created;
+    } else null;
+    defer if (context) |created| c.mrb_ccontext_free(vm.mrb, created);
+
+    const parser = c.mrb_parse_nstring(vm.mrb, buf.ptr, src.len, context) orelse return error.CompileFailed;
     defer c.mrb_parser_free(parser);
     if (c.mrz_parse_nerr(parser) != 0) return error.CompileFailed;
     const proc = c.mrb_generate_code(vm.mrb, parser) orelse return error.CompileFailed;
 
     var bin: ?[*]u8 = null;
     var bin_size: usize = 0;
-    const rc = c.mrb_dump_irep(vm.mrb, c.mrz_proc_irep(proc), 0, &bin, &bin_size);
-    if (rc != 0) return error.CompileFailed;
-    // mrb_malloc'd buffer: copy to a gpa slice, free through mruby.
-    const owned = try alloc_mod.gpa.dupe(u8, bin.?[0..bin_size]);
-    _ = mrb_free_via_allocator(bin.?, bin_size);
-    return owned;
+    const rc = c.mrb_dump_irep(vm.mrb, c.mrz_proc_irep(proc), dump_flags, &bin, &bin_size);
+    if (rc != 0) {
+        if (bin) |allocated| mrb_free_via_allocator(allocated, bin_size);
+        return error.CompileFailed;
+    }
+    return .{ .ptr = bin orelse return error.CompileFailed, .len = bin_size };
+}
+
+/// Deprecated compatibility operation: compile `src` to unframed RITE bytes.
+/// It omits mruby-zig's compatibility/application checks; use `compileRite`.
+pub fn compile(src: []const u8) ![]u8 {
+    var raw = try compileRaw(src, null, 0);
+    defer raw.deinit();
+    return alloc_mod.gpa.dupe(u8, raw.bytes());
+}
+
+/// Compile source into a typed, caller-owned RITE artifact.
+pub fn compileRite(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    options: CompileRiteOptions,
+) CompileRiteError!artifact_mod.RiteImage {
+    var raw = try compileRaw(
+        src,
+        options.source_name,
+        if (options.include_debug) c.MRB_DUMP_DEBUG_INFO else 0,
+    );
+    defer raw.deinit();
+
+    return artifact_mod.wrapRite(allocator, raw.bytes(), .{
+        .compatibility = artifact_config.rite_compatibility_fingerprint,
+        .application = options.application,
+        .max_encoded_bytes = std.math.maxInt(usize),
+    }) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.CompileFailed,
+    };
 }
 
 fn mrb_free_via_allocator(ptr: [*]u8, size: usize) void {

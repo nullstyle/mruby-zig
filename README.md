@@ -67,7 +67,7 @@ std.debug.print("{d}\n", .{try result.asInt()});
 Depending on this package (once published):
 
 ```
-zig fetch --save=mruby https://github.com/nullstyle/mruby-zig/archive/refs/tags/v0.2.0.tar.gz
+zig fetch --save=mruby https://github.com/nullstyle/mruby-zig/archive/refs/tags/v0.3.0.tar.gz
 ```
 
 ```zig
@@ -240,6 +240,86 @@ const result = iso.run(script) catch |err| switch (err) {
 };
 ```
 
+### Typed RITE and state artifacts
+
+Use typed RITE images to compile once and execute only in a compatible
+sandbox. The wrapper records mruby-zig's generated compatibility fingerprint;
+an optional application fingerprint also binds the image to your bootstrap
+contract:
+
+```zig
+const app: mruby.artifact.ApplicationFingerprint = .{ .bytes = app_digest };
+
+var image = try mruby.sandbox.compileRite(allocator, worker_source, .{
+    .source_name = "worker.rb",
+    .application = app,
+});
+defer image.deinit(allocator);
+
+const worker = try mruby.sandbox.Isolate.spawn(.{
+    .artifacts = .{ .application = app },
+});
+defer worker.deinit();
+
+const result = try worker.runRite(image.view());
+```
+
+`source_name` controls `__FILE__` even when debug information is omitted.
+`RiteImage` owns only `encoded`; pass the same allocator used by
+`compileRite` to `deinit`. Across a process boundary, send
+`image.view().bytes` and construct `.{ .bytes = received_bytes }` at the
+destination. Every `runRite` revalidates the envelope, checksum, generated
+compatibility fingerprint, application fingerprint, and byte ceiling.
+
+State capsules move supported value graphs without executing guest methods:
+
+```zig
+const schema: mruby.artifact.Schema = .{
+    .id = job_schema_id,
+    .major = 1,
+    .minor = 0,
+};
+
+const root = try producer.run(
+    "count = \"count\".freeze; {count => 41, :jobs => [1, 2, 3]}",
+);
+var capsule = try producer.exportValue(allocator, root, .{ .schema = schema });
+defer capsule.deinit(allocator);
+
+// Send capsule.view().bytes to another process.
+const restored = try worker.importValue(
+    .{ .bytes = received_capsule_bytes },
+    .{ .accepted_schema = .{
+        .id = job_schema_id,
+        .major = 1,
+        .minor = 2,
+    } },
+);
+```
+
+A destination accepts the same schema ID and major version when the producer's
+minor version is no newer. Null accepts only schema-less capsules. Version 1
+preserves cycles, aliases, binary64 bits, frozen String/Array/Hash state, and
+non-proc Hash defaults. Hash keys are limited to Integer, Float, Symbol, and
+frozen exact-core String; subclasses, instance variables, default procs,
+Binding, Proc, Fiber, and native data are rejected. This strict subset keeps
+import/export inert: no `_dump`, `_load`, `hash`, `eql?`, constructors, or
+other guest hooks run.
+
+`StateCapsule`, like `RiteImage`, owns only its encoded bytes and is freed with
+the allocator passed to `exportValue`. Imported Ruby allocations use the
+destination isolate's allocator and memory policy. Per-call capsule limits can
+tighten, never relax, the ceilings copied from `Policy.artifacts` at spawn.
+Independent non-relaxable safety ceilings also bound total Hash pairs, exact
+simulated insertion probes, and conservative String-key comparison work.
+Export and import run the same preflight and report `CapsuleLimitExceeded` at
+the offending key for pathological collision sets.
+
+RITE is executable input; StateCapsule is bounded inert data. Their SHA-256
+checksums detect corruption, not substitution, so authenticate either artifact
+when it crosses a trust boundary (especially RITE). Neither type is a VM,
+Binding, Fiber, or continuation snapshot.
+
 ### Gas scopes
 
 `Limits.gas` controls how instruction gas is granted:
@@ -248,7 +328,7 @@ const result = iso.run(script) catch |err| switch (err) {
 | --- | --- |
 | `.unlimited` | No gas meter; `stats().gas` is `null`. |
 | `.{ .per_isolate = N }` | One cumulative allowance for the Isolate. Lazy capability setup and all executions share it, and exhaustion is sticky. |
-| `.{ .per_execution = N }` | Each admitted outermost `run`, `runImage`, or `call` gets a fresh allowance. Rejected preflight calls do not advance the generation; nested callback re-entry shares the active allowance. |
+| `.{ .per_execution = N }` | Each admitted outermost `run`, `runImage`, `runRite`, or `call` gets a fresh allowance. Rejected preflight calls do not advance the generation; nested callback re-entry shares the active allowance. |
 
 Use `.per_execution` for a stateful worker that should accept another request
 after gas exhaustion:
@@ -331,9 +411,11 @@ supported.
   `className()` use rooted inert metadata, execute no guest code, and consume
   no gas; returned slices are caller-owned and must be freed with
   `mruby.alloc.gpa.free`.
-- **Snapshots**: `mruby.sandbox.compile(src)` compiles without executing
-  into a Rite irep image; `iso.runImage(image)` runs it (limits apply)
-  with no parse/codegen — the v8-snapshot analogue for mass spawn.
+- **Compiled images**: prefer typed `compileRite`/`runRite`, which add framing,
+  corruption checks, generated build compatibility, and optional application
+  identity. Legacy `sandbox.compile`/`runImage` remain temporarily available
+  for raw RITE but are deprecated because they provide none of those outer
+  compatibility checks.
 - **CPU/loops**: the instruction hook fires only on bytecode. Long pure-C
   operations and host Zig callbacks are not instruction-interruptible; memory
   caps constrain only allocations attributed to the Isolate, not CPU time.
@@ -347,27 +429,34 @@ supported.
   inside one C-native opcode.
 - **Lifecycle**: lazy capability setup joins `.per_isolate` gas, but completes
   before generation 1 for `.per_execution`. Route untrusted work through
-  `Isolate.run`, `runImage`, or `call`; executing directly through `iso.vm`
-  bypasses the generation lifecycle and is for trusted bootstrap only. Only
-  `terminate()` and `pendingTermination()` are cross-thread safe; serialize
-  execution and diagnostic calls. `wall_time_ns` starts when the first outer
-  entry begins preflight, continues across idle time, and is never renewed by
-  a new gas generation.
+  `Isolate.run`, `runImage`, `runRite`, or `call`; executing directly through
+  `iso.vm` bypasses the generation lifecycle and is for trusted bootstrap only.
+  One non-blocking operation lock covers guest execution and value artifact
+  operations; simultaneous same-Isolate access returns `IsolateThreadBusy`.
+  Nested guest execution from a callback retains its existing behavior, but a
+  callback cannot start export/import. Invalid typed RITE is rejected before
+  `lastError`, timing, gas, capabilities, or termination state changes.
+  `terminate()` and `pendingTermination()` remain the cross-thread-safe
+  lock-free controls; serialize stats, diagnostics, direct VM access, and
+  destruction. `wall_time_ns` starts when the first outer entry begins
+  preflight, continues across idle time, and is never renewed by a new gas
+  generation.
 
 **Not covered by the in-process tier** (by design, same as v8 isolates):
 no address-space separation from the host. The planned out-of-process
 tier (worker processes with IPC: run/call/terminate/stats plus structured
 value transfer, OS-level memory separation and optional seccomp/pledge)
-fronts this same API; irep snapshots already give those workers cheap
-warm-starts.
+fronts this same API; typed RITE images give those workers cheap warm-starts,
+and StateCapsules provide deliberate structured value transfer.
 
 ## Layout
 
 ```
 build.zig            # the entire mruby build, in zig
 build/{sources,gems,gen}.zig
-tools/presym_gen.zig # port of mruby's lib/mruby/presym.rb
-tools/file_join.zig  # generated-C assembler helper
+tools/presym_gen.zig       # presym tables + canonical table digest
+tools/artifact_config_gen.zig # build-dependent RITE identity module
+tools/file_join.zig        # generated-C assembler helper
 src/c.zig            # hand-written extern bindings (public for power users)
 src/shim.c           # C-side accessors for macro-only inline APIs
 src/vm.zig           # Vm: eval, call, classes, globals, raise, arena
@@ -385,8 +474,9 @@ package generates all of them in `build.zig`, mirroring the rake tasks:
 1. **presym tables** — preprocess every C source with
    `-DMRB_PRESYM_SCANNING` (which turns `MRB_SYM(x)` into `<@! "x" !@>`
    markers), collect and sort symbols by (length, bytes), emit
-   `mruby/presym/{id.h,table.h}` — a port of `lib/mruby/presym.rb`
-   (`tools/presym_gen.zig`).
+   `mruby/presym/{id.h,table.h}`, and hash the final canonical symbol-to-ID
+   table. That generated digest feeds the typed RITE compatibility fingerprint;
+   input path names are never used as a substitute for the emitted table.
 2. **host `mrbc`** — mruby's own bootstrap trick: the `mrbc` tool ships
    empty `mrb_init_mrblib`/`mrb_init_mrbgems` stubs, so it links without
    any generated files. We build it for the host with `zig cc` (with its
@@ -409,7 +499,9 @@ functions, keeping every layout decision on the C side.
 ## Development
 
 ```sh
-mise x -- zig build test              # 26 tests incl. Ruby suites
+mise x -- zig build test              # unit + Ruby integration suites
+mise x -- zig build test-state-capsule-process
+mise x -- zig build fuzz-state-capsule --fuzz=100K
 mise x -- zig build run-host-functions
 mise x -- zig build run-repl -- -e 'RUBY_VERSION'
 ```

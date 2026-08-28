@@ -24,6 +24,23 @@ const sources = @import("build/sources.zig");
 const gems_mod = @import("build/gems.zig");
 const gen = @import("build/gen.zig");
 
+const mruby_version = "4.0.0";
+const rite_binary_version = "04.00";
+const rite_vm_version = "0400";
+const portable_container_flags = &.{
+    "-DMRB_STR_LENGTH_MAX=0",
+    "-DMRB_ARY_LENGTH_MAX=0",
+};
+// Zig's built-in fuzzer uses a native inline coverage map. Instrumenting the
+// linked mruby C objects with Clang's sanitizer-coverage ABI adds counters
+// without matching PC records, so keep coverage focused on the Zig parser.
+const no_c_fuzz_coverage = "-fno-sanitize-coverage=trace-pc-guard,trace-cmp,trace-div,indirect-calls,inline-8bit-counters,pc-table";
+/// Bump when local C/Zig ABI or generated-code behavior changes RITE loading
+/// compatibility without changing an input represented below.
+const rite_compatibility_epoch: u32 = 3;
+const hash_integer_patch_marker = "mruby-hash-rinteger-value-hash=v1";
+const hash_symbol_patch_marker = "mruby-hash-symbol-name-hash=v1";
+
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -46,8 +63,18 @@ pub fn build(b: *std.Build) !void {
     }
 
     // Host tools shared by the pipeline.
+    const artifact_identity_mod = b.createModule(.{
+        .root_source_file = b.path("build/artifact_identity.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
     const presym_gen = hostTool(b, "tools/presym_gen.zig");
+    presym_gen.root_module.addImport("artifact_identity", artifact_identity_mod);
+    const artifact_config_gen = hostTool(b, "tools/artifact_config_gen.zig");
+    artifact_config_gen.root_module.addImport("artifact_identity", artifact_identity_mod);
     const file_join = hostTool(b, "tools/file_join.zig");
+    const hash_patcher = hostTool(b, "tools/patch_mruby_hash.zig");
+    const patched_hash = patchMrubyHash(b, arena, hash_patcher, root);
 
     // ============================= stage 1 =================================
     // Presym headers for the host mrbc build: scan core (with allocf.c),
@@ -73,7 +100,15 @@ pub fn build(b: *std.Build) !void {
     try mrbc_files.append(arena, sources.allocf_src);
     try mrbc_files.appendSlice(arena, &sources.compiler_srcs);
     try mrbc_files.appendSlice(arena, &sources.mrbc_srcs);
-    mrbc_mod.addCSourceFiles(.{ .root = root, .files = mrbc_files.items, .flags = &.{"-w"} });
+    mrbc_mod.addCSourceFiles(.{
+        .root = root,
+        .files = mrbc_files.items,
+        .flags = &.{
+            "-w",
+            "-DMRB_STR_LENGTH_MAX=0",
+            "-DMRB_ARY_LENGTH_MAX=0",
+        },
+    });
     mrbc_mod.addIncludePath(try root.join(arena, "include"));
     mrbc_mod.addIncludePath(mrbc_presym_dir);
     const mrbc = b.addExecutable(.{ .name = "mrbc", .root_module = mrbc_mod });
@@ -130,7 +165,16 @@ pub fn build(b: *std.Build) !void {
     // including the generated files above.
     const triple = try target.result.zigTriple(arena);
     var lib_scan: std.ArrayList(ScanInput) = .empty;
-    try addTreeFiles(arena, &lib_scan, root, &sources.core_srcs, "core");
+    for (sources.core_srcs) |path| {
+        if (std.mem.eql(u8, path, "src/hash.c")) {
+            try lib_scan.append(arena, .{ .lp = patched_hash, .pp_name = "core_src_hash.c.pp" });
+        } else {
+            try lib_scan.append(arena, .{
+                .lp = try root.join(arena, path),
+                .pp_name = try std.fmt.allocPrint(arena, "core_{s}", .{try mangle(arena, path, &.{ "c", "pp" })}),
+            });
+        }
+    }
     try addTreeFiles(arena, &lib_scan, root, &sources.compiler_srcs, "compiler");
     var gem_include_dirs: std.ArrayList(std.Build.LazyPath) = .empty;
     for (selected_gems) |g| {
@@ -152,6 +196,7 @@ pub fn build(b: *std.Build) !void {
         var d: std.ArrayList([]const u8) = .empty;
         try d.appendSlice(arena, gem_defines.items);
         try d.append(arena, "-DMRB_USE_DEBUG_HOOK");
+        try d.appendSlice(arena, portable_container_flags);
         break :defines d.items;
     };
     const lib_presym_dir = try presymHeaders(b, presym_gen, arena, lib_scan.items, lib_scan_defines, root, triple);
@@ -186,6 +231,8 @@ pub fn build(b: *std.Build) !void {
         // Enables mrb->code_fetch_hook (NULL-guarded per-instruction call
         // site) used by the sandboxing layer for limits and termination.
         try f.append(arena, "-DMRB_USE_DEBUG_HOOK");
+        try f.appendSlice(arena, portable_container_flags);
+        try f.append(arena, no_c_fuzz_coverage);
         try f.appendSlice(arena, ro_data_flags);
         try f.appendSlice(arena, gem_defines.items);
         break :flags f.items;
@@ -194,6 +241,8 @@ pub fn build(b: *std.Build) !void {
     const shim_flags = flags: {
         var f: std.ArrayList([]const u8) = .empty;
         try f.appendSlice(arena, &.{ "-w", "-DMRB_USE_DEBUG_HOOK" });
+        try f.appendSlice(arena, portable_container_flags);
+        try f.append(arena, no_c_fuzz_coverage);
         try f.appendSlice(arena, ro_data_flags);
         break :flags f.items;
     };
@@ -205,11 +254,24 @@ pub fn build(b: *std.Build) !void {
         .sanitize_thread = sanitize_thread,
         .link_libc = true,
     });
+    const artifact_config = try artifactConfigModule(
+        b,
+        artifact_config_gen,
+        arena,
+        target.result,
+        selected_gems,
+        mruby_dep.builder.pkg_hash,
+        lib_presym_dir,
+    );
+    mruby_mod.addImport("artifact_config", artifact_config);
     var lib_files: std.ArrayList([]const u8) = .empty;
-    try lib_files.appendSlice(arena, &sources.core_srcs);
+    for (sources.core_srcs) |path| {
+        if (!std.mem.eql(u8, path, "src/hash.c")) try lib_files.append(arena, path);
+    }
     try lib_files.appendSlice(arena, &sources.compiler_srcs);
     for (selected_gems) |g| try lib_files.appendSlice(arena, g.c_srcs);
     mruby_mod.addCSourceFiles(.{ .root = root, .files = lib_files.items, .flags = lib_flags });
+    mruby_mod.addCSourceFile(.{ .file = patched_hash, .flags = lib_flags });
     // Generated sources (cache paths, not under the dependency root).
     for (generated_c.items) |g| {
         mruby_mod.addCSourceFile(.{ .file = g.lp, .flags = lib_flags });
@@ -267,6 +329,34 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "run unit and integration tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    const artifact_identity_test_mod = b.createModule(.{
+        .root_source_file = b.path("build/artifact_identity.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const artifact_identity_tests = b.addTest(.{ .root_module = artifact_identity_test_mod });
+    const run_artifact_identity_tests = b.addRunArtifact(artifact_identity_tests);
+    test_step.dependOn(&run_artifact_identity_tests.step);
+
+    // Pure StateCapsule parser fuzz target. A normal `zig build test` runs the
+    // stable corpus once; `zig build fuzz-state-capsule --fuzz=100K` enables
+    // Zig's coverage-guided engine. The callback never creates an mruby VM.
+    const state_capsule_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/state_capsule_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+    });
+    state_capsule_fuzz_mod.addImport("mruby", mruby_mod);
+    const state_capsule_fuzz_tests = b.addTest(.{ .root_module = state_capsule_fuzz_mod });
+    const run_state_capsule_fuzz_tests = b.addRunArtifact(state_capsule_fuzz_tests);
+    test_step.dependOn(&run_state_capsule_fuzz_tests.step);
+    const fuzz_state_capsule_step = b.step(
+        "fuzz-state-capsule",
+        "fuzz the pure StateCapsule frame and graph parser",
+    );
+    fuzz_state_capsule_step.dependOn(&run_state_capsule_fuzz_tests.step);
+
     // The integration suite above roots at src/tests.zig and pulls in the
     // library as an imported module, so Zig never collects the `test` blocks
     // that live *inside* the mruby module (src/convert.zig, src/alloc.zig,
@@ -275,6 +365,45 @@ pub fn build(b: *std.Build) !void {
     const mod_tests = b.addTest(.{ .root_module = mruby_mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
     test_step.dependOn(&run_mod_tests.step);
+
+    // A real producer and consumer executable exchange the encoded capsule
+    // through captured stdout/stdin. They are separately linked OS processes;
+    // the consumer restores into a new Isolate and checks the complete graph.
+    const capsule_producer_mod = b.createModule(.{
+        .root_source_file = b.path("tools/state_capsule_process_producer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+    });
+    capsule_producer_mod.addImport("mruby", mruby_mod);
+    const capsule_producer = b.addExecutable(.{
+        .name = "state-capsule-process-producer",
+        .root_module = capsule_producer_mod,
+    });
+    const run_capsule_producer = b.addRunArtifact(capsule_producer);
+    const transferred_capsule = run_capsule_producer.captureStdOut(.{
+        .basename = "state-capsule.bin",
+    });
+
+    const capsule_consumer_mod = b.createModule(.{
+        .root_source_file = b.path("tools/state_capsule_process_consumer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+    });
+    capsule_consumer_mod.addImport("mruby", mruby_mod);
+    const capsule_consumer = b.addExecutable(.{
+        .name = "state-capsule-process-consumer",
+        .root_module = capsule_consumer_mod,
+    });
+    const run_capsule_consumer = b.addRunArtifact(capsule_consumer);
+    run_capsule_consumer.setStdIn(.{ .lazy_path = transferred_capsule });
+    test_step.dependOn(&run_capsule_consumer.step);
+    const process_fixture_step = b.step(
+        "test-state-capsule-process",
+        "transfer a StateCapsule between producer and consumer processes",
+    );
+    process_fixture_step.dependOn(&run_capsule_consumer.step);
 
     // Examples.
     const ex_names = [_][]const u8{ "quickstart", "host_functions", "exceptions" };
@@ -306,6 +435,80 @@ const ScanInput = struct {
     includes: []const []const u8 = &.{},
 };
 const GeneratedC = struct { lp: std.Build.LazyPath, pp_name: []const u8 };
+
+fn artifactConfigModule(
+    b: *std.Build,
+    artifact_config_gen: *std.Build.Step.Compile,
+    arena: std.mem.Allocator,
+    target: std.Target,
+    selected_gems: []const gems_mod.Gem,
+    mruby_package_hash: []const u8,
+    final_presym_dir: std.Build.LazyPath,
+) !*std.Build.Module {
+    const pointer_bits = target.ptrBitWidth();
+    if (pointer_bits != 32 and pointer_bits != 64) {
+        std.debug.panic("mruby RITE identity does not support {d}-bit pointers", .{pointer_bits});
+    }
+
+    var semantic_defines: std.ArrayList([]const u8) = .empty;
+    try semantic_defines.append(arena, "MRB_USE_DEBUG_HOOK");
+    try semantic_defines.appendSlice(arena, &.{
+        "MRB_STR_LENGTH_MAX=0",
+        "MRB_ARY_LENGTH_MAX=0",
+    });
+
+    var ordered_gems: std.ArrayList([]const u8) = .empty;
+
+    for (selected_gems) |gem| {
+        try ordered_gems.append(arena, gem.name);
+        for (gem.defines) |define| try semantic_defines.append(arena, define);
+    }
+
+    const generated_configuration = &.{
+        "presym-scanner=v1",
+        "presym-define=MRB_PRESYM_SCANNING",
+        "presym-target-traits=pointer-width,endian",
+        "mrbc-cdump=static,no-extension-tables",
+        "mrblib-template=v1",
+        "gem-init-template=v1",
+        hash_integer_patch_marker,
+        hash_symbol_patch_marker,
+    };
+
+    const run = b.addRunArtifact(artifact_config_gen);
+    run.addFileArg(final_presym_dir.path(b, "presym.digest"));
+    run.addArg(mruby_version);
+    run.addArg(mruby_package_hash);
+    run.addArg(rite_binary_version);
+    run.addArg(rite_vm_version);
+    run.addArg(try std.fmt.allocPrint(arena, "{d}", .{rite_compatibility_epoch}));
+    run.addArg(try std.fmt.allocPrint(arena, "{d}", .{pointer_bits}));
+    run.addArg(switch (target.cpu.arch.endian()) {
+        .little => "little",
+        .big => "big",
+    });
+    // The pinned mrbconf.h defaults to word boxing, binary64 Float, and
+    // pointer-width Integer. Any future override belongs in these traits.
+    run.addArg(try std.fmt.allocPrint(arena, "{d}", .{pointer_bits}));
+    run.addArg("64");
+    run.addArg("word");
+    run.addArg("true");
+    try addIdentitySequenceArgs(run, arena, semantic_defines.items);
+    try addIdentitySequenceArgs(run, arena, ordered_gems.items);
+    try addIdentitySequenceArgs(run, arena, generated_configuration);
+
+    const generated_config = run.addOutputFileArg("artifact_config.zig");
+    return b.createModule(.{ .root_source_file = generated_config });
+}
+
+fn addIdentitySequenceArgs(
+    run: *std.Build.Step.Run,
+    arena: std.mem.Allocator,
+    values: []const []const u8,
+) !void {
+    run.addArg(try std.fmt.allocPrint(arena, "{d}", .{values.len}));
+    for (values) |value| run.addArg(value);
+}
 
 const mrblib_banner =
     \\/*
@@ -489,7 +692,8 @@ fn mangle(arena: std.mem.Allocator, rel: []const u8, exts: []const []const u8) !
 
 /// Preprocess every input with `zig cc -E -P -DMRB_PRESYM_SCANNING`, then run
 /// presym_gen over the results (out dir as its last argument). Returns the
-/// generated include directory containing `mruby/presym/{id.h,table.h}`.
+/// generated include directory containing `mruby/presym/{id.h,table.h}` plus
+/// `presym.digest`, the canonical final symbol-to-ID compatibility digest.
 fn presymHeaders(
     b: *std.Build,
     presym_gen: *std.Build.Step.Compile,
@@ -541,6 +745,17 @@ const JoinPart = union(enum) {
     str: []const u8,
     file: std.Build.LazyPath,
 };
+
+fn patchMrubyHash(
+    b: *std.Build,
+    arena: std.mem.Allocator,
+    patcher: *std.Build.Step.Compile,
+    root: std.Build.LazyPath,
+) std.Build.LazyPath {
+    const run = b.addRunArtifact(patcher);
+    run.addFileArg(root.join(arena, "src/hash.c") catch @panic("OOM"));
+    return run.addOutputFileArg("hash.c");
+}
 
 fn joinFiles(
     b: *std.Build,
