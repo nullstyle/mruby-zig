@@ -82,6 +82,58 @@ test "evaluates arithmetic" {
     try std.testing.expectEqual(@as(i64, 2), try result.asInt());
 }
 
+test "nested isolate lifecycle restores outer allocator attribution" {
+    const outer = try mruby.sandbox.Isolate.spawn(.{});
+    defer outer.deinit();
+
+    const cls = try outer.vm.defineClass("NestedLifecycle", null);
+    cls.defineClassMethod("check", "", struct {
+        fn call(m: *mruby.Vm, self: mruby.Value) !mruby.Value {
+            _ = self;
+            const expected = mruby.alloc.currentIsolateCell() orelse return error.MissingOuterAttribution;
+
+            const child = try mruby.sandbox.Isolate.spawn(.{});
+            const after_spawn = mruby.alloc.currentIsolateCell() == expected;
+            child.deinit();
+            const after_deinit = mruby.alloc.currentIsolateCell() == expected;
+
+            return m.intValue(@as(i64, @intFromBool(after_spawn)) |
+                (@as(i64, @intFromBool(after_deinit)) << 1));
+        }
+    }.call);
+
+    const flags = try (try outer.run("NestedLifecycle.check")).asInt();
+    try std.testing.expectEqual(@as(i64, 3), flags);
+}
+
+test "plain Vm retained from callback outlives its allocator Isolate" {
+    const Retained = struct {
+        var vm: ?*mruby.Vm = null;
+
+        fn create(m: *mruby.Vm, self: mruby.Value) !mruby.Value {
+            _ = self;
+            vm = try mruby.Vm.init();
+            return m.nilValue();
+        }
+    };
+    Retained.vm = null;
+
+    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    var iso_live = true;
+    defer if (iso_live) iso.deinit();
+    const cls = try iso.vm.defineClass("RetainPlainVm", null);
+    cls.defineClassMethod("create", "", Retained.create);
+    _ = try iso.run("RetainPlainVm.create");
+
+    iso.deinit();
+    iso_live = false;
+
+    const retained = Retained.vm orelse return error.MissingRetainedVm;
+    Retained.vm = null;
+    defer retained.deinit();
+    try std.testing.expectEqual(@as(i64, 42), try (try retained.loadString("40 + 2")).asInt());
+}
+
 test "floats and strings roundtrip through eval" {
     const vm = try mruby.Vm.init();
     defer vm.deinit();
@@ -476,10 +528,96 @@ test "sandbox: external terminate stops an infinite loop" {
     try std.testing.expectError(error.ScriptTerminated, iso.run("while true; end"));
 }
 
+test "sandbox: gas cleanup cannot erase an in-flight terminate" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 2_000 },
+    } });
+    defer iso.deinit();
+
+    const Race = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var released = std.atomic.Value(bool).init(false);
+
+        fn pause(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
+            _ = self;
+            entered.store(true, .release);
+            while (!released.load(.acquire)) std.atomic.spinLoopHint();
+            return m.nilValue();
+        }
+
+        fn terminate(target: *sandbox.Isolate) void {
+            while (!entered.load(.acquire)) std.atomic.spinLoopHint();
+            target.terminate();
+            released.store(true, .release);
+        }
+    };
+    Race.entered.store(false, .release);
+    Race.released.store(false, .release);
+
+    const cls = try iso.vm.defineClass("GasCleanupRace", null);
+    cls.defineMethod("pause", "", Race.pause);
+
+    var stopper = try std.Thread.spawn(.{}, Race.terminate, .{iso});
+    const outcome = iso.run(
+        \\i = 0
+        \\begin
+        \\  while i < 1_000_000_000
+        \\    i += 1
+        \\  end
+        \\rescue Exception
+        \\  GasCleanupRace.new.pause
+        \\end
+    );
+    stopper.join();
+
+    // Script termination has higher priority when it arrives while gas is
+    // unwinding. Finalization may clear only gas, so script remains sticky.
+    try std.testing.expectError(error.ScriptTerminated, outcome);
+    const terminated = iso.stats();
+    try std.testing.expectEqual(@as(u64, 1), terminated.gas.?.generation);
+    try std.testing.expect(iso.pendingTermination());
+    try std.testing.expectError(error.ScriptTerminated, iso.run("$race_must_not_run = true"));
+    const repeated = iso.stats();
+    try std.testing.expectEqual(terminated.instructions, repeated.instructions);
+    try std.testing.expectEqual(terminated.gas.?.generation, repeated.gas.?.generation);
+}
+
 test "sandbox: wall-clock deadline" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .wall_time_ns = 60 * std.time.ns_per_ms } });
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = std.math.maxInt(u64) },
+        .wall_time_ns = 60 * std.time.ns_per_ms,
+    } });
     defer iso.deinit();
     try std.testing.expectError(error.DeadlineExceeded, iso.run("while true; end"));
+    const terminated = iso.stats();
+    try std.testing.expectEqual(@as(u64, 1), terminated.gas.?.generation);
+    try std.testing.expect(iso.pendingTermination());
+    try std.testing.expectError(error.DeadlineExceeded, iso.run("$deadline_must_not_run = true"));
+    const repeated = iso.stats();
+    try std.testing.expectEqual(terminated.instructions, repeated.instructions);
+    try std.testing.expectEqual(terminated.gas.?.generation, repeated.gas.?.generation);
+}
+
+test "sandbox: deadline is arbitrated after final native work" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 10_000 },
+        .wall_time_ns = 1 * std.time.ns_per_ms,
+    } });
+    defer iso.deinit();
+
+    const cls = try iso.vm.defineClass("DeadlineNative", null);
+    cls.defineMethod("wait", "", struct {
+        fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
+            _ = self;
+            sandbox.sleepNs(5 * std.time.ns_per_ms);
+            return m.intValue(1);
+        }
+    }.call);
+    // Trusted bootstrap outside an execution generation gives call() a
+    // receiver without starting the isolate lifetime deadline first.
+    const receiver = try iso.vm.loadString("DeadlineNative.new");
+
+    try std.testing.expectError(error.DeadlineExceeded, iso.call(receiver, "wait", .{}));
 }
 
 test "sandbox: instruction gas exhausts and is deterministic" {
@@ -497,6 +635,276 @@ test "sandbox: instruction gas exhausts and is deterministic" {
     const iso3 = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 200 } });
     defer iso3.deinit();
     try std.testing.expectError(error.GasExhausted, iso3.run(script));
+}
+
+test "sandbox: explicit per-isolate gas preserves sticky legacy behavior" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_isolate = 2_000 },
+    } });
+    defer iso.deinit();
+
+    try std.testing.expectError(error.GasExhausted, iso.run("while true; end"));
+    const before = iso.stats().instructions;
+    try std.testing.expectError(error.GasExhausted, iso.run("$must_not_run = true"));
+    try std.testing.expectEqual(before, iso.stats().instructions);
+}
+
+test "sandbox: per-execution gas publishes generation zero before first run" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 7 },
+    } });
+    defer iso.deinit();
+
+    const stats = iso.stats();
+    try std.testing.expectEqual(@as(u64, 0), stats.instructions);
+    const gas = stats.gas.?;
+    try std.testing.expectEqual(sandbox.GasScope.execution, gas.scope);
+    try std.testing.expectEqual(@as(u64, 0), gas.generation);
+    try std.testing.expectEqual(@as(u64, 7), gas.limit);
+    try std.testing.expectEqual(@as(u64, 0), gas.used);
+    try std.testing.expectEqual(@as(u64, 7), gas.remaining);
+    try std.testing.expect(!gas.exhausted);
+    try std.testing.expectEqual(@as(u128, 0), gas.observed_instructions);
+}
+
+test "sandbox: explicit unlimited policy publishes no gas stats" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .gas = .unlimited } });
+    defer iso.deinit();
+    try std.testing.expect(iso.stats().gas == null);
+    _ = try iso.run("1 + 1");
+    try std.testing.expect(iso.stats().gas == null);
+}
+
+test "sandbox: termination latched before entry starts no gas generation" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 1_000 },
+    } });
+    defer iso.deinit();
+
+    iso.terminate();
+    try std.testing.expect(iso.pendingTermination());
+    try std.testing.expectError(error.ScriptTerminated, iso.run("$must_not_run = true"));
+    const rejected = iso.stats();
+    try std.testing.expectEqual(@as(u64, 0), rejected.instructions);
+    try std.testing.expectEqual(@as(u64, 0), rejected.gas.?.generation);
+    try std.testing.expect((try iso.vm.getGlobal("must_not_run")).isNil());
+
+    try std.testing.expectError(error.ScriptTerminated, iso.run("1"));
+    try std.testing.expectEqual(@as(u64, 0), iso.stats().gas.?.generation);
+}
+
+test "sandbox: idle entry preserves an existing allocator attribution" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 1_000 },
+    } });
+    defer iso.deinit();
+
+    {
+        mruby.alloc.enterIsolate(&iso.cell);
+        defer mruby.alloc.exitIsolate();
+        try std.testing.expectError(error.IsolateThreadBusy, iso.run("$must_not_run = true"));
+        try std.testing.expect(mruby.alloc.currentIsolateCell() == &iso.cell);
+    }
+
+    try std.testing.expectEqual(@as(u64, 0), iso.stats().gas.?.generation);
+    const ok = try iso.run("42");
+    try std.testing.expectEqual(@as(i64, 42), try ok.asInt());
+}
+
+test "sandbox: gas configuration is validated and cached at spawn" {
+    const allocations_before = mruby.alloc.liveAllocs();
+    try std.testing.expectError(error.ConflictingGasPolicy, sandbox.Isolate.spawn(.{ .limits = .{
+        .instructions = 10,
+        .gas = .{ .per_execution = 10 },
+    } }));
+    // Conflict validation happens before the mruby heap is allocated.
+    try std.testing.expectEqual(allocations_before, mruby.alloc.liveAllocs());
+
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 100 },
+    } });
+    defer iso.deinit();
+
+    // Policy is retained for source compatibility and inspection, but the
+    // authoritative scope and allowance were resolved once at spawn.
+    iso.policy.limits.gas = .unlimited;
+    iso.policy.limits.instructions = 1_000_000;
+    try std.testing.expectError(error.GasExhausted, iso.run("while true; end"));
+    const gas = iso.stats().gas.?;
+    try std.testing.expectEqual(sandbox.GasScope.execution, gas.scope);
+    try std.testing.expectEqual(@as(u64, 100), gas.limit);
+}
+
+test "sandbox: exact and zero gas boundaries are observable" {
+    // Calibrate the deterministic opcode count on the same public entry path.
+    const calibration = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_isolate = 10_000 },
+    } });
+    defer calibration.deinit();
+    _ = try calibration.run("1");
+    const exact_limit = calibration.stats().gas.?.used;
+    try std.testing.expect(exact_limit > 0);
+
+    const exact = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_isolate = exact_limit },
+    } });
+    defer exact.deinit();
+    const one = try exact.run("1");
+    try std.testing.expectEqual(@as(i64, 1), try one.asInt());
+    const empty = exact.stats().gas.?;
+    try std.testing.expectEqual(@as(u64, 0), empty.remaining);
+    try std.testing.expect(!empty.exhausted);
+
+    // Exhaustion is observed only when a later fetch sees the empty meter.
+    try std.testing.expectError(error.GasExhausted, exact.run("1"));
+    try std.testing.expect(exact.stats().gas.?.exhausted);
+
+    const zero = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 0 },
+    } });
+    defer zero.deinit();
+    try std.testing.expectError(error.GasExhausted, zero.run("1 + 1"));
+    const zero_stats = zero.stats().gas.?;
+    try std.testing.expectEqual(@as(u64, 0), zero_stats.used);
+    try std.testing.expectEqual(@as(u64, 0), zero_stats.remaining);
+    try std.testing.expect(zero_stats.exhausted);
+    try std.testing.expect(zero_stats.observed_instructions >= 1);
+}
+
+test "sandbox: per-execution gas renews at each outer run" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 1_000 },
+    } });
+    defer iso.deinit();
+
+    const first = try iso.run("$request_count ||= 0; $request_count += 1");
+    try std.testing.expectEqual(@as(i64, 1), try first.asInt());
+    const first_stats = iso.stats();
+    const first_gas = first_stats.gas.?;
+    try std.testing.expectEqual(@as(u64, 1), first_gas.generation);
+    try std.testing.expect(first_gas.used > 0);
+    try std.testing.expect(!first_gas.exhausted);
+
+    const second = try iso.run("$request_count += 1");
+    try std.testing.expectEqual(@as(i64, 2), try second.asInt());
+    const second_stats = iso.stats();
+    const second_gas = second_stats.gas.?;
+    try std.testing.expectEqual(@as(u64, 2), second_gas.generation);
+    try std.testing.expect(second_gas.used > 0);
+    try std.testing.expect(second_stats.instructions > first_stats.instructions);
+}
+
+test "sandbox: sequential executions each receive the full fixed allowance" {
+    const script = "i = 0; while i < 50; i += 1; end; i";
+    const calibration = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 100_000 },
+    } });
+    defer calibration.deinit();
+    _ = try calibration.run(script);
+    const allowance = calibration.stats().gas.?.used;
+
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = allowance },
+    } });
+    defer iso.deinit();
+
+    const first = try iso.run(script);
+    try std.testing.expectEqual(@as(i64, 50), try first.asInt());
+    const first_gas = iso.stats().gas.?;
+    try std.testing.expectEqual(@as(u64, 1), first_gas.generation);
+    try std.testing.expectEqual(@as(u64, 0), first_gas.remaining);
+    try std.testing.expect(!first_gas.exhausted);
+
+    const second = try iso.run(script);
+    try std.testing.expectEqual(@as(i64, 50), try second.asInt());
+    const second_stats = iso.stats();
+    const second_gas = second_stats.gas.?;
+    try std.testing.expectEqual(@as(u64, 2), second_gas.generation);
+    try std.testing.expectEqual(@as(u64, 0), second_gas.remaining);
+    try std.testing.expect(!second_gas.exhausted);
+    try std.testing.expect(second_stats.instructions >= allowance * 2);
+}
+
+test "sandbox: per-execution gas recovers after exhaustion on the same heap" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 2_000 },
+    } });
+    defer iso.deinit();
+
+    try std.testing.expectError(error.GasExhausted, iso.run(
+        \\$gas_value = 0
+        \\$gas_ensured = false
+        \\begin
+        \\  while $gas_value < 1_000_000_000
+        \\    $gas_value += 1
+        \\  end
+        \\ensure
+        \\  $gas_ensured = true
+        \\end
+    ));
+    try std.testing.expect(!iso.pendingTermination());
+    try std.testing.expect(iso.lastError() == null);
+    const exhausted = iso.stats().gas.?;
+    try std.testing.expectEqual(@as(u64, 1), exhausted.generation);
+    try std.testing.expect(exhausted.exhausted);
+    try std.testing.expectEqual(exhausted.limit, exhausted.used);
+    try std.testing.expect(exhausted.observed_instructions >= @as(u128, exhausted.limit) + 1);
+
+    const preserved = try iso.run("$gas_value > 0 && $gas_ensured");
+    try std.testing.expect(preserved.isTruthy());
+    const renewed = iso.stats().gas.?;
+    try std.testing.expectEqual(@as(u64, 2), renewed.generation);
+    try std.testing.expect(!renewed.exhausted);
+    try std.testing.expectEqual(@as(u128, renewed.used), renewed.observed_instructions);
+}
+
+test "sandbox: run runImage and call each start a fresh gas generation" {
+    const image = try sandbox.compile("6 * 7");
+    defer mruby.alloc.gpa.free(image);
+
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 2_000 },
+    } });
+    defer iso.deinit();
+
+    try std.testing.expectError(error.GasExhausted, iso.run("while true; end"));
+    try std.testing.expectEqual(@as(u64, 1), iso.stats().gas.?.generation);
+
+    const receiver = try iso.run(
+        \\class GasEntryPoint
+        \\  def answer
+        \\    42
+        \\  end
+        \\end
+        \\GasEntryPoint.new
+    );
+    try std.testing.expectEqual(@as(u64, 2), iso.stats().gas.?.generation);
+
+    const from_image = try iso.runImage(image);
+    try std.testing.expectEqual(@as(i64, 42), try from_image.asInt());
+    try std.testing.expectEqual(@as(u64, 3), iso.stats().gas.?.generation);
+
+    const from_call = try iso.call(receiver, "answer", .{});
+    try std.testing.expectEqual(@as(i64, 42), try from_call.asInt());
+    try std.testing.expectEqual(@as(u64, 4), iso.stats().gas.?.generation);
+}
+
+test "sandbox: per-isolate gas reports charged and observed instructions" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_isolate = 300 },
+    } });
+    defer iso.deinit();
+
+    try std.testing.expectError(error.GasExhausted, iso.run("while true; end"));
+    const stats = iso.stats();
+    const gas = stats.gas.?;
+    try std.testing.expectEqual(sandbox.GasScope.isolate, gas.scope);
+    try std.testing.expectEqual(@as(u64, 1), gas.generation);
+    try std.testing.expectEqual(@as(u64, 300), gas.used);
+    try std.testing.expectEqual(@as(u64, 0), gas.remaining);
+    try std.testing.expect(gas.exhausted);
+    try std.testing.expect(gas.observed_instructions >= 301);
+    try std.testing.expectEqual(@as(u128, stats.instructions), gas.observed_instructions);
 }
 
 test "sandbox: un-rescuable termination still runs ensure" {
@@ -561,7 +969,10 @@ test "sandbox: termination cannot be suppressed by rescue" {
 }
 
 test "sandbox: memory cap escalates to MemoryLimitExceeded" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .memory_bytes = 2 * 1024 * 1024 } });
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 10_000_000 },
+        .memory_bytes = 2 * 1024 * 1024,
+    } });
     defer iso.deinit();
     // Grow a string well past the cap; the host survives.
     try std.testing.expectError(error.MemoryLimitExceeded, iso.run(
@@ -569,11 +980,19 @@ test "sandbox: memory cap escalates to MemoryLimitExceeded" {
         \\2000.times { s += "0123456789abcdef0123456789abcdef" }
         \\s.size
     ));
-    try std.testing.expect(iso.cell.soft_oom or iso.cell.hard_oom);
+    try std.testing.expect(iso.cell.anyOom());
+    const terminated = iso.stats();
+    try std.testing.expectError(error.MemoryLimitExceeded, iso.run("$memory_must_not_run = true"));
+    const repeated = iso.stats();
+    try std.testing.expectEqual(terminated.instructions, repeated.instructions);
+    try std.testing.expectEqual(terminated.gas.?.generation, repeated.gas.?.generation);
 }
 
 test "sandbox: call-depth limit" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .call_depth = 8 } });
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 100_000 },
+        .call_depth = 8,
+    } });
     defer iso.deinit();
     try std.testing.expectError(error.CallDepthExceeded, iso.run(
         \\def r(n)
@@ -581,6 +1000,11 @@ test "sandbox: call-depth limit" {
         \\end
         \\r(0)
     ));
+    const terminated = iso.stats();
+    try std.testing.expectError(error.CallDepthExceeded, iso.run("$depth_must_not_run = true"));
+    const repeated = iso.stats();
+    try std.testing.expectEqual(terminated.instructions, repeated.instructions);
+    try std.testing.expectEqual(terminated.gas.?.generation, repeated.gas.?.generation);
 }
 
 test "sandbox: capabilities strip eval, send, introspection, ObjectSpace" {
@@ -647,6 +1071,56 @@ test "sandbox: deterministic RNG and frozen clock" {
     }
 }
 
+test "sandbox: capability bytecode follows the selected gas scope" {
+    if (!test_config.has_random) return error.SkipZigTest;
+
+    const renewable = try sandbox.Isolate.spawn(.{
+        .limits = .{ .gas = .{ .per_execution = 10_000 } },
+        .capabilities = .{ .random_seed = 42 },
+    });
+    defer renewable.deinit();
+    _ = try renewable.run("1");
+    const renewable_stats = renewable.stats();
+    // The trusted one-time srand setup executes before generation 1.
+    try std.testing.expect(renewable_stats.instructions > renewable_stats.gas.?.observed_instructions);
+    try std.testing.expectEqual(@as(u64, 1), renewable_stats.gas.?.generation);
+
+    const lifetime = try sandbox.Isolate.spawn(.{
+        .limits = .{ .gas = .{ .per_isolate = 10_000 } },
+        .capabilities = .{ .random_seed = 42 },
+    });
+    defer lifetime.deinit();
+    _ = try lifetime.run("1");
+    const lifetime_stats = lifetime.stats();
+    // A lifetime meter is active at spawn, so the same setup is charged.
+    try std.testing.expectEqual(
+        @as(u128, lifetime_stats.instructions),
+        lifetime_stats.gas.?.observed_instructions,
+    );
+}
+
+test "sandbox: failed capability preparation is terminal before generation one" {
+    if (test_config.has_random) return error.SkipZigTest;
+
+    const iso = try sandbox.Isolate.spawn(.{
+        .limits = .{ .gas = .{ .per_execution = 10_000 } },
+        // A trimmed build without mruby-random must fail loudly instead of
+        // claiming a deterministic seed was installed.
+        .capabilities = .{ .random_seed = 42 },
+    });
+    defer iso.deinit();
+
+    try std.testing.expectError(error.CapabilityApplicationFailed, iso.run("$must_not_run = true"));
+    const failed = iso.stats();
+    try std.testing.expectEqual(@as(u64, 0), failed.gas.?.generation);
+
+    try std.testing.expectError(error.CapabilityApplicationFailed, iso.run("$must_not_run = true"));
+    const repeated = iso.stats();
+    try std.testing.expectEqual(failed.instructions, repeated.instructions);
+    try std.testing.expectEqual(@as(u64, 0), repeated.gas.?.generation);
+    try std.testing.expect((try iso.vm.getGlobal("must_not_run")).isNil());
+}
+
 test "sandbox: nested run from a method callback" {
     const iso = try sandbox.Isolate.spawn(.{});
     defer iso.deinit();
@@ -667,6 +1141,77 @@ test "sandbox: nested run from a method callback" {
 
     const r = try iso.run("Nested.new.scale(21)");
     try std.testing.expectEqual(@as(i64, 42), try r.asInt());
+}
+
+test "sandbox: nested callback re-entry shares the active gas generation" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 10_000 },
+    } });
+    defer iso.deinit();
+
+    const Reenter = struct {
+        var target: ?*sandbox.Isolate = null;
+        var generation_before: u64 = 0;
+        var generation_after: u64 = 0;
+        var used_before: u64 = 0;
+        var used_after: u64 = 0;
+
+        fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
+            _ = self;
+            const before = target.?.stats().gas.?;
+            generation_before = before.generation;
+            used_before = before.used;
+            const inner = try target.?.run("20 + 1");
+            const after = target.?.stats().gas.?;
+            generation_after = after.generation;
+            used_after = after.used;
+            return m.intValue((try inner.asInt()) * 2);
+        }
+    };
+    Reenter.target = iso;
+    Reenter.generation_before = 0;
+    Reenter.generation_after = 0;
+    Reenter.used_before = 0;
+    Reenter.used_after = 0;
+
+    const cls = try iso.vm.defineClass("GasReenter", null);
+    cls.defineMethod("call", "", Reenter.call);
+
+    const result = try iso.run("GasReenter.new.call");
+    try std.testing.expectEqual(@as(i64, 42), try result.asInt());
+    try std.testing.expectEqual(@as(u64, 1), Reenter.generation_before);
+    try std.testing.expectEqual(Reenter.generation_before, Reenter.generation_after);
+    try std.testing.expect(Reenter.used_after > Reenter.used_before);
+    try std.testing.expectEqual(@as(u64, 1), iso.stats().gas.?.generation);
+}
+
+test "sandbox: nested callback cannot mint a replacement gas generation" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 1_000 },
+    } });
+    defer iso.deinit();
+
+    const Reenter = struct {
+        var target: ?*sandbox.Isolate = null;
+        fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
+            _ = m;
+            _ = self;
+            _ = try target.?.run("while true; end");
+            return error.TestUnexpectedResult;
+        }
+    };
+    Reenter.target = iso;
+    const cls = try iso.vm.defineClass("GasNestedExhaust", null);
+    cls.defineMethod("call", "", Reenter.call);
+
+    try std.testing.expectError(error.GasExhausted, iso.run("GasNestedExhaust.new.call"));
+    const exhausted = iso.stats().gas.?;
+    try std.testing.expectEqual(@as(u64, 1), exhausted.generation);
+    try std.testing.expect(exhausted.exhausted);
+
+    const next = try iso.run("42");
+    try std.testing.expectEqual(@as(i64, 42), try next.asInt());
+    try std.testing.expectEqual(@as(u64, 2), iso.stats().gas.?.generation);
 }
 
 test "sandbox: concurrent isolates with independent policies" {
@@ -747,12 +1292,179 @@ test "sandbox: frozen clock pin cannot be reassigned by a script" {
 }
 
 test "sandbox: script cannot forge a policy termination" {
-    const iso = try sandbox.Isolate.spawn(.{});
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 1_000 },
+    } });
     defer iso.deinit();
     // Raising the sandbox's own termination class from script must surface as
     // an ordinary RubyException, never the host-trusted error.GasExhausted
-    // (no real limit was hit, so terminate_flag stays clear).
+    // (no real limit was hit, so the authoritative gas bit stays clear).
     try std.testing.expectError(error.RubyException, iso.run("raise MRubyZigSandbox::GasExhausted, 'fake'"));
+    const class_name = iso.lastError().?.className();
+    defer mruby.alloc.gpa.free(class_name);
+    try std.testing.expectEqualStrings("MRubyZigSandbox::GasExhausted", class_name);
+    const next = try iso.run("21 * 2");
+    try std.testing.expectEqual(@as(i64, 42), try next.asInt());
+    try std.testing.expectEqual(@as(u64, 2), iso.stats().gas.?.generation);
+}
+
+test "sandbox: policy exception delivery does not dispatch guest factories" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 1_000 },
+    } });
+    defer iso.deinit();
+
+    try std.testing.expectError(error.GasExhausted, iso.run(
+        \\$replacement = RuntimeError.new("hijacked")
+        \\class << MRubyZigSandbox::GasExhausted
+        \\  def exception(*args)
+        \\    $policy_factory_ran = true
+        \\    $replacement
+        \\  end
+        \\end
+        \\while true; end
+    ));
+    const untouched = try iso.run("$policy_factory_ran == nil");
+    try std.testing.expect(untouched.isTruthy());
+}
+
+test "sandbox: lastError uses inert exception metadata" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 100_000 },
+    } });
+    defer iso.deinit();
+
+    try std.testing.expectError(error.RubyException, iso.run(
+        \\module DiagnosticOuter
+        \\  class HostileError < StandardError
+        \\    def to_s
+        \\      $hostile_to_s_ran = true
+        \\      raise "to_s was dispatched"
+        \\    end
+        \\    def class
+        \\      $hostile_class_ran = true
+        \\      String
+        \\    end
+        \\  end
+        \\  class << HostileError
+        \\    def to_s
+        \\      $hostile_class_to_s_ran = true
+        \\      raise "class to_s was dispatched"
+        \\    end
+        \\  end
+        \\end
+        \\raise DiagnosticOuter::HostileError, "stored\x00 snowman: ☃"
+    ));
+
+    const before = iso.stats();
+
+    // The private root must keep both the exception and its metadata alive
+    // through non-executing collection. Symbol lookups then exercise the
+    // reusable short-symbol buffer before the cached class path is copied.
+    {
+        mruby.alloc.enterIsolate(&iso.cell);
+        defer mruby.alloc.exitIsolate();
+        mruby.c.mrb_full_gc(iso.vm.mrb);
+        mruby.c.mrb_incremental_gc(iso.vm.mrb);
+        const unrelated = try iso.vm.internSymbol("unrelated_short_symbol");
+        _ = iso.vm.symbolName(unrelated);
+    }
+
+    const ruby_error = iso.lastError().?;
+    const failed_copy = blk: {
+        const previous_allocator = mruby.alloc.gpa;
+        mruby.alloc.gpa = std.testing.failing_allocator;
+        defer mruby.alloc.gpa = previous_allocator;
+        break :blk ruby_error.message();
+    };
+    try std.testing.expectEqualStrings("", failed_copy);
+
+    const message = ruby_error.message();
+    defer mruby.alloc.gpa.free(message);
+    const class_name = ruby_error.className();
+    defer mruby.alloc.gpa.free(class_name);
+    const repeated_message = ruby_error.message();
+    defer mruby.alloc.gpa.free(repeated_message);
+    const repeated_class = ruby_error.className();
+    defer mruby.alloc.gpa.free(repeated_class);
+
+    try std.testing.expectEqualStrings("stored\x00 snowman: ☃", message);
+    try std.testing.expectEqualStrings("DiagnosticOuter::HostileError", class_name);
+    try std.testing.expectEqualStrings(message, repeated_message);
+    try std.testing.expectEqualStrings(class_name, repeated_class);
+    const after = iso.stats();
+    try std.testing.expectEqual(before.instructions, after.instructions);
+    try std.testing.expectEqual(before.gas.?.observed_instructions, after.gas.?.observed_instructions);
+    try std.testing.expectEqual(before.gas.?.generation, after.gas.?.generation);
+    try std.testing.expect(!iso.pendingTermination());
+    try std.testing.expect((try iso.vm.getGlobal("hostile_to_s_ran")).isNil());
+    try std.testing.expect((try iso.vm.getGlobal("hostile_class_ran")).isNil());
+    try std.testing.expect((try iso.vm.getGlobal("hostile_class_to_s_ran")).isNil());
+
+    _ = try iso.run("1");
+    try std.testing.expect(iso.lastError() == null);
+}
+
+test "sandbox: inert diagnostics use a fixed anonymous class fallback" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 10_000 },
+    } });
+    defer iso.deinit();
+
+    try std.testing.expectError(error.RubyException, iso.run(
+        \\anonymous = Class.new(StandardError)
+        \\raise anonymous, "anonymous message"
+    ));
+    const ruby_error = iso.lastError().?;
+    const message = ruby_error.message();
+    defer mruby.alloc.gpa.free(message);
+    const class_name = ruby_error.className();
+    defer mruby.alloc.gpa.free(class_name);
+    try std.testing.expectEqualStrings("anonymous message", message);
+    try std.testing.expectEqualStrings("<anonymous exception>", class_name);
+}
+
+test "sandbox: rejected outer entry invalidates the previous lastError" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 10_000 },
+    } });
+    defer iso.deinit();
+
+    try std.testing.expectError(error.RubyException, iso.run("raise 'old error'"));
+    try std.testing.expect(iso.lastError() != null);
+    const completed_generation = iso.stats().gas.?.generation;
+
+    iso.terminate();
+    try std.testing.expectError(error.ScriptTerminated, iso.run("1"));
+    try std.testing.expect(iso.lastError() == null);
+    try std.testing.expectEqual(completed_generation, iso.stats().gas.?.generation);
+}
+
+test "sandbox: private diagnostic and policy roots are hidden from ObjectSpace" {
+    if (!test_config.has_object_space) return error.SkipZigTest;
+
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 100_000 },
+    } });
+    defer iso.deinit();
+
+    // Freeze every guest-visible Array. The fixed diagnostic and policy root
+    // arrays have no class, so ObjectSpace cannot expose or tamper with them.
+    try std.testing.expectError(error.RubyException, iso.run(
+        \\ObjectSpace.each_object(Array) do |array|
+        \\  begin
+        \\    array.freeze
+        \\  rescue Exception
+        \\  end
+        \\end
+        \\raise "root survives"
+    ));
+    const message = iso.lastError().?.message();
+    defer mruby.alloc.gpa.free(message);
+    try std.testing.expectEqualStrings("root survives", message);
+
+    try std.testing.expectError(error.GasExhausted, iso.run("while true; end"));
+    try std.testing.expect(iso.lastError() == null);
 }
 
 test "sandbox: frozen object model also freezes the immediate-value singletons" {

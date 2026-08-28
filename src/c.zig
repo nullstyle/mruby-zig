@@ -79,6 +79,9 @@ pub const MRB_ARGS_ANY: mrb_aspec = MRB_ARGS_REST;
 
 pub extern fn mrb_open() ?*mrb_state;
 pub extern fn mrb_close(mrb: *mrb_state) void;
+pub extern fn mrb_gc_register(mrb: *mrb_state, obj: mrb_value) void;
+pub extern fn mrb_full_gc(mrb: *mrb_state) void;
+pub extern fn mrb_incremental_gc(mrb: *mrb_state) void;
 
 // ---- compile / eval ---------------------------------------------------
 
@@ -163,6 +166,15 @@ pub extern fn mrb_exc_raise(mrb: *mrb_state, exc: mrb_value) noreturn;
 pub extern fn mrb_print_error(mrb: *mrb_state) void;
 pub extern fn mrb_print_backtrace(mrb: *mrb_state) void;
 pub extern fn mrb_protect_error(mrb: *mrb_state, body: *const fn (*mrb_state, ?*anyopaque) callconv(.c) mrb_value, userdata: ?*anyopaque, error_out: ?*bool) mrb_value;
+
+pub const mrz_exception_metadata = extern struct {
+    message: mrb_value,
+    class_name: mrb_value,
+};
+pub extern fn mrz_error_root_new(mrb: *mrb_state) mrb_value;
+pub extern fn mrz_error_capture(mrb: *mrb_state, root: mrb_value, exc: mrb_value, out: *mrz_exception_metadata) bool;
+pub extern fn mrz_error_release(mrb: *mrb_state, root: mrb_value) bool;
+pub extern fn mrz_policy_exceptions_new(mrb: *mrb_state, hidden: *RClass) mrb_value;
 
 // ---- misc -------------------------------------------------------------
 

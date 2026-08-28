@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.2.0 (2026-08-28)
+
+Gas policy and reusable Isolates:
+
+- Added `Limits.gas` with `.unlimited`, `.per_isolate`, and `.per_execution`
+  policies. `.per_isolate` supplies one sticky lifetime allowance;
+  `.per_execution` starts a fixed-size generation for each admitted outermost
+  `run`, `runImage`, or `call`, while rejected preflights do not advance the
+  generation and nested re-entry shares the active generation.
+- Gas-only `GasExhausted` under `.per_execution` no longer poisons the
+  Isolate. After the call fully unwinds, the next outer execution receives a
+  fresh generation on the same Ruby heap. Guest state and completed `ensure`
+  effects survive; interrupted computation is neither resumed nor rolled
+  back. Every non-gas termination and `.per_isolate` exhaustion remain sticky.
+- Added `GasStats` through `Isolate.stats().gas`: scope, generation, limit,
+  charged use, remaining gas, observed exhaustion, and the wider
+  `observed_instructions` count that includes bounded termination-delivery
+  work. Existing `Stats.instructions` remains the saturating lifetime fetch
+  count.
+- Deprecated `Limits.instructions`; it remains source-compatible and maps
+  exactly to `.gas = .{ .per_isolate = N }`. Setting both fields returns
+  `error.ConflictingGasPolicy` before allocating an mruby heap.
+- Sandbox `lastError()` diagnostics now use rooted, inert exception metadata.
+  Reading `message()` or `className()` executes no guest methods, starts no gas
+  generation, and changes no instruction statistics. Policy terminations
+  expose no `lastError()`.
+- Gas renewal is policy-scoped rather than exposed as a mutable `resetGas`
+  operation. `.per_isolate` retains Shopify's fixed cumulative scope, while
+  mruby-zig keeps its own bounded guest-unwind and termination semantics and
+  adds reusable per-request Isolates without a reset/invoke race.
+
+Migration:
+
+- Existing `.instructions = N` callers require no immediate source change and
+  retain cumulative, sticky behavior. Prefer
+  `.gas = .{ .per_isolate = N }` in new code.
+- Use `.gas = .{ .per_execution = N }` only when the same Isolate should
+  accept another request after gas exhaustion. Replace the Isolate after any
+  other policy termination. Gas renewal does not renew the lifetime wall-time,
+  memory, or call-depth policy; any of those can still reject a later request.
+- Do not set `instructions` and `gas` together.
+- Read `stats().gas.?.exhausted`, not merely `remaining == 0`: a program may
+  finish exactly at zero without a later fetch observing exhaustion.
+- Sandbox error text now reflects the stored exception message and real cached
+  class name, not guest-overridden diagnostic methods.
+
 ## 0.1.0 (2026-08-26)
 
 Initial implementation.

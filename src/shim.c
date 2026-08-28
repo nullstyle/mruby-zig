@@ -16,9 +16,12 @@
 #include <mruby/internal.h>
 #include <mruby/class.h>
 #include <mruby/error.h>
+#include <mruby/array.h>
 #include <mruby/string.h>
 #include <mruby/proc.h>
 #include <mruby/compile.h>
+#include <mruby/variable.h>
+#include <string.h>
 
 /* ---- GC arena (macros over mrb->gc.arena_idx) ---- */
 
@@ -34,6 +37,87 @@ void mrz_exc_clear(mrb_state *mrb) { mrb->exc = NULL; }
 void mrz_exc_set(mrb_state *mrb, mrb_value exc) {
   if (mrb_immediate_p(exc)) return; /* not a heap object */
   mrb->exc = mrb_obj_ptr(exc);
+}
+
+struct mrz_exception_metadata {
+  mrb_value message;
+  mrb_value class_name;
+};
+
+/* One private fixed-size root. Its class is cleared so ObjectSpace cannot
+ * expose, freeze, share, or resize it. */
+mrb_value mrz_error_root_new(mrb_state *mrb) {
+  mrb_value nil = mrb_nil_value();
+  mrb_value root = mrb_ary_new_from_values(mrb, 1, &nil);
+  mrb_obj_ptr(root)->c = NULL;
+  mrb_gc_register(mrb, root);
+  return root;
+}
+
+static mrb_bool error_root_store(mrb_state *mrb, mrb_value root,
+                                 mrb_value value) {
+  if (!mrb_array_p(root)) return FALSE;
+  struct RArray *array = mrb_ary_ptr(root);
+  if (array->c != NULL || ARY_LEN(array) != 1 ||
+      ARY_SHARED_P(array) || mrb_frozen_p(array)) return FALSE;
+  ARY_PTR(array)[0] = value;
+  mrb_field_write_barrier_value(mrb, (struct RBasic*)array, value);
+  return TRUE;
+}
+
+/* Root an exception, then read its normalized message and cached real-class
+ * name without method dispatch, allocation, or a raising operation. */
+mrb_bool mrz_error_capture(mrb_state *mrb, mrb_value root, mrb_value exc,
+                           struct mrz_exception_metadata *out) {
+  if (out == NULL || !mrb_exception_p(exc) ||
+      !error_root_store(mrb, root, exc)) return FALSE;
+
+  out->class_name = mrb_nil_value();
+  struct RClass *klass = mrb_obj_class(mrb, exc);
+  if (klass != NULL) {
+    mrb_value name = mrb_obj_iv_get(mrb, (struct RObject*)klass,
+                                    MRB_SYM(__classname__));
+    if (mrb_symbol_p(name) || mrb_string_p(name)) out->class_name = name;
+  }
+
+  out->message = mrb_nil_value();
+  struct RException *exception = mrb_exc_ptr(exc);
+  if (exception->mesg != NULL) {
+    mrb_value message = mrb_obj_value(exception->mesg);
+    if (mrb_string_p(message)) out->message = message;
+  }
+  return TRUE;
+}
+
+mrb_bool mrz_error_release(mrb_state *mrb, mrb_value root) {
+  return error_root_store(mrb, root, mrb_nil_value());
+}
+
+/* Preallocate the five private policy exceptions so hook-time delivery is
+ * allocation-free and cannot dispatch a guest-overridden `.exception`. */
+mrb_value mrz_policy_exceptions_new(mrb_state *mrb, struct RClass *hidden) {
+  static const char *names[] = {
+    "ScriptTerminated", "DeadlineExceeded", "GasExhausted",
+    "MemoryLimitExceeded", "CallDepthExceeded"
+  };
+  static const char *messages[] = {
+    "mruby-zig sandbox: ScriptTerminated",
+    "mruby-zig sandbox: DeadlineExceeded",
+    "mruby-zig sandbox: GasExhausted",
+    "mruby-zig sandbox: MemoryLimitExceeded",
+    "mruby-zig sandbox: CallDepthExceeded"
+  };
+  mrb_value root = mrb_ary_new_capa(mrb, 5);
+  for (mrb_int i = 0; i < 5; ++i) {
+    struct RClass *klass = mrb_class_get_under(mrb, hidden, names[i]);
+    mrb_value exc = mrb_exc_new(mrb, klass, messages[i],
+                                (mrb_int)strlen(messages[i]));
+    mrb_obj_freeze(mrb, exc);
+    mrb_ary_push(mrb, root, exc);
+  }
+  mrb_obj_ptr(root)->c = NULL;
+  mrb_gc_register(mrb, root);
+  return root;
 }
 
 /* mrb->ud auxiliary pointer (sandbox backreference) */

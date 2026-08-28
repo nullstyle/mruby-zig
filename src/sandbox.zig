@@ -3,8 +3,9 @@
 //! An `Isolate` owns a private `Vm` (separate heap, symbols, globals —
 //! nothing is shared between isolates) plus an enforced `Policy`:
 //!
-//!   - `instructions`: deterministic gas budget (interpreter instructions;
-//!     v8 has no equivalent),
+//!   - `gas`: deterministic instruction gas, either one sticky Isolate
+//!     allowance or a fresh allowance per admitted outermost execution (v8
+//!     has no equivalent),
 //!   - `wall_time_ns`: deadline checked between instructions,
 //!   - `memory_bytes` / `hard_memory_bytes`: per-isolate allocation caps
 //!     with soft (rescuable NoMemoryError) → hard (un-rescuable
@@ -14,16 +15,16 @@
 //!     freeze the core object model (`def` → FrozenError), pin the RNG
 //!     seed and the clock for reproducible runs.
 //!
-//! `terminate()` is safe to call from any thread and takes effect at the
-//! next interpreter instruction. Termination is **un-rescuable**: the
-//! instruction hook re-raises on every instruction while a termination is
-//! pending (scripts cannot `rescue` their way out), but `ensure` blocks
-//! still run — unlike mruby's task-stop mechanism, which skips them.
+//! `terminate()` is safe to call from any thread and is observed at the next
+//! bytecode fetch. Delivery may wait for a catchable VM position and then uses
+//! bounded handler grace: scripts cannot `rescue` their way out, but `ensure`
+//! blocks still run — unlike mruby's task-stop mechanism, which skips them.
 //!
-//! Same class of caveat as v8 native code: the hook fires on bytecode
-//! only. Long pure-C operations and host Zig callbacks are not
-//! instruction-interruptible (memory caps still bound them); keep host
-//! callbacks bounded or poll `Isolate.pendingTermination` from them.
+//! Same class of caveat as v8 native code: the hook fires on bytecode only.
+//! Long pure-C operations and host Zig callbacks are not instruction-
+//! interruptible; memory caps constrain attributable allocations, not CPU
+//! time. Keep callbacks bounded; they may poll `Isolate.pendingTermination`
+//! for an external or already-recorded cause.
 //!
 //! Out-of-process isolates (worker processes with IPC, OS-level memory
 //! separation) are a planned follow-up tier; the in-process API here is
@@ -35,17 +36,25 @@ const vm_mod = @import("vm.zig");
 const value_mod = @import("value.zig");
 const error_mod = @import("error.zig");
 const alloc_mod = @import("alloc.zig");
+const gas_mod = @import("gas.zig");
 
 pub const Vm = vm_mod.Vm;
 pub const Value = value_mod.Value;
 pub const RubyError = error_mod.RubyError;
 
+pub const GasPolicy = gas_mod.Policy;
+pub const GasScope = gas_mod.Scope;
+pub const GasStats = gas_mod.Stats;
+
 /// Enforced resource limits. All optional; unset fields are unbounded.
 pub const Limits = struct {
-    /// Interpreter instruction budget (deterministic "gas"). Exact across
-    /// runs of the same script on the same build.
+    /// Deprecated compatibility spelling for `.gas = .{ .per_isolate = N }`.
     instructions: ?u64 = null,
-    /// Wall-clock deadline for the whole isolate lifetime, in nanoseconds.
+    /// Instruction-gas policy. Null derives from `instructions` during the
+    /// compatibility window; setting both fields is an error.
+    gas: ?GasPolicy = null,
+    /// Lifetime deadline in nanoseconds. It starts when the first outer entry
+    /// begins preflight (not at spawn), spans idle time, and is never renewed.
     wall_time_ns: ?u64 = null,
     /// Soft per-isolate memory cap in bytes: crossing it fails the next
     /// allocation (mruby runs a full GC, retries once, then raises the
@@ -88,7 +97,11 @@ pub const Policy = struct {
 };
 
 pub const Stats = struct {
+    /// Saturating lifetime count of every observed bytecode fetch, including
+    /// bounded termination-delivery work.
     instructions: u64,
+    /// Null only when gas is unlimited.
+    gas: ?GasStats = null,
     peak_memory_bytes: usize,
     live_memory_bytes: usize,
     peak_call_depth: u32,
@@ -107,7 +120,16 @@ pub const TerminationKind = enum {
     call_depth,
 };
 
-const clock_batch = 1024; // deadline + stats sampled every N instructions
+const term_script: u8 = 1 << 0;
+const term_deadline: u8 = 1 << 1;
+const term_gas: u8 = 1 << 2;
+const term_memory: u8 = 1 << 3;
+const term_call_depth: u8 = 1 << 4;
+
+const Phase = enum { idle, preparing, running };
+const CapabilityState = enum { pending, ready, failed };
+
+const clock_batch: u16 = 1024; // deadline sampled every N instructions
 const handler_grace_instructions = 1024;
 const uncovered_wait_limit = 4096;
 
@@ -147,12 +169,15 @@ pub fn sleepNs(ns: u64) void {
 pub const Isolate = struct {
     vm: *Vm,
     policy: Policy,
+    resolved_gas: GasPolicy,
+    gas_meter: ?gas_mod.Meter,
+    last_gas: ?GasStats,
     cell: alloc_mod.IsolateCell = .{},
 
     // hook/runtime state (owned by the isolate's thread while running)
-    terminate_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    pending_kind: std.atomic.Value(u8) = std.atomic.Value(u8).init(@backingInt(TerminationKind.script)),
+    termination_bits: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     instr_count: u64 = 0,
+    clock_countdown: u16 = clock_batch,
     gas_remaining: u64 = 0,
     /// Instruction budget granted to handler bodies (and any immediate
     /// post-handler continuation) after a termination was raised: mruby
@@ -166,11 +191,11 @@ pub const Isolate = struct {
     /// must not re-arm it, or a rescue/catch loop could run forever in
     /// grace-sized bursts).
     grace_armed: bool = false,
-    /// Termination is delivered on the fetch AFTER the one that detected
-    /// the violation: the hook runs before instruction execution, and
-    /// catch-handler coverage requires pc to have advanced past the
-    /// region start (a raise at a region's first instruction would find
-    /// no handler and skip ensure blocks).
+    /// Termination is armed for delivery beginning with the fetch AFTER the
+    /// one that detected the violation: the hook runs before instruction
+    /// execution, and catch-handler coverage requires pc to have advanced
+    /// past the region start (a raise at a region's first instruction would
+    /// find no handler and skip ensure blocks).
     /// Termination is armed but waiting for a fetch where the raise would
     /// actually be catchable (hook-time pc hasn't advanced past the
     /// current instruction, and backward jumps can land exactly on a
@@ -181,8 +206,8 @@ pub const Isolate = struct {
     start_ns: i128 = 0,
     elapsed_ns: u64 = 0,
     peak_call_depth: u32 = 0,
-    capabilities_applied: bool = false,
-    running: bool = false,
+    phase: Phase = .idle,
+    capabilities: CapabilityState = .pending,
 
     // hidden exception classes (rooted as constants of this module)
     hidden: *c.RClass,
@@ -190,62 +215,91 @@ pub const Isolate = struct {
     /// with mrb->exc pending can clobber it, so it is stashed and the
     /// pending state cleared before classification.
     last_exc: c.mrb_value = undefined,
+    /// Preallocated one-element array registered as a GC root. Its element is
+    /// replaced allocation-free when an ordinary exception is captured.
+    error_root: c.mrb_value,
+    policy_exceptions: c.mrb_value,
+    error_message: c.mrb_value,
+    error_class: c.mrb_value,
 
     /// Spawn an isolate with a policy. The underlying `Vm` is fully
     /// initialized; capabilities apply lazily on the first `run`/`call`
     /// (register host methods on `iso.vm` before then when freezing).
     pub fn spawn(policy: Policy) !*Isolate {
-        // Bracket bootstrap allocations so caps see them.
-        var bootstrap_cell = alloc_mod.IsolateCell{};
-        alloc_mod.enterIsolate(&bootstrap_cell);
-        defer alloc_mod.exitIsolate();
+        const resolved_gas = try resolveGas(policy.limits);
+        const initial_meter = gas_mod.Meter.init(resolved_gas);
+
+        // Allocate the stable owner cell before mruby. Allocation headers keep
+        // this address so frees/reallocs remain attributable after bootstrap.
+        const iso = try alloc_mod.gpa.create(Isolate);
+        errdefer alloc_mod.gpa.destroy(iso);
+        iso.cell = .{};
+        try iso.cell.initOwnership();
+        errdefer iso.cell.retireOwnership();
+        const attribution = alloc_mod.pushIsolate(&iso.cell);
+        defer alloc_mod.restoreIsolate(attribution);
 
         const vm = try Vm.init();
         errdefer vm.deinit();
 
-        const iso = try alloc_mod.gpa.create(Isolate);
-        errdefer alloc_mod.gpa.destroy(iso);
+        const bootstrap = try bootstrapSandbox(vm);
+        const hidden = bootstrap.hidden;
 
-        const hidden = c.mrb_define_module(vm.mrb, "MRubyZigSandbox");
-        defineTerminationClasses(vm.mrb, hidden);
+        const bootstrap_live_bytes = iso.cell.live_bytes;
+        const bootstrap_live_allocs = iso.cell.live_allocs;
+        const bootstrap_owner = iso.cell.owner_token;
 
         iso.* = .{
             .vm = vm,
             .policy = policy,
+            .resolved_gas = resolved_gas,
+            .gas_meter = initial_meter,
+            .last_gas = if (initial_meter) |meter| meter.snapshot() else null,
             .hidden = hidden,
+            .last_exc = c.mrz_nil_value(),
+            .error_root = bootstrap.error_root,
+            .policy_exceptions = bootstrap.policy_exceptions,
+            .error_message = c.mrz_nil_value(),
+            .error_class = c.mrz_nil_value(),
             .cell = .{
                 // Bootstrap allocations (state, symbols, core classes,
                 // termination classes) are permanent; count them toward
                 // the caps so budgets reflect true isolate footprint.
-                .live_bytes = bootstrap_cell.live_bytes,
-                .live_allocs = bootstrap_cell.live_allocs,
-                .peak_bytes = bootstrap_cell.live_bytes,
+                .live_bytes = bootstrap_live_bytes,
+                .live_allocs = bootstrap_live_allocs,
+                .peak_bytes = bootstrap_live_bytes,
                 .soft_cap = policy.limits.memory_bytes,
                 .hard_cap = policy.limits.hard_memory_bytes orelse defaultHardCap(policy.limits.memory_bytes),
+                .on_limit = allocatorLimit,
+                .on_limit_ctx = iso,
+                .owner_token = bootstrap_owner,
             },
         };
-        iso.gas_remaining = policy.limits.instructions orelse 0;
+        iso.gas_remaining = switch (resolved_gas) {
+            .unlimited => 0,
+            .per_isolate, .per_execution => |limit| limit,
+        };
         c.mrz_set_ud(vm.mrb, iso);
         c.mrz_set_code_fetch_hook(vm.mrb, fetchHook);
         return iso;
     }
 
     pub fn deinit(iso: *Isolate) void {
-        alloc_mod.enterIsolate(&iso.cell);
-        defer alloc_mod.exitIsolate();
+        const attribution = alloc_mod.pushIsolate(&iso.cell);
         c.mrz_set_code_fetch_hook(iso.vm.mrb, null);
         c.mrz_set_ud(iso.vm.mrb, null);
         iso.vm.deinit();
+        alloc_mod.restoreIsolate(attribution);
+        iso.cell.retireOwnership();
         alloc_mod.gpa.destroy(iso);
     }
 
     /// Run `src` under the policy. Policy terminations surface as distinct
     /// errors (`ScriptTerminated`, `DeadlineExceeded`, `GasExhausted`,
     /// `MemoryLimitExceeded`, `CallDepthExceeded`); ordinary script errors
-    /// as `error.RubyException` (see `iso.vm.lastError()`).
+    /// as `error.RubyException` (see `iso.lastError()`).
     pub fn run(iso: *Isolate, src: []const u8) !Value {
-        try iso.prepare();
-        return iso.bracketed(struct {
+        return iso.enterExecution(struct {
             fn body(iso_: *Isolate, src_: []const u8) !Value {
                 return iso_.vm.loadString(src_);
             }
@@ -254,8 +308,7 @@ pub const Isolate = struct {
 
     /// Run a snapshot produced by `compile` (no parse/codegen).
     pub fn runImage(iso: *Isolate, image: []const u8) !Value {
-        try iso.prepare();
-        return iso.bracketed(struct {
+        return iso.enterExecution(struct {
             fn body(iso_: *Isolate, image_: []const u8) !Value {
                 // loadIrep runs under mrb_protect_error and checks mrb->exc, so
                 // a raising image surfaces as error.RubyException (mapped to a
@@ -268,41 +321,49 @@ pub const Isolate = struct {
 
     /// Call a Ruby method under the policy (same error mapping as `run`).
     pub fn call(iso: *Isolate, recv: Value, name: []const u8, args: anytype) !Value {
-        try iso.prepare();
-        return iso.bracketed(struct {
+        return iso.enterExecution(struct {
             fn body(iso_: *Isolate, ctx: anytype) !Value {
                 return iso_.vm.call(ctx.recv, ctx.name, ctx.args);
             }
         }.body, .{ .recv = recv, .name = name, .args = args });
     }
 
-    /// Request termination from any thread. The running script stops at
-    /// the next interpreter instruction (`ensure` blocks run; `rescue`
-    /// cannot suppress it) and the pending `run` returns
-    /// `error.ScriptTerminated`.
+    /// Request termination from any thread. The next bytecode fetch observes
+    /// it; delivery and guest unwind then complete within bounded wait/grace
+    /// budgets (`ensure` runs, while `rescue` cannot suppress it). The pending
+    /// outer execution returns `error.ScriptTerminated`.
     pub fn terminate(iso: *Isolate) void {
-        iso.pending_kind.store(@backingInt(TerminationKind.script), .release);
-        iso.terminate_flag.store(true, .release);
+        noteTerm(iso, .script);
     }
 
-    /// True once termination has been requested (or a limit has fired) and
-    /// has not been observed yet. Host callbacks that loop for a long time
-    /// can poll this to cooperatively unwind.
+    /// True while any termination cause is recorded. Sticky causes remain true
+    /// after observation; renewable per-execution gas clears only after the
+    /// outer unwind completes. Host callbacks can poll this to cooperatively
+    /// unwind for an external or already-recorded cause.
     pub fn pendingTermination(iso: *Isolate) bool {
-        return iso.terminate_flag.load(.acquire) or iso.cell.hard_oom;
+        return iso.termination_bits.load(.acquire) != 0 or iso.cell.anyOom();
     }
 
     pub fn stats(iso: *Isolate) Stats {
         const depth: u32 = @intCast(@max(0, c.mrz_ci_depth(iso.vm.mrb)));
+        const gas_stats: ?GasStats = switch (iso.resolved_gas) {
+            .unlimited => null,
+            .per_isolate => iso.gas_meter.?.snapshot(),
+            .per_execution => if (iso.phase == .running)
+                iso.gas_meter.?.snapshot()
+            else
+                iso.last_gas,
+        };
         return .{
             .instructions = iso.instr_count,
+            .gas = gas_stats,
             .peak_memory_bytes = iso.cell.peak_bytes,
             .live_memory_bytes = iso.cell.live_bytes,
             .peak_call_depth = @max(iso.peak_call_depth, depth),
             .live_objects = c.mrz_gc_live(iso.vm.mrb),
             .wall_time_ns = iso.elapsed_ns,
-            .soft_memory_limit_hit = iso.cell.soft_oom,
-            .hard_memory_limit_hit = iso.cell.hard_oom,
+            .soft_memory_limit_hit = iso.cell.softOom(),
+            .hard_memory_limit_hit = iso.cell.hardOom(),
         };
     }
 
@@ -310,82 +371,209 @@ pub const Isolate = struct {
 
     fn defaultHardCap(soft: ?usize) ?usize {
         const s = soft orelse return null;
-        return s + @max(1024 * 1024, s / 2);
+        return s +| @max(1024 * 1024, s / 2);
     }
 
-    fn prepare(iso: *Isolate) !void {
-        if (iso.capabilities_applied) return;
-        iso.capabilities_applied = true;
-        // Attribute capability-application allocations (frozen-clock Time
-        // object, srand state, method (un)defs, freezes) to the isolate's
-        // cell so they count toward the memory caps and stats, like the
-        // bootstrap allocations spawn() folds in. This runs before bracketed()
-        // enters the cell, so without it these leaked to global accounting.
-        alloc_mod.enterIsolate(&iso.cell);
-        defer alloc_mod.exitIsolate();
-        const caps_result: anyerror!void = iso.applyCapabilities();
-        caps_result catch |err| switch (err) {
-            error.RubyException => {
-                iso.vm.clearError();
-                return error.CapabilityApplicationFailed;
-            },
-            else => return err,
+    fn resolveGas(limits: Limits) !GasPolicy {
+        if (limits.gas != null and limits.instructions != null) {
+            return error.ConflictingGasPolicy;
+        }
+        if (limits.gas) |gas| return gas;
+        if (limits.instructions) |limit| return .{ .per_isolate = limit };
+        return .unlimited;
+    }
+
+    fn enterExecution(iso: *Isolate, comptime body: anytype, ctx: anytype) !Value {
+        switch (iso.phase) {
+            .running => return body(iso, ctx),
+            .preparing => return error.IsolatePreparing,
+            .idle => {},
+        }
+        // The running phase above is the only supported nested entry seam.
+        // At idle, even this isolate's cell may belong to an outer trusted
+        // allocator bracket; entering and exiting again would destroy that
+        // caller's TLS attribution because the allocator API is not stacked.
+        if (alloc_mod.currentIsolateCell() != null) return error.IsolateThreadBusy;
+
+        iso.clearErrorView();
+        iso.startTiming();
+        defer iso.updateElapsed();
+
+        const renewable = switch (iso.resolved_gas) {
+            .per_execution => true,
+            .unlimited, .per_isolate => false,
         };
-    }
+        try iso.rejectPending(renewable);
+        try iso.prepareCapabilities();
+        try iso.rejectPending(renewable);
 
-    fn bracketed(iso: *Isolate, comptime body: anytype, ctx: anytype) !Value {
-        if (iso.running) return body(iso, ctx); // nested: already bracketed
-        // A terminated isolate is dead for good: refuse further script and
-        // re-report the termination. Without this, a re-entered run()/call()
-        // resets grace_armed and re-arms a fresh handler_grace window
-        // (raiseTerm, once handler_grace hits 0), so a host looping on a
-        // terminated isolate would execute another ~1024-instruction burst of
-        // script per call — bounding execution per-call instead of per-isolate.
-        if (iso.cell.hard_oom) return error.MemoryLimitExceeded;
-        if (iso.terminate_flag.load(.acquire)) {
-            return terminationError(@fromBackingInt(@intCast(iso.pending_kind.load(.monotonic))));
+        if (renewable) {
+            const candidate = iso.gas_meter.?.nextGeneration();
+            _ = iso.termination_bits.fetchAnd(~term_gas, .acq_rel);
+            try iso.rejectPending(true);
+            iso.gas_meter = candidate;
+            iso.gas_remaining = candidate.remaining;
+            iso.clearGasDelivery();
         }
-        iso.running = true;
-        defer iso.running = false;
 
-        if (iso.policy.limits.wall_time_ns) |budget| {
-            if (iso.deadline_ns == null) {
-                iso.start_ns = monotonicNs();
-                iso.deadline_ns = iso.start_ns + @as(i128, @intCast(budget));
-            }
-        } else if (iso.start_ns == 0) {
-            iso.start_ns = monotonicNs();
-        }
-        // Record wall time on every exit path (success, script error, and
-        // termination) — a supervisor reads stats().wall_time_ns precisely
-        // after a kill, where the old success-only assignment left it stale.
-        defer iso.elapsed_ns = @intCast(@max(0, monotonicNs() - iso.start_ns));
+        iso.phase = .running;
+        defer iso.finishExecution();
 
-        alloc_mod.enterIsolate(&iso.cell);
-        defer alloc_mod.exitIsolate();
+        // A non-gas termination racing after the final preflight belongs to
+        // this now-committed generation, but still executes no guest body.
+        try iso.rejectPending(false);
 
-        iso.last_exc = c.mrz_nil_value();
-        iso.grace_armed = false;
+        const attribution = alloc_mod.pushIsolate(&iso.cell);
+        defer alloc_mod.restoreIsolate(attribution);
+
         const result = body(iso, ctx) catch |err| {
-            return iso.mapError(err);
+            if (err == error.RubyException) return iso.mapError(err);
+            // The final operation may be native code with no later fetch to
+            // trigger the batched hook poll. Arbitrate the deadline at every
+            // outer return boundary as well.
+            iso.pollDeadline();
+            if (currentTermination(iso)) |kind| return terminationError(kind);
+            return err;
         };
-        if (iso.terminate_flag.load(.acquire)) {
-            return terminationError(@fromBackingInt(@intCast(iso.pending_kind.load(.monotonic))));
-        }
+        iso.pollDeadline();
+        if (currentTermination(iso)) |kind| return terminationError(kind);
         return result;
     }
 
-    /// The exception behind the last failed `run`/`runImage`/`call`
-    /// (ordinary script errors; policy terminations are reported as their
-    /// distinct Zig errors instead). Only valid until the next run.
+    fn startTiming(iso: *Isolate) void {
+        if (iso.start_ns != 0) return;
+        iso.start_ns = monotonicNs();
+        if (iso.policy.limits.wall_time_ns) |budget| {
+            iso.deadline_ns = iso.start_ns + @as(i128, @intCast(budget));
+        }
+    }
+
+    fn updateElapsed(iso: *Isolate) void {
+        iso.elapsed_ns = @intCast(@max(0, monotonicNs() - iso.start_ns));
+    }
+
+    fn pollDeadline(iso: *Isolate) void {
+        if (iso.deadline_ns) |deadline| {
+            if (monotonicNs() > deadline) noteTerm(iso, .deadline);
+        }
+    }
+
+    fn rejectPending(iso: *Isolate, ignore_gas: bool) !void {
+        syncOomCause(iso);
+        iso.pollDeadline();
+        var bits = iso.termination_bits.load(.acquire);
+        if (ignore_gas) bits &= ~term_gas;
+        if (selectedTermination(bits)) |kind| return terminationError(kind);
+    }
+
+    const CapabilityContext = struct {
+        iso: *Isolate,
+        zig_error: ?anyerror = null,
+    };
+
+    fn protectedCapabilities(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
+        _ = mrb orelse return c.mrz_nil_value();
+        const context: *CapabilityContext = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
+        context.iso.applyCapabilities() catch |err| {
+            context.zig_error = err;
+        };
+        return c.mrz_nil_value();
+    }
+
+    fn applyCapabilitiesProtected(iso: *Isolate) !void {
+        var context = CapabilityContext{ .iso = iso };
+        var raised = false;
+        const result = c.mrb_protect_error(iso.vm.mrb, protectedCapabilities, &context, &raised);
+        if (raised) {
+            c.mrz_exc_set(iso.vm.mrb, result);
+            return error.RubyException;
+        }
+        if (context.zig_error) |err| return err;
+    }
+
+    fn prepareCapabilities(iso: *Isolate) !void {
+        switch (iso.capabilities) {
+            .ready => return,
+            .failed => return error.CapabilityApplicationFailed,
+            .pending => {},
+        }
+
+        iso.phase = .preparing;
+        var complete = false;
+        defer {
+            iso.phase = .idle;
+            if (!complete) iso.capabilities = .failed;
+        }
+
+        const attribution = alloc_mod.pushIsolate(&iso.cell);
+        defer alloc_mod.restoreIsolate(attribution);
+        iso.applyCapabilitiesProtected() catch {
+            iso.vm.clearError();
+            if (currentTermination(iso)) |kind| return terminationError(kind);
+            return error.CapabilityApplicationFailed;
+        };
+        if (currentTermination(iso)) |kind| return terminationError(kind);
+        iso.capabilities = .ready;
+        complete = true;
+    }
+
+    fn finishExecution(iso: *Isolate) void {
+        if (iso.gas_meter) |*meter| {
+            iso.last_gas = meter.snapshot();
+            if (meter.scope == .execution) {
+                meter.finishGeneration();
+                _ = iso.termination_bits.fetchAnd(~term_gas, .acq_rel);
+                iso.clearGasDelivery();
+            }
+        }
+        iso.phase = .idle;
+    }
+
+    fn clearGasDelivery(iso: *Isolate) void {
+        iso.handler_grace = 0;
+        iso.grace_armed = false;
+        iso.raise_pending = false;
+        iso.uncovered_waits = 0;
+    }
+
+    /// The inert exception metadata behind the last failed outer
+    /// `run`/`runImage`/`call` (ordinary script errors only; policy
+    /// terminations are distinct Zig errors). Reading it executes no guest
+    /// methods or bytecodes. Valid only until the next outer entry, including
+    /// one rejected during preflight.
     pub fn lastError(iso: *Isolate) ?RubyError {
         if (c.mrz_nil_p(iso.last_exc)) return null;
-        return RubyError.fromValue(iso.vm.mrb, iso.last_exc);
+        return RubyError.fromInert(
+            iso.vm.mrb,
+            iso.last_exc,
+            iso.error_message,
+            iso.error_class,
+        );
+    }
+
+    fn clearErrorView(iso: *Isolate) void {
+        _ = c.mrz_error_release(iso.vm.mrb, iso.error_root);
+        iso.last_exc = c.mrz_nil_value();
+        iso.error_message = c.mrz_nil_value();
+        iso.error_class = c.mrz_nil_value();
+    }
+
+    fn captureErrorView(iso: *Isolate) void {
+        const exc = c.mrz_exc_value(iso.vm.mrb);
+        var metadata: c.mrz_exception_metadata = undefined;
+        if (c.mrz_error_capture(iso.vm.mrb, iso.error_root, exc, &metadata)) {
+            iso.last_exc = exc;
+            iso.error_class = metadata.class_name;
+            iso.error_message = metadata.message;
+        } else {
+            iso.last_exc = c.mrz_nil_value();
+        }
+        c.mrz_exc_clear(iso.vm.mrb);
     }
 
     /// Map a failed run to a distinct Zig error. Policy terminations are
-    /// classified **only** by the authoritative `terminate_flag`/`pending_kind`
-    /// the hook sets (and the memory-cap flags), never by the raised
+    /// classified **only** by the authoritative termination-cause bitset the
+    /// hook sets (and the memory-cap flags), never by the raised
     /// exception's class name: the `MRubyZigSandbox::*` classes are
     /// script-visible and a script can `raise` them (or spoof their `to_s`),
     /// so trusting the name would let a script forge a termination the host
@@ -393,15 +581,16 @@ pub const Isolate = struct {
     /// genuine termination is fully covered by the flag check below.
     fn mapError(iso: *Isolate, err: anyerror) anyerror {
         if (err != error.RubyException) return err;
-        if (iso.cell.soft_oom or iso.cell.hard_oom) {
-            return error.MemoryLimitExceeded;
+        iso.pollDeadline();
+        if (currentTermination(iso)) |kind| {
+            c.mrz_exc_clear(iso.vm.mrb);
+            return terminationError(kind);
         }
-        // Stash the exception for lastError(); clear the pending state (a
-        // later class/to_s funcall would otherwise disturb it).
-        iso.last_exc = c.mrz_exc_value(iso.vm.mrb);
-        c.mrz_exc_clear(iso.vm.mrb);
-        if (iso.terminate_flag.load(.acquire)) {
-            return terminationError(@fromBackingInt(@intCast(iso.pending_kind.load(.monotonic))));
+        iso.captureErrorView();
+        iso.pollDeadline();
+        if (currentTermination(iso)) |kind| {
+            iso.clearErrorView();
+            return terminationError(kind);
         }
         return err;
     }
@@ -414,6 +603,13 @@ pub const Isolate = struct {
             .memory => error.MemoryLimitExceeded,
             .call_depth => error.CallDepthExceeded,
         };
+    }
+
+    fn allocatorLimit(ctx: ?*anyopaque, kind: alloc_mod.IsolateCell.LimitKind, attempted: usize) void {
+        _ = kind;
+        _ = attempted;
+        const iso: *Isolate = @ptrCast(@alignCast(ctx orelse return));
+        noteTerm(iso, .memory);
     }
 
     fn hookNoop(mrb: ?*c.mrb_state, self: c.mrb_value) callconv(.c) c.mrb_value {
@@ -576,11 +772,13 @@ pub const Isolate = struct {
         const m = mrb orelse return;
         const iso: *Isolate = @ptrCast(@alignCast(c.mrz_get_ud(m) orelse return));
 
-        iso.instr_count += 1;
+        iso.instr_count +|= 1;
 
         // Record limit conditions (idempotent flags).
-        if (iso.cell.soft_oom) noteTerm(iso, .memory);
-        if (iso.policy.limits.instructions != null and iso.gas_remaining == 0) noteTerm(iso, .gas);
+        syncOomCause(iso);
+        if (iso.gas_meter) |*meter| {
+            if (meter.observeFetch()) noteTerm(iso, .gas);
+        }
         if (iso.policy.limits.call_depth) |maxd| {
             const depth = c.mrz_ci_depth(m);
             if (depth > 0) {
@@ -600,7 +798,8 @@ pub const Isolate = struct {
             if (c.mrz_pc_catchable(irep, pc) != 0 or iso.uncovered_waits >= uncovered_wait_limit) {
                 iso.raise_pending = false;
                 iso.uncovered_waits = 0;
-                raiseTerm(m, iso, if (iso.cell.hard_oom) .memory else @fromBackingInt(@intCast(iso.pending_kind.load(.monotonic))));
+                if (currentTermination(iso)) |kind| raiseTerm(m, iso, kind);
+                iso.raise_pending = false;
             } else {
                 iso.uncovered_waits += 1;
             }
@@ -613,7 +812,7 @@ pub const Isolate = struct {
         // code resumes after a rescue — termination re-raises. Scripts
         // cannot rescue their way out; ensure blocks complete.
         //
-        if (iso.terminate_flag.load(.acquire) or iso.cell.hard_oom) {
+        if (currentTermination(iso) != null) {
             const unwinding = !c.mrz_nil_p(c.mrz_exc_value(m));
             if (!unwinding) {
                 if (iso.handler_grace > 0) {
@@ -622,25 +821,55 @@ pub const Isolate = struct {
                     iso.raise_pending = true;
                 }
             }
-            if (iso.cell.hard_oom) return; // no gas/step accounting needed
+            if (iso.cell.hardOom()) return; // no gas/step accounting needed
         }
 
         // Step the counters.
-        if (iso.policy.limits.instructions != null and iso.gas_remaining > 0) {
-            iso.gas_remaining -= 1;
+        if (iso.gas_meter) |*meter| {
+            meter.chargeFetch();
+            iso.gas_remaining = meter.remaining;
         }
 
-        // Deadline, batched.
-        if (iso.instr_count % clock_batch == 0) {
-            if (iso.deadline_ns) |dl| {
-                if (monotonicNs() > dl) noteTerm(iso, .deadline);
-            }
+        // Deadline, batched independently of the saturating public lifetime
+        // counter so polling cannot stop at maxInt(u64).
+        if (iso.clock_countdown > 1) {
+            iso.clock_countdown -= 1;
+        } else {
+            iso.clock_countdown = clock_batch;
+            iso.pollDeadline();
         }
     }
 
     fn noteTerm(iso: *Isolate, kind: TerminationKind) void {
-        iso.pending_kind.store(@backingInt(kind), .release);
-        iso.terminate_flag.store(true, .release);
+        _ = iso.termination_bits.fetchOr(terminationBit(kind), .release);
+    }
+
+    fn terminationBit(kind: TerminationKind) u8 {
+        return switch (kind) {
+            .script => term_script,
+            .deadline => term_deadline,
+            .gas => term_gas,
+            .memory => term_memory,
+            .call_depth => term_call_depth,
+        };
+    }
+
+    fn selectedTermination(bits: u8) ?TerminationKind {
+        if (bits & term_memory != 0) return .memory;
+        if (bits & term_script != 0) return .script;
+        if (bits & term_deadline != 0) return .deadline;
+        if (bits & term_call_depth != 0) return .call_depth;
+        if (bits & term_gas != 0) return .gas;
+        return null;
+    }
+
+    fn syncOomCause(iso: *Isolate) void {
+        if (iso.cell.anyOom()) noteTerm(iso, .memory);
+    }
+
+    fn currentTermination(iso: *Isolate) ?TerminationKind {
+        syncOomCause(iso);
+        return selectedTermination(iso.termination_bits.load(.acquire));
     }
 
     fn raiseTerm(m: *c.mrb_state, iso: *Isolate, kind: TerminationKind) noreturn {
@@ -649,21 +878,82 @@ pub const Isolate = struct {
             iso.handler_grace = handler_grace_instructions;
             iso.grace_armed = true;
         }
-        const name = switch (kind) {
-            .script => "ScriptTerminated",
-            .deadline => "DeadlineExceeded",
-            .gas => "GasExhausted",
-            .memory => "MemoryLimitExceeded",
-            .call_depth => "CallDepthExceeded",
-        };
-        var buf: [96]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "mruby-zig sandbox: {s}", .{name}) catch unreachable; // 96B buf, <= 22B name
-        const cls = c.mrb_class_get_under(m, iso.hidden, name);
-        const msg_v = c.mrb_str_new(m, if (msg.len == 0) null else msg.ptr, @intCast(msg.len));
-        const exc = c.mrb_funcall(m, c.mrz_obj_value(@ptrCast(cls)), "exception", 1, msg_v);
+        const exc = c.mrb_ary_entry(iso.policy_exceptions, @backingInt(kind));
         c.mrb_exc_raise(m, exc);
     }
 };
+
+test "derived hard cap saturates at usize maximum" {
+    const maximum = std.math.maxInt(usize);
+    try std.testing.expectEqual(maximum, Isolate.defaultHardCap(maximum).?);
+}
+
+const SandboxBootstrap = struct {
+    hidden: *c.RClass,
+    error_root: c.mrb_value,
+    policy_exceptions: c.mrb_value,
+};
+
+/// All sandbox-specific class/root construction can allocate and raise. Keep
+/// the whole bootstrap inside one mruby protection frame so OOM returns from
+/// spawn instead of reaching exc_throw with mrb->jmp null.
+fn bootstrapSandbox(vm: *Vm) !SandboxBootstrap {
+    const Protected = struct {
+        const Context = struct {
+            hidden: ?*c.RClass = null,
+            error_root: c.mrb_value = undefined,
+            policy_exceptions: c.mrb_value = undefined,
+        };
+
+        fn create(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
+            const m = mrb orelse return c.mrz_nil_value();
+            const context: *Context = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
+            const hidden = c.mrb_define_module(m, "MRubyZigSandbox");
+            defineTerminationClasses(m, hidden);
+            context.hidden = hidden;
+            context.error_root = c.mrz_error_root_new(m);
+            context.policy_exceptions = c.mrz_policy_exceptions_new(m, hidden);
+            return c.mrz_nil_value();
+        }
+    };
+
+    var context = Protected.Context{};
+    var failed = false;
+    _ = c.mrb_protect_error(vm.mrb, Protected.create, &context, &failed);
+    if (failed) return error.OutOfMemory;
+    return .{
+        .hidden = context.hidden orelse return error.OutOfMemory,
+        .error_root = context.error_root,
+        .policy_exceptions = context.policy_exceptions,
+    };
+}
+
+test "every sandbox bootstrap allocation failure returns OutOfMemory" {
+    const previous = alloc_mod.gpa;
+
+    // First measure raw allocations made by the protected sandbox-specific
+    // bootstrap. The wrapper delegates to the same backing allocator, so VM
+    // teardown remains valid after restoring the direct allocator handle.
+    const measure_vm = try Vm.init();
+    var measure = std.testing.FailingAllocator.init(previous, .{});
+    alloc_mod.gpa = measure.allocator();
+    const measured = bootstrapSandbox(measure_vm);
+    alloc_mod.gpa = previous;
+    _ = try measured;
+    const allocation_count = measure.alloc_index;
+    measure_vm.deinit();
+
+    for (0..allocation_count) |fail_index| {
+        const vm = try Vm.init();
+        var failing = std.testing.FailingAllocator.init(previous, .{ .fail_index = fail_index });
+        alloc_mod.gpa = failing.allocator();
+        const result = bootstrapSandbox(vm);
+        alloc_mod.gpa = previous;
+        try std.testing.expectError(error.OutOfMemory, result);
+        try std.testing.expect(failing.has_induced_failure);
+        vm.deinit();
+    }
+}
 
 fn defineTerminationClasses(m: *c.mrb_state, hidden: *c.RClass) void {
     const names = [_][]const u8{

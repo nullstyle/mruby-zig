@@ -27,6 +27,7 @@ const gen = @import("build/gen.zig");
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const sanitize_thread = b.option(bool, "sanitize-thread", "enable ThreadSanitizer") orelse false;
 
     const gem_set = b.option([]const u8, "gem-set", "gem set: \"standard\" or \"minimal\"") orelse "standard";
     const with_gems = b.option([]const u8, "with-gems", "comma-separated extra gems to enable on top of the gem set");
@@ -201,6 +202,7 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("src/mruby.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
         .link_libc = true,
     });
     var lib_files: std.ArrayList([]const u8) = .empty;
@@ -223,6 +225,7 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("tools/repl.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
     });
     repl_mod.addImport("mruby", mruby_mod);
     const repl = b.addExecutable(.{ .name = "mruby-repl", .root_module = repl_mod });
@@ -237,6 +240,7 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
     });
     test_mod.addImport("mruby", mruby_mod);
     const test_config = b.addOptions();
@@ -256,6 +260,7 @@ pub fn build(b: *std.Build) !void {
     test_config.addOption(bool, "has_math", hasGem(selected_gems, "mruby-math"));
     test_config.addOption(bool, "has_random", hasGem(selected_gems, "mruby-random"));
     test_config.addOption(bool, "has_time", hasGem(selected_gems, "mruby-time"));
+    test_config.addOption(bool, "has_object_space", hasGem(selected_gems, "mruby-objectspace"));
     test_mod.addOptions("test_config", test_config);
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -278,6 +283,7 @@ pub fn build(b: *std.Build) !void {
             .root_source_file = b.path(b.fmt("examples/{s}.zig", .{ex_name})),
             .target = target,
             .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
         });
         ex_mod.addImport("mruby", mruby_mod);
         const ex = b.addExecutable(.{ .name = ex_name, .root_module = ex_mod });
