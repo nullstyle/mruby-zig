@@ -45,6 +45,12 @@ pub const Value = struct {
         return .{ .mrb = mrb, .v = c.mrz_nil_value() };
     }
 
+    /// Reject using a Ruby value with a different interpreter. Heap-backed
+    /// `mrb_value`s are meaningful only to the state that created them.
+    pub fn ensureOwnedBy(self: Value, mrb: *c.mrb_state) error{ForeignValue}!void {
+        if (self.mrb != mrb) return error.ForeignValue;
+    }
+
     pub fn typeOf(self: Value) Type {
         return @fromBackingInt(@intCast(c.mrz_type(self.v)));
     }

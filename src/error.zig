@@ -42,7 +42,9 @@ pub const RubyError = struct {
             }
             return self.dupeInertValue(metadata.class_name, "<anonymous exception>");
         }
-        return self.dupeString(self.protectedFuncall("to_s"));
+        const message_value =
+            self.protectedFuncall(self.exc, "to_s") orelse return "";
+        return self.dupeString(message_value);
     }
 
     /// Class name of the exception, e.g. "ZeroDivisionError". Sandbox errors
@@ -53,35 +55,25 @@ pub const RubyError = struct {
         if (self.inert) |metadata| {
             return self.dupeInertValue(metadata.class_name, "<anonymous exception>");
         }
-        const cls = self.protectedFuncall("class");
-        const Protected = struct {
-            fn body(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
-                const m = mrb orelse return c.mrz_nil_value();
-                const v: *c.mrb_value = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
-                return c.mrb_funcall(m, v.*, "to_s", 0);
-            }
-        };
-        var err = false;
-        const name_v = c.mrb_protect_error(self.mrb, Protected.body, @ptrCast(@constCast(@as(*const c.mrb_value, &cls))), &err);
+        const cls = self.protectedFuncall(self.exc, "class") orelse return "";
+        const name_v = self.protectedFuncall(cls, "to_s") orelse return "";
         return self.dupeString(name_v);
     }
 
-    const ExcCall = struct {
-        exc: c.mrb_value,
-        method: [*:0]const u8,
-    };
-
-    fn protectedFuncall(self: RubyError, method: [*:0]const u8) c.mrb_value {
-        const Protected = struct {
-            fn body(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
-                const m = mrb orelse return c.mrz_nil_value();
-                const ctx: *ExcCall = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
-                return c.mrb_funcall(m, ctx.exc, ctx.method, 0);
-            }
-        };
-        var ctx = ExcCall{ .exc = self.exc, .method = method };
-        var err = false;
-        return c.mrb_protect_error(self.mrb, Protected.body, &ctx, &err);
+    fn protectedFuncall(
+        self: RubyError,
+        receiver: c.mrb_value,
+        method: []const u8,
+    ) ?c.mrb_value {
+        var result: c.mrb_value = undefined;
+        if (!c.mrz_protected_funcall_preserve_error(
+            self.mrb,
+            receiver,
+            method.ptr,
+            method.len,
+            &result,
+        )) return null;
+        return result;
     }
 
     fn dupeString(self: RubyError, v: c.mrb_value) []const u8 {

@@ -7,7 +7,7 @@
 //! ```
 //! const mruby = @import("mruby");
 //!
-//! var vm = try mruby.Vm.init();
+//! const vm = try mruby.Vm.init();
 //! defer vm.deinit();
 //! const result = try vm.loadString("2 + 2");
 //! try std.testing.expectEqual(@as(i64, 4), try result.asInt());

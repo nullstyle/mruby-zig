@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) !void {
     const mruby_dep = b.dependency("mruby", .{});
     const root = mruby_dep.path("");
 
-    const selected_gems = selectGems(arena, gem_set, with_gems, without_gems);
+    const selected_gems = try selectGems(arena, gem_set, with_gems, without_gems);
     var gem_defines: std.ArrayList([]const u8) = .empty;
     for (selected_gems) |g| {
         for (g.defines) |d| {
@@ -164,6 +164,13 @@ pub fn build(b: *std.Build) !void {
     // Presym headers for the final library: everything that gets compiled,
     // including the generated files above.
     const triple = try target.result.zigTriple(arena);
+    // mrbconf.h enables an ELF `etext`/`edata` optimization by default, but
+    // Zig's linker does not provide those symbols. Keep preprocessing and
+    // compilation on the same documented fallback path.
+    const ro_data_flags: []const []const u8 = if (target.result.os.tag == .linux)
+        &.{"-DMRB_NO_DEFAULT_RO_DATA_P"}
+    else
+        &.{};
     var lib_scan: std.ArrayList(ScanInput) = .empty;
     for (sources.core_srcs) |path| {
         if (std.mem.eql(u8, path, "src/hash.c")) {
@@ -189,6 +196,7 @@ pub fn build(b: *std.Build) !void {
             try gem_include_dirs.append(arena, try root.join(arena, dir));
         }
     }
+    try lib_scan.append(arena, .{ .lp = b.path("src/shim.c"), .pp_name = "mruby_zig_shim.c.pp" });
     for (generated_c.items) |g| try lib_scan.append(arena, .{ .lp = g.lp, .pp_name = g.pp_name });
 
     // Keep the presym scan consistent with the compile-time defines.
@@ -197,6 +205,7 @@ pub fn build(b: *std.Build) !void {
         try d.appendSlice(arena, gem_defines.items);
         try d.append(arena, "-DMRB_USE_DEBUG_HOOK");
         try d.appendSlice(arena, portable_container_flags);
+        try d.appendSlice(arena, ro_data_flags);
         break :defines d.items;
     };
     const lib_presym_dir = try presymHeaders(b, presym_gen, arena, lib_scan.items, lib_scan_defines, root, triple);
@@ -207,24 +216,6 @@ pub fn build(b: *std.Build) !void {
     // themselves. The Zig-side allocator override (src/alloc.zig, which
     // exports mrb_basic_alloc_func) lives in the same module, which is why
     // src/allocf.c is not part of the build.
-    // mrbconf.h turns on MRB_USE_ETEXT_RO_DATA_P for every __linux__ build,
-    // which makes mruby's mrb_ro_data_p() compare pointers against `etext`
-    // and `edata` -- symbols the traditional GNU link supplies and Zig's
-    // linker does not, so every Linux link fails with "undefined symbol:
-    // etext". macOS takes the mach-o branch instead and never sees it, which
-    // is why this only ever showed up on the ubuntu CI leg. Turning the
-    // default off makes mrb_ro_data_p() answer FALSE, mruby's own documented
-    // fallback for platforms that cannot answer the question: it costs a
-    // string-literal fast path, not correctness.
-    //
-    // This must reach EVERY translation unit that includes value.h -- the
-    // core sources, the generated gem inits, and shim.c below -- or the
-    // inline function is defined inconsistently across the module.
-    const ro_data_flags: []const []const u8 = if (target.result.os.tag == .linux)
-        &.{"-DMRB_NO_DEFAULT_RO_DATA_P"}
-    else
-        &.{};
-
     const lib_flags = flags: {
         var f: std.ArrayList([]const u8) = .empty;
         try f.append(arena, "-w");
@@ -240,10 +231,11 @@ pub fn build(b: *std.Build) !void {
 
     const shim_flags = flags: {
         var f: std.ArrayList([]const u8) = .empty;
-        try f.appendSlice(arena, &.{ "-w", "-DMRB_USE_DEBUG_HOOK" });
+        try f.appendSlice(arena, &.{ "-Wall", "-Wextra", "-DMRB_USE_DEBUG_HOOK" });
         try f.appendSlice(arena, portable_container_flags);
         try f.append(arena, no_c_fuzz_coverage);
         try f.appendSlice(arena, ro_data_flags);
+        try f.appendSlice(arena, gem_defines.items);
         break :flags f.items;
     };
 
@@ -337,6 +329,15 @@ pub fn build(b: *std.Build) !void {
     const artifact_identity_tests = b.addTest(.{ .root_module = artifact_identity_test_mod });
     const run_artifact_identity_tests = b.addRunArtifact(artifact_identity_tests);
     test_step.dependOn(&run_artifact_identity_tests.step);
+
+    const gem_tests_mod = b.createModule(.{
+        .root_source_file = b.path("build/gems.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const gem_tests = b.addTest(.{ .root_module = gem_tests_mod });
+    const run_gem_tests = b.addRunArtifact(gem_tests);
+    test_step.dependOn(&run_gem_tests.step);
 
     // Pure StateCapsule parser fuzz target. A normal `zig build test` runs the
     // stable corpus once; `zig build fuzz-state-capsule --fuzz=100K` enables
@@ -526,65 +527,34 @@ fn selectGems(
     gem_set: []const u8,
     with: ?[]const u8,
     without: ?[]const u8,
-) []const gems_mod.Gem {
-    var list: std.ArrayList(gems_mod.Gem) = .empty;
-    var base: []const gems_mod.Gem = undefined;
-    if (std.mem.eql(u8, gem_set, "standard")) {
-        base = &gems_mod.standard;
-    } else if (std.mem.eql(u8, gem_set, "minimal")) {
-        base = &gems_mod.minimal;
-    } else {
-        std.debug.panic("unknown -Dgem-set={s} (expected \"standard\" or \"minimal\")", .{gem_set});
-    }
-    for (base) |g| list.append(arena, g) catch @panic("OOM");
-
-    if (with) |csv| {
-        var it = std.mem.splitScalar(u8, csv, ',');
-        while (it.next()) |raw| {
-            const name = std.mem.trim(u8, raw, " ");
-            if (name.len == 0) continue;
-            const g = gems_mod.byName(name) orelse
-                std.debug.panic("unknown gem in -Dwith-gems: {s}", .{name});
-            var dup = false;
-            for (list.items) |existing| {
-                if (std.mem.eql(u8, existing.name, name)) dup = true;
-            }
-            if (!dup) list.append(arena, g) catch @panic("OOM");
+) ![]const gems_mod.Gem {
+    var failure: gems_mod.SelectionFailure = .{};
+    return gems_mod.select(arena, .{
+        .gem_set = gem_set,
+        .with = with,
+        .without = without,
+    }, &failure) catch |err| {
+        switch (failure.kind) {
+            .unknown_gem_set => std.debug.print(
+                "error: unknown -Dgem-set={s} (expected \"standard\" or \"minimal\")\n",
+                .{failure.name},
+            ),
+            .unknown_gem => std.debug.print(
+                "error: unknown gem in build options: {s}\n",
+                .{failure.name},
+            ),
+            .unknown_dependency => std.debug.print(
+                "error: gem {s} depends on unknown gem {s}\n",
+                .{ failure.dependent, failure.name },
+            ),
+            .dependency_cycle => std.debug.print(
+                "error: gem dependency cycle includes {s}\n",
+                .{failure.name},
+            ),
+            .none => {},
         }
-    }
-    if (without) |csv| {
-        var it = std.mem.splitScalar(u8, csv, ',');
-        while (it.next()) |raw| {
-            const name = std.mem.trim(u8, raw, " ");
-            if (name.len == 0) continue;
-            removeGem(&list, name);
-            // Cascade: a gem whose dependency was removed cannot initialize;
-            // remove its dependents transitively (with a clear trace). The
-            // scan restarts after every removal so no stale slice is walked.
-            var changed = true;
-            while (changed) {
-                changed = false;
-                var i: usize = 0;
-                while (i < list.items.len) : (i += 1) {
-                    var removed = false;
-                    for (list.items[i].deps) |dep| {
-                        if (!selected(list, dep)) {
-                            std.debug.print("note: -Dwithout-gems={s} also removes {s} (depends on it)\n", .{ name, list.items[i].name });
-                            removeGem(&list, list.items[i].name);
-                            changed = true;
-                            removed = true;
-                            break;
-                        }
-                    }
-                    if (removed) break;
-                }
-            }
-        }
-    }
-    // Auto-add missing dependencies (rake's add_dependency semantics),
-    // inserting each one just before its first dependent.
-    resolveDeps(arena, &list);
-    return list.items;
+        return err;
+    };
 }
 
 fn hasGem(enabled_gems: []const gems_mod.Gem, name: []const u8) bool {
@@ -613,40 +583,6 @@ fn hasNamedGems(enabled_gems: []const gems_mod.Gem, required: []const []const u8
         if (!hasGem(enabled_gems, name)) return false;
     }
     return true;
-}
-
-fn selected(list: std.ArrayList(gems_mod.Gem), name: []const u8) bool {
-    for (list.items) |g| {
-        if (std.mem.eql(u8, g.name, name)) return true;
-    }
-    return false;
-}
-
-fn removeGem(list: *std.ArrayList(gems_mod.Gem), name: []const u8) void {
-    var i: usize = 0;
-    while (i < list.items.len) {
-        if (std.mem.eql(u8, list.items[i].name, name)) {
-            _ = list.orderedRemove(i);
-        } else i += 1;
-    }
-}
-
-fn resolveDeps(arena: std.mem.Allocator, list: *std.ArrayList(gems_mod.Gem)) void {
-    var changed = true;
-    while (changed) {
-        changed = false;
-        var i: usize = 0;
-        while (i < list.items.len) : (i += 1) {
-            for (list.items[i].deps) |dep| {
-                if (selected(list.*, dep)) continue;
-                const g = gems_mod.byName(dep) orelse
-                    std.debug.panic("gem {s} depends on unknown gem {s}", .{ list.items[i].name, dep });
-                list.insert(arena, i, g) catch @panic("OOM");
-                changed = true;
-                break;
-            }
-        }
-    }
 }
 
 fn hostTool(b: *std.Build, path: []const u8) *std.Build.Step.Compile {

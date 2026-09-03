@@ -5,7 +5,7 @@
 //! callback receives fully typed arguments:
 //!
 //!     const math = try vm.defineClass("ZigMath", null);
-//!     math.defineMethod("add", "ii", struct {
+//!     try math.defineMethod("add", "ii", struct {
 //!         fn call(vm: *mruby.Vm, self: mruby.Value, a: i64, b: i64) anyerror!mruby.Value {
 //!             _ = self;
 //!             return vm.intValue(a + b);
@@ -27,9 +27,9 @@
 //!
 //! Error handling: any Zig error surfaced from the callback becomes a Ruby
 //! RuntimeError carrying the error name; a callback that raised its own Ruby
-//! exception (see `vm.raise`) keeps that exception. mruby's setjmp/longjmp
-//! never crosses a live Zig frame: callbacks run inside `mrb_protect_error`
-//! and pending exceptions are re-raised from a clean frame.
+//! exception (see `vm.raise`) keeps that exception. Potentially raising mruby
+//! calls run in C protection trampolines; the VM observes a pending exception
+//! only after the Zig callback has returned.
 
 const std = @import("std");
 const c = @import("c.zig");
@@ -56,23 +56,63 @@ pub const Class = struct {
     mrb: *c.mrb_state,
     class: *c.RClass,
 
-    pub fn defineMethod(self: Class, name: [:0]const u8, comptime fmt: []const u8, comptime func: anytype) void {
-        const wrap = Wrap(fmt, func);
-        _ = c.mrb_define_method(self.mrb, self.class, name.ptr, wrap.cCall, aspec(fmt));
+    /// View this class/module object as a `Value` owned by the same VM.
+    pub fn asValue(self: Class) Value {
+        return .{ .mrb = self.mrb, .v = c.mrz_obj_value(@ptrCast(self.class)) };
     }
 
-    pub fn defineClassMethod(self: Class, name: [:0]const u8, comptime fmt: []const u8, comptime func: anytype) void {
-        const wrap = Wrap(fmt, func);
-        _ = c.mrb_define_class_method(self.mrb, self.class, name.ptr, wrap.cCall, aspec(fmt));
+    pub fn ensureOwnedBy(self: Class, mrb: *c.mrb_state) error{ForeignValue}!void {
+        if (self.mrb != mrb) return error.ForeignValue;
     }
 
-    pub fn defineModuleFunction(self: Class, name: [:0]const u8, comptime fmt: []const u8, comptime func: anytype) void {
+    pub fn defineMethod(self: Class, name: []const u8, comptime fmt: []const u8, comptime func: anytype) !void {
         const wrap = Wrap(fmt, func);
-        _ = c.mrb_define_module_function(self.mrb, self.class, name.ptr, wrap.cCall, aspec(fmt));
+        if (!c.mrz_protected_define_method(
+            self.mrb,
+            self.class,
+            name.ptr,
+            name.len,
+            wrap.cCall,
+            aspec(fmt),
+            c.MRZ_METHOD_INSTANCE,
+        )) return error.RubyException;
     }
 
-    pub fn defineConst(self: Class, name: [:0]const u8, val: Value) void {
-        c.mrb_define_const(self.mrb, self.class, name.ptr, val.v);
+    pub fn defineClassMethod(self: Class, name: []const u8, comptime fmt: []const u8, comptime func: anytype) !void {
+        const wrap = Wrap(fmt, func);
+        if (!c.mrz_protected_define_method(
+            self.mrb,
+            self.class,
+            name.ptr,
+            name.len,
+            wrap.cCall,
+            aspec(fmt),
+            c.MRZ_METHOD_CLASS,
+        )) return error.RubyException;
+    }
+
+    pub fn defineModuleFunction(self: Class, name: []const u8, comptime fmt: []const u8, comptime func: anytype) !void {
+        const wrap = Wrap(fmt, func);
+        if (!c.mrz_protected_define_method(
+            self.mrb,
+            self.class,
+            name.ptr,
+            name.len,
+            wrap.cCall,
+            aspec(fmt),
+            c.MRZ_METHOD_MODULE_FUNCTION,
+        )) return error.RubyException;
+    }
+
+    pub fn defineConst(self: Class, name: []const u8, val: Value) !void {
+        try val.ensureOwnedBy(self.mrb);
+        if (!c.mrz_protected_define_const(
+            self.mrb,
+            self.class,
+            name.ptr,
+            name.len,
+            val.v,
+        )) return error.RubyException;
     }
 };
 
@@ -235,35 +275,11 @@ fn ArgSlots(comptime specs: []const Spec) type {
     };
 }
 
-const CallCtx = struct {
-    mrb: *c.mrb_state,
-    self_v: c.mrb_value,
-};
-
 fn Wrap(comptime fmt: []const u8, comptime func: anytype) type {
     return struct {
         fn cCall(mrb: ?*c.mrb_state, self_v: c.mrb_value) callconv(.c) c.mrb_value {
             const m = mrb orelse return c.mrz_nil_value();
-            var ctx = CallCtx{ .mrb = m, .self_v = self_v };
-
-            var errored = false;
-            const r = c.mrb_protect_error(m, protectedBody, &ctx, &errored);
-            if (errored) {
-                // On error, protect's result IS the exception object and
-                // mrb->exc has been cleared; raise it from this clean frame.
-                c.mrb_exc_raise(m, r);
-            }
-            const exc = c.mrz_exc_value(m);
-            if (!c.mrz_nil_p(exc)) {
-                c.mrb_exc_raise(m, exc);
-            }
-            return r;
-        }
-
-        fn protectedBody(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
-            const m = mrb orelse return c.mrz_nil_value();
-            const ctx: *CallCtx = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
-            return invoke(m, ctx.self_v) catch |err| {
+            return invoke(m, self_v) catch |err| {
                 if (err == error.RubyException and !c.mrz_nil_p(c.mrz_exc_value(m))) {
                     return c.mrz_nil_value(); // callback raised its own exception
                 }
@@ -275,12 +291,13 @@ fn Wrap(comptime fmt: []const u8, comptime func: anytype) type {
         fn setZigError(m: *c.mrb_state, err: anyerror) void {
             var buf: [160]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "zig error: {s}", .{@errorName(err)}) catch "zig error";
-            // We are inside protectedBody's protect, so even a failure while
-            // building the exception is contained.
-            const cls = c.mrb_class_get(m, "RuntimeError");
-            const msg_v = c.mrb_str_new(m, if (msg.len == 0) null else msg.ptr, @intCast(msg.len));
-            const exc = c.mrb_funcall(m, c.mrz_obj_value(@ptrCast(cls)), "exception", 1, msg_v);
-            c.mrz_exc_set(m, exc);
+            _ = c.mrz_protected_set_exception(
+                m,
+                "RuntimeError",
+                "RuntimeError".len,
+                if (msg.len == 0) null else msg.ptr,
+                msg.len,
+            );
         }
 
         fn invoke(m: *c.mrb_state, self_v: c.mrb_value) !c.mrb_value {
@@ -292,9 +309,16 @@ fn Wrap(comptime fmt: []const u8, comptime func: anytype) type {
             var slots: ArgSlots(specs) = ArgSlots(specs).init();
             var ptrs: [ArgSlots(specs).total_slots]?*anyopaque = @splat(null);
             slots.fillPtrs(&ptrs);
-            _ = c.mrb_get_args_a(m, @ptrCast(fmtz.ptr), ptrs[0..].ptr);
+            var parsed: c.mrb_int = 0;
+            if (!c.mrz_protected_get_args(
+                m,
+                @ptrCast(fmtz.ptr),
+                ptrs[0..].ptr,
+                &parsed,
+            )) return error.RubyException;
 
             const result: Value = try callN(specs, 0, vm, self_val, &slots, .{ vm, self_val });
+            try result.ensureOwnedBy(m);
             return result.v;
         }
 

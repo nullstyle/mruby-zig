@@ -109,46 +109,36 @@ pub const Vm = struct {
     /// expression. All Ruby exceptions (compile or runtime) are reported as
     /// `error.RubyException`; call `vm.lastError()` for details.
     ///
-    /// Note: mruby's lexer stops at the first NUL byte, so a `src` slice
-    /// containing an interior NUL is evaluated only up to it.
+    /// Source containing an interior NUL is rejected rather than silently
+    /// evaluating only the prefix visible to mruby's lexer.
     pub fn loadString(vm: *Vm, src: []const u8) !Value {
+        if (std.mem.indexOfScalar(u8, src, 0) != null) return error.InvalidSource;
+
         // mruby's lexer reads to a NUL sentinel (mrb_load_nstring's length is
         // not a hard bound in 4.0), so the source is always copied into a
         // NUL-terminated buffer first.
         var stack_buf: [4096]u8 = undefined;
         const taken = src.len < stack_buf.len;
-        const buf = if (taken) stack_buf[0..] else try alloc_mod.gpa.alloc(u8, src.len + 1);
+        const buffer_length = std.math.add(usize, src.len, 1) catch
+            return error.OutOfMemory;
+        const buf = if (taken)
+            stack_buf[0..]
+        else
+            try alloc_mod.gpa.alloc(u8, buffer_length);
         defer if (!taken) alloc_mod.gpa.free(buf);
         @memcpy(buf[0..src.len], src);
         buf[src.len] = 0;
 
-        var ctx = ProtectedLoad{ .src = @as([*:0]const u8, @ptrCast(buf.ptr)) };
         // mrb_protect_error already restores the arena to its own entry index
         // and re-roots `v` via mrb_gc_protect, so the result is left rooted at
         // exactly one arena slot. An outer save+restore here would pop that
         // slot, un-rooting the returned Value (a use-after-free once a later
         // allocation triggers GC). Callers that loop should bound growth with
         // `vm.arenaScope()`.
-        var err = false;
-        const v = c.mrb_protect_error(vm.mrb, protectedLoad, &ctx, &err);
-        if (err) {
-            // protect returns the exception object as its result and clears
-            // mrb->exc; restore it so lastError() can describe it.
-            c.mrz_exc_set(vm.mrb, v);
+        var v: c.mrb_value = undefined;
+        if (!c.mrz_protected_load_string(vm.mrb, @ptrCast(buf.ptr), &v))
             return error.RubyException;
-        }
-        if (!c.mrz_nil_p(c.mrz_exc_value(vm.mrb))) {
-            return error.RubyException;
-        }
         return .{ .mrb = vm.mrb, .v = v };
-    }
-
-    const ProtectedLoad = struct { src: [*:0]const u8 };
-
-    fn protectedLoad(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
-        const m = mrb orelse return c.mrz_nil_value();
-        const ctx: *ProtectedLoad = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
-        return c.mrb_load_string(m, ctx.src);
     }
 
     /// Load and execute a compiled irep image (see `sandbox.compile`). Same
@@ -157,28 +147,10 @@ pub const Vm = struct {
     /// the pending exception is left set for `lastError()` rather than
     /// leaking into the next call.
     pub fn loadIrep(vm: *Vm, image: []const u8) !Value {
-        var ctx = ProtectedIrep{ .ptr = image.ptr, .len = image.len };
-        var err = false;
-        const v = c.mrb_protect_error(vm.mrb, protectedIrep, &ctx, &err);
-        if (err) {
-            c.mrz_exc_set(vm.mrb, v);
+        var v: c.mrb_value = undefined;
+        if (!c.mrz_protected_load_irep(vm.mrb, image.ptr, image.len, &v))
             return error.RubyException;
-        }
-        // mrb_load_irep_buf returns the uncaught exception object as its result
-        // and leaves mrb->exc set (no longjmp), so this check — not `err` — is
-        // what catches a raising image.
-        if (!c.mrz_nil_p(c.mrz_exc_value(vm.mrb))) {
-            return error.RubyException;
-        }
         return .{ .mrb = vm.mrb, .v = v };
-    }
-
-    const ProtectedIrep = struct { ptr: [*]const u8, len: usize };
-
-    fn protectedIrep(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
-        const m = mrb orelse return c.mrz_nil_value();
-        const ctx: *ProtectedIrep = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
-        return c.mrb_load_irep_buf(m, ctx.ptr, ctx.len);
     }
 
     // ---- calling Ruby from Zig -------------------------------------------
@@ -187,13 +159,9 @@ pub const Vm = struct {
     /// accepted by `convert.toValue`). Exceptions are reported as
     /// `error.RubyException` (never longjmp into Zig frames).
     pub fn call(vm: *Vm, recv: Value, name: []const u8, args: anytype) !Value {
-        var name_buf: [256]u8 = undefined;
-        if (name.len >= name_buf.len) return error.NameTooLong;
-        @memcpy(name_buf[0..name.len], name);
-        name_buf[name.len] = 0;
-        const namez: [*:0]const u8 = @ptrCast(&name_buf);
+        try recv.ensureOwnedBy(vm.mrb);
 
-        const sym = c.mrb_intern_cstr(vm.mrb, namez);
+        if (name.len >= 256) return error.NameTooLong;
         const n = comptime @typeInfo(@TypeOf(args)).@"struct".field_types.len;
         if (n > 8) @compileError("vm.call supports at most 8 arguments");
 
@@ -202,33 +170,22 @@ pub const Vm = struct {
             argv[i] = (try convert.toValue(vm.mrb, args[i])).v;
         }
 
-        const ctx = ProtectedCall{ .recv = recv.v, .sym = sym, .argc = n, .argv = argv };
         // mrb_protect_error re-roots its result in the arena; an outer
         // save+restore would pop that slot and un-root the returned Value.
         // See loadString for the full rationale.
-        var err = false;
-        const v = c.mrb_protect_error(vm.mrb, protectedCall, @ptrCast(@constCast(&ctx)), &err);
-        if (err) {
-            c.mrz_exc_set(vm.mrb, v);
-            return error.RubyException;
-        }
-        if (!c.mrz_nil_p(c.mrz_exc_value(vm.mrb))) {
+        var v: c.mrb_value = undefined;
+        if (!c.mrz_protected_funcall(
+            vm.mrb,
+            recv.v,
+            name.ptr,
+            name.len,
+            n,
+            &argv,
+            &v,
+        )) {
             return error.RubyException;
         }
         return .{ .mrb = vm.mrb, .v = v };
-    }
-
-    const ProtectedCall = struct {
-        recv: c.mrb_value,
-        sym: c.mrb_sym,
-        argc: usize,
-        argv: [8]c.mrb_value,
-    };
-
-    fn protectedCall(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
-        const m = mrb orelse return c.mrz_nil_value();
-        const ctx: *ProtectedCall = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
-        return c.mrb_funcall_argv(m, ctx.recv, ctx.sym, @intCast(ctx.argc), &ctx.argv);
     }
 
     // ---- classes ---------------------------------------------------------
@@ -238,118 +195,60 @@ pub const Vm = struct {
     /// constant, `error.RubyException` (TypeError) is returned — never a
     /// longjmp through Zig frames.
     pub fn defineClass(vm: *Vm, name: []const u8, super: ?Class) !Class {
-        if (name.len >= 256) return error.NameTooLong;
-        const existing = vm.getClassOrNull(name);
+        if (super) |s| try s.ensureOwnedBy(vm.mrb);
+        const existing = try vm.lookupClass(name);
         if (existing) |e| return e;
         const super_ptr: ?*c.RClass = if (super) |s| s.class else null;
-        var ctx = ProtectedDefine{
-            .kind = .class,
-            .name = name,
-            .super = super_ptr orelse objectClass(vm),
-        };
-        const v = try vm.protectedDefine(&ctx);
+        const v = try vm.protectedDefine(
+            name,
+            super_ptr,
+            c.MRZ_DEFINE_CLASS,
+        );
         return .{ .mrb = vm.mrb, .class = @ptrCast(@alignCast(c.mrz_ptr(v) orelse return error.InitFailed)) };
     }
 
     /// Define a new module. Same conflict semantics as `defineClass`.
     pub fn defineModule(vm: *Vm, name: []const u8) !Class {
-        if (name.len >= 256) return error.NameTooLong;
-        const existing = vm.getClassOrNull(name);
+        const existing = try vm.lookupClass(name);
         if (existing) |e| return e;
-        var ctx = ProtectedDefine{ .kind = .module, .name = name, .super = null };
-        const v = try vm.protectedDefine(&ctx);
+        const v = try vm.protectedDefine(name, null, c.MRZ_DEFINE_MODULE);
         return .{ .mrb = vm.mrb, .class = @ptrCast(@alignCast(c.mrz_ptr(v) orelse return error.InitFailed)) };
     }
 
-    const DefineKind = enum { class, module };
-
-    const ProtectedDefine = struct {
-        kind: DefineKind,
+    fn protectedDefine(
+        vm: *Vm,
         name: []const u8,
         super: ?*c.RClass,
-    };
-
-    fn protectedDefine(vm: *Vm, ctx: *ProtectedDefine) !c.mrb_value {
-        var err = false;
-        const v = c.mrb_protect_error(vm.mrb, protectedDefineBody, @ptrCast(ctx), &err);
-        if (err) {
-            c.mrz_exc_set(vm.mrb, v);
+        kind: u8,
+    ) !c.mrb_value {
+        var value: c.mrb_value = undefined;
+        if (!c.mrz_protected_define(
+            vm.mrb,
+            name.ptr,
+            name.len,
+            super,
+            kind,
+            &value,
+        )) {
             return error.RubyException;
         }
-        if (!c.mrz_nil_p(c.mrz_exc_value(vm.mrb))) {
-            return error.RubyException;
-        }
-        if (c.mrz_nil_p(v)) return error.InitFailed;
-        return v;
-    }
-
-    fn protectedDefineBody(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
-        const m = mrb orelse return c.mrz_nil_value();
-        const ctx: *ProtectedDefine = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
-        var buf: [256]u8 = undefined;
-        if (ctx.name.len >= buf.len) return c.mrz_nil_value();
-        @memcpy(buf[0..ctx.name.len], ctx.name);
-        buf[ctx.name.len] = 0;
-        const cla = switch (ctx.kind) {
-            .class => c.mrb_define_class(m, @ptrCast(&buf), ctx.super orelse c.mrb_class_get(m, "Object")),
-            .module => c.mrb_define_module(m, @ptrCast(&buf)),
-        };
-        return c.mrz_obj_value(@ptrCast(cla));
+        if (c.mrz_nil_p(value)) return error.InitFailed;
+        return value;
     }
 
     /// Fetch a class/module by fully-qualified name ("Object", "Math",
     /// "Enumerator::Lazy"). `error.UnknownClass` if no such constant exists.
     pub fn getClass(vm: *Vm, name: []const u8) !Class {
-        return vm.getClassOrNull(name) orelse error.UnknownClass;
+        return (try vm.lookupClass(name)) orelse error.UnknownClass;
     }
 
-    fn getClassOrNull(vm: *Vm, name: []const u8) ?Class {
-        // mrb_class_get raises NameError on missing constants, so the walk
-        // runs under protect; any raise -> null.
-        if (name.len >= 256) return null;
-        var ctx = ProtectedLookup{ .name = name };
-        var err = false;
-        const v = c.mrb_protect_error(vm.mrb, protectedLookup, @ptrCast(&ctx), &err);
-        if (err) {
-            c.mrz_exc_clear(vm.mrb);
-            return null;
-        }
-        if (!c.mrz_nil_p(c.mrz_exc_value(vm.mrb))) {
-            c.mrz_exc_clear(vm.mrb);
-            return null;
-        }
-        if (c.mrz_nil_p(v)) return null;
-        const ptr = c.mrz_ptr(v) orelse return null;
+    fn lookupClass(vm: *Vm, name: []const u8) !?Class {
+        var value: c.mrb_value = undefined;
+        if (!c.mrz_protected_lookup(vm.mrb, name.ptr, name.len, &value))
+            return error.RubyException;
+        if (c.mrz_nil_p(value)) return null;
+        const ptr = c.mrz_ptr(value) orelse return null;
         return .{ .mrb = vm.mrb, .class = @ptrCast(@alignCast(ptr)) };
-    }
-
-    const ProtectedLookup = struct { name: []const u8 };
-
-    /// Resolve "A::B::C" through const_get and accept Class, Module, or
-    /// SClass (mrb_class_get / mrb_module_get are each type-strict).
-    fn protectedLookup(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
-        const m = mrb orelse return c.mrz_nil_value();
-        const ctx: *ProtectedLookup = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
-
-        var buf: [256]u8 = undefined;
-        var cur = c.mrz_obj_value(@ptrCast(c.mrb_class_get(m, "Object")));
-        var it = std.mem.splitSequence(u8, ctx.name, "::");
-        while (it.next()) |seg| {
-            if (seg.len == 0) continue;
-            if (seg.len >= buf.len) return c.mrz_nil_value();
-            @memcpy(buf[0..seg.len], seg);
-            buf[seg.len] = 0;
-            const sym = c.mrb_intern_cstr(m, @ptrCast(&buf));
-            cur = c.mrb_const_get(m, cur, sym);
-        }
-        switch (c.mrz_type(cur)) {
-            c.MRB_TT_CLASS, c.MRB_TT_MODULE, c.MRB_TT_SCLASS => return cur,
-            else => return c.mrz_nil_value(),
-        }
-    }
-
-    fn objectClass(vm: *Vm) *c.RClass {
-        return c.mrb_class_get(vm.mrb, "Object");
     }
 
     // ---- globals / instance variables ------------------------------------
@@ -358,43 +257,74 @@ pub const Vm = struct {
     /// "$version").
     pub fn getGlobal(vm: *Vm, name: []const u8) !Value {
         var buf: [256]u8 = undefined;
-        if (name.len + 1 >= buf.len) return error.NameTooLong;
+        if (name.len > buf.len - 1) return error.NameTooLong;
         buf[0] = '$';
         @memcpy(buf[1 .. name.len + 1], name);
-        const sym = try vm.internSymbol(buf[0 .. name.len + 1]);
-        return .{ .mrb = vm.mrb, .v = c.mrb_gv_get(vm.mrb, sym) };
+        var value: c.mrb_value = undefined;
+        if (!c.mrz_protected_global_get(
+            vm.mrb,
+            &buf,
+            name.len + 1,
+            &value,
+        )) return error.RubyException;
+        return .{ .mrb = vm.mrb, .v = value };
     }
 
-    /// Set a global variable. Errors only on out-of-memory or an
-    /// over-long name (rather than silently doing nothing).
+    /// Set a global variable. A value from another interpreter is rejected as
+    /// `error.ForeignValue`; allocation failures and Ruby exceptions are
+    /// reported rather than silently ignored.
     pub fn setGlobal(vm: *Vm, name: []const u8, val: Value) !void {
+        try val.ensureOwnedBy(vm.mrb);
+
         var buf: [256]u8 = undefined;
-        if (name.len + 1 >= buf.len) return error.NameTooLong;
+        if (name.len > buf.len - 1) return error.NameTooLong;
         buf[0] = '$';
         @memcpy(buf[1 .. name.len + 1], name);
-        const sym = try vm.internSymbol(buf[0 .. name.len + 1]);
-        c.mrb_gv_set(vm.mrb, sym, val.v);
+        if (!c.mrz_protected_global_set(
+            vm.mrb,
+            &buf,
+            name.len + 1,
+            val.v,
+        )) return error.RubyException;
     }
 
     /// Read an instance variable (`name` includes the `@`); nil if unset.
-    /// Infallible except that an out-of-memory interning returns nil.
-    pub fn getIvar(vm: *Vm, obj: Value, name: []const u8) Value {
-        const sym = vm.internSymbol(name) catch return Value.nil(vm.mrb);
-        return .{ .mrb = vm.mrb, .v = c.mrb_iv_get(vm.mrb, obj.v, sym) };
+    pub fn getIvar(vm: *Vm, obj: Value, name: []const u8) !Value {
+        try obj.ensureOwnedBy(vm.mrb);
+        var value: c.mrb_value = undefined;
+        if (!c.mrz_protected_ivar_get(
+            vm.mrb,
+            obj.v,
+            name.ptr,
+            name.len,
+            &value,
+        )) return error.RubyException;
+        return .{ .mrb = vm.mrb, .v = value };
     }
 
-    /// Set an instance variable (`name` includes the `@`). Errors only on
-    /// out-of-memory.
+    /// Set an instance variable (`name` includes the `@`). The object and
+    /// value must both belong to this interpreter.
     pub fn setIvar(vm: *Vm, obj: Value, name: []const u8, val: Value) !void {
-        const sym = try vm.internSymbol(name);
-        c.mrb_iv_set(vm.mrb, obj.v, sym, val.v);
+        try obj.ensureOwnedBy(vm.mrb);
+        try val.ensureOwnedBy(vm.mrb);
+
+        if (!c.mrz_protected_ivar_set(
+            vm.mrb,
+            obj.v,
+            name.ptr,
+            name.len,
+            val.v,
+        )) return error.RubyException;
     }
 
     // ---- symbols ----------------------------------------------------------
 
     /// Intern a symbol, returning its id.
     pub fn internSymbol(vm: *Vm, name: []const u8) !u32 {
-        return c.mrb_intern(vm.mrb, name.ptr, name.len);
+        var symbol: c.mrb_sym = undefined;
+        if (!c.mrz_protected_intern(vm.mrb, name.ptr, name.len, &symbol))
+            return error.RubyException;
+        return symbol;
     }
 
     /// Symbol name (borrowed; lives in the symbol table for the lifetime of
@@ -409,40 +339,16 @@ pub const Vm = struct {
 
     /// Set a pending exception and return `error.RubyException` from your
     /// method callback. Intended for use inside Zig method callbacks, where
-    /// the exception is re-raised from a clean frame by the dispatcher.
+    /// mruby observes the pending exception after the Zig callback returns.
     pub fn raise(vm: *Vm, class_name: []const u8, msg: []const u8) error{RubyException} {
-        const ctx = ProtectedRaise{ .class_name = class_name, .msg = msg };
-        var err = false;
-        _ = c.mrb_protect_error(vm.mrb, protectedRaise, @ptrCast(@constCast(&ctx)), &err);
+        _ = c.mrz_protected_set_exception(
+            vm.mrb,
+            class_name.ptr,
+            class_name.len,
+            if (msg.len == 0) null else msg.ptr,
+            msg.len,
+        );
         return error.RubyException;
-    }
-
-    const ProtectedRaise = struct { class_name: []const u8, msg: []const u8 };
-
-    fn protectedRaise(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
-        const m = mrb orelse return c.mrz_nil_value();
-        const ctx: *ProtectedRaise = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
-
-        var cn: [128]u8 = undefined;
-        if (ctx.class_name.len >= cn.len) {
-            c.mrz_exc_set(m, simpleError(m, "RuntimeError", ctx.msg));
-            return c.mrz_nil_value();
-        }
-        @memcpy(cn[0..ctx.class_name.len], ctx.class_name);
-        cn[ctx.class_name.len] = 0;
-
-        const msg_str = c.mrb_str_new(m, if (ctx.msg.len == 0) null else ctx.msg.ptr, @intCast(ctx.msg.len));
-        const cls = c.mrb_class_get(m, @ptrCast(&cn));
-        const exc = c.mrb_funcall(m, c.mrz_obj_value(@ptrCast(cls)), "exception", 1, msg_str);
-        if (!c.mrz_nil_p(c.mrz_exc_value(m))) return c.mrz_nil_value(); // keep earlier exception
-        c.mrz_exc_set(m, exc);
-        return c.mrz_nil_value();
-    }
-
-    fn simpleError(m: *c.mrb_state, class_name: [*:0]const u8, msg: []const u8) c.mrb_value {
-        const cls = c.mrb_class_get(m, class_name);
-        const msg_str = c.mrb_str_new(m, if (msg.len == 0) null else msg.ptr, @intCast(msg.len));
-        return c.mrb_funcall(m, c.mrz_obj_value(@ptrCast(cls)), "exception", 1, msg_str);
     }
 
     // ---- exceptions -------------------------------------------------------
@@ -461,7 +367,7 @@ pub const Vm = struct {
     /// Print the pending exception + backtrace to the process stderr
     /// (mruby's own formatter).
     pub fn printError(vm: *Vm) void {
-        c.mrb_print_error(vm.mrb);
+        c.mrz_protected_print_error(vm.mrb);
     }
 
     // ---- GC ---------------------------------------------------------------
@@ -472,31 +378,29 @@ pub const Vm = struct {
 
     // ---- value construction ------------------------------------------------
 
-    /// Integer value. Infallible for use inside method callbacks;
-    /// integers outside the representable i64 range (possible for u64
-    /// inputs, since this build has no bigint) saturate to the nearest
-    /// bound.
-    pub fn intValue(vm: *Vm, x: anytype) Value {
+    /// Integer value. Integers outside the representable i64 range (possible
+    /// for u64 inputs, since this build has no bigint) saturate to the nearest
+    /// bound. Heap-boxing allocation failure is reported as a Ruby exception.
+    pub fn intValue(vm: *Vm, x: anytype) !Value {
         const n: i64 = std.math.cast(i64, x) orelse if (x < 0)
             std.math.minInt(i64)
         else
             std.math.maxInt(i64);
-        return .{ .mrb = vm.mrb, .v = c.mrz_int_value(vm.mrb, n) };
+        return convert.toValue(vm.mrb, n);
     }
 
-    pub fn floatValue(vm: *Vm, x: f64) Value {
-        return .{ .mrb = vm.mrb, .v = c.mrz_float_value(vm.mrb, x) };
+    pub fn floatValue(vm: *Vm, x: f64) !Value {
+        return convert.toValue(vm.mrb, x);
     }
 
     pub fn boolValue(vm: *Vm, x: bool) Value {
         return .{ .mrb = vm.mrb, .v = c.mrz_bool_value(x) };
     }
 
-    /// String values are copied onto the Ruby heap. Allocation failure
-    /// raises mruby's NoMemoryError; call from within a callback (or any
-    /// protected context) as usual.
-    pub fn stringValue(vm: *Vm, s: []const u8) Value {
-        return .{ .mrb = vm.mrb, .v = c.mrb_str_new(vm.mrb, if (s.len == 0) null else s.ptr, @intCast(s.len)) };
+    /// String values are copied onto the Ruby heap. Allocation failure is
+    /// contained in C and reported as `error.RubyException`.
+    pub fn stringValue(vm: *Vm, s: []const u8) !Value {
+        return convert.toValue(vm.mrb, s);
     }
 
     pub fn nilValue(vm: *Vm) Value {

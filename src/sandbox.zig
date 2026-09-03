@@ -57,6 +57,7 @@ pub const CompileRiteOptions = struct {
 
 pub const CompileRiteError = std.mem.Allocator.Error || error{
     CompileFailed,
+    InvalidSource,
     InvalidSourceName,
 };
 
@@ -219,7 +220,10 @@ pub fn monotonicNs() i128 {
         if (std.os.windows.QueryPerformanceCounter(&counter) != 0) {
             var freq: std.os.windows.LARGE_INTEGER = undefined;
             if (std.os.windows.QueryPerformanceFrequency(&freq) != 0 and freq != 0) {
-                return @divFloor(counter * 1_000_000_000, freq);
+                return @divFloor(
+                    @as(i128, counter) * std.time.ns_per_s,
+                    @as(i128, freq),
+                );
             }
         }
         return 0;
@@ -294,6 +298,10 @@ pub const Isolate = struct {
 
     // hidden exception classes (rooted as constants of this module)
     hidden: *c.RClass,
+    sandbox_context: c.mrz_sandbox_context,
+    /// Cached Time value returned by the non-dispatching `Time.now` callback.
+    /// The hidden module's FROZEN_TIME constant keeps it rooted.
+    frozen_time: c.mrb_value,
     /// Exception (as a raw value) behind the last failed run; funcalling
     /// with mrb->exc pending can clobber it, so it is stashed and the
     /// pending state cleared before classification.
@@ -342,6 +350,11 @@ pub const Isolate = struct {
             .gas_meter = initial_meter,
             .last_gas = if (initial_meter) |meter| meter.snapshot() else null,
             .hidden = hidden,
+            .sandbox_context = .{
+                .userdata = iso,
+                .observer = fetchHook,
+            },
+            .frozen_time = c.mrz_nil_value(),
             .last_exc = c.mrz_nil_value(),
             .error_root = bootstrap.error_root,
             .policy_exceptions = bootstrap.policy_exceptions,
@@ -365,16 +378,14 @@ pub const Isolate = struct {
             .unlimited => 0,
             .per_isolate, .per_execution => |limit| limit,
         };
-        c.mrz_set_ud(vm.mrb, iso);
-        c.mrz_set_code_fetch_hook(vm.mrb, fetchHook);
+        c.mrz_set_sandbox_context(vm.mrb, &iso.sandbox_context);
         return iso;
     }
 
     pub fn deinit(iso: *Isolate) void {
         iso.clearArtifactDiagnostic();
         const attribution = alloc_mod.pushIsolate(&iso.cell);
-        c.mrz_set_code_fetch_hook(iso.vm.mrb, null);
-        c.mrz_set_ud(iso.vm.mrb, null);
+        c.mrz_set_sandbox_context(iso.vm.mrb, null);
         iso.vm.deinit();
         alloc_mod.restoreIsolate(attribution);
         iso.cell.retireOwnership();
@@ -398,10 +409,11 @@ pub const Isolate = struct {
     pub fn runImage(iso: *Isolate, image: []const u8) !Value {
         return iso.enterExecution(struct {
             fn body(iso_: *Isolate, image_: []const u8) !Value {
-                // loadIrep runs under mrb_protect_error and checks mrb->exc, so
-                // a raising image surfaces as error.RubyException (mapped to a
-                // termination error when a limit fired) instead of returning
-                // the exception as a success value and poisoning the next run.
+                // loadIrep's C trampoline runs under mrb_protect_error and
+                // checks mrb->exc, so a raising image surfaces as
+                // error.RubyException (mapped to a termination error when a
+                // limit fired) instead of returning the exception as a success
+                // value and poisoning the next run.
                 return iso_.vm.loadIrep(image_);
             }
         }.body, image);
@@ -806,31 +818,6 @@ pub const Isolate = struct {
         if (selectedTermination(bits)) |kind| return terminationError(kind);
     }
 
-    const CapabilityContext = struct {
-        iso: *Isolate,
-        zig_error: ?anyerror = null,
-    };
-
-    fn protectedCapabilities(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
-        _ = mrb orelse return c.mrz_nil_value();
-        const context: *CapabilityContext = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
-        context.iso.applyCapabilities() catch |err| {
-            context.zig_error = err;
-        };
-        return c.mrz_nil_value();
-    }
-
-    fn applyCapabilitiesProtected(iso: *Isolate) !void {
-        var context = CapabilityContext{ .iso = iso };
-        var raised = false;
-        const result = c.mrb_protect_error(iso.vm.mrb, protectedCapabilities, &context, &raised);
-        if (raised) {
-            c.mrz_exc_set(iso.vm.mrb, result);
-            return error.RubyException;
-        }
-        if (context.zig_error) |err| return err;
-    }
-
     fn prepareCapabilities(iso: *Isolate) !void {
         switch (iso.capabilities) {
             .ready => return,
@@ -847,7 +834,7 @@ pub const Isolate = struct {
 
         const attribution = alloc_mod.pushIsolate(&iso.cell);
         defer alloc_mod.restoreIsolate(attribution);
-        iso.applyCapabilitiesProtected() catch {
+        iso.applyCapabilities() catch {
             iso.vm.clearError();
             if (currentTermination(iso)) |kind| return terminationError(kind);
             return error.CapabilityApplicationFailed;
@@ -952,47 +939,35 @@ pub const Isolate = struct {
         noteTerm(iso, .memory);
     }
 
-    fn hookNoop(mrb: ?*c.mrb_state, self: c.mrb_value) callconv(.c) c.mrb_value {
-        _ = mrb;
-        _ = self;
-        return c.mrz_nil_value();
-    }
-
     fn applyCapabilities(iso: *Isolate) !void {
         const caps = iso.policy.capabilities;
         const m = iso.vm.mrb;
-
-        // mrb_undef_method fires the method_undefined hook on the class;
-        // without a handler that funcall raises NoMethodError. Install a
-        // no-op on Kernel (in the ancestry of every class object) first.
-        const kernel0 = try iso.vm.getClass("Kernel");
-        c.mrb_define_method(m, kernel0.class, "method_undefined", hookNoop, 1 << 18); // MRB_ARGS_REQ(1)
 
         if (!caps.eval) {
             const kernel = try iso.vm.getClass("Kernel");
             const basic = try iso.vm.getClass("BasicObject");
             const module = try iso.vm.getClass("Module");
-            undef(kernel, "eval");
-            undef(kernel, "binding");
+            try maskMethod(kernel, "eval");
+            try maskMethod(kernel, "binding");
             // instance_eval/instance_exec are defined on BasicObject, not
             // Kernel; a BasicObject-receiver call (whose ancestry excludes
-            // Kernel) would bypass a Kernel-only strip. Undef on both.
-            undef(kernel, "instance_eval");
-            undef(kernel, "instance_exec");
-            undef(basic, "instance_eval");
-            undef(basic, "instance_exec");
+            // Kernel) would bypass a Kernel-only strip. Mask on both.
+            try maskMethod(kernel, "instance_eval");
+            try maskMethod(kernel, "instance_exec");
+            try maskMethod(basic, "instance_eval");
+            try maskMethod(basic, "instance_exec");
             // Module#class_eval / #module_eval accept a source string and are
             // a full string-eval escape; they live on the module class,
             // untouched by the Kernel/BasicObject strips above.
-            undef(module, "class_eval");
-            undef(module, "module_eval");
+            try maskMethod(module, "class_eval");
+            try maskMethod(module, "module_eval");
         }
         if (!caps.send) {
             const kernel = try iso.vm.getClass("Kernel");
             const basic = try iso.vm.getClass("BasicObject");
-            undef(kernel, "send");
-            undef(kernel, "public_send");
-            undef(basic, "__send__");
+            try maskMethod(kernel, "send");
+            try maskMethod(kernel, "public_send");
+            try maskMethod(basic, "__send__");
         }
         if (!caps.introspection) {
             const kernel = try iso.vm.getClass("Kernel");
@@ -1001,7 +976,7 @@ pub const Isolate = struct {
                 "instance_variables",    "instance_variable_defined?",
                 "methods",               "method",
                 "singleton_methods",
-            }) |name| undef(kernel, name);
+            }) |name| try maskMethod(kernel, name);
         }
         if (!caps.object_space) {
             const present = blk: {
@@ -1010,8 +985,12 @@ pub const Isolate = struct {
             };
             if (present) {
                 const object = try iso.vm.getClass("Object");
-                const sym = try iso.vm.internSymbol("ObjectSpace");
-                c.mrb_const_remove(m, object.class, sym);
+                if (!c.mrz_protected_remove_const(
+                    m,
+                    object.class,
+                    "ObjectSpace",
+                    "ObjectSpace".len,
+                )) return error.RubyException;
             }
         }
         if (caps.random_seed) |seed| {
@@ -1025,14 +1004,17 @@ pub const Isolate = struct {
         if (caps.clock_epoch_s) |epoch| {
             try iso.installFrozenClock(epoch);
         }
-        if (caps.freeze_object_model) iso.sealModel();
+        if (caps.freeze_object_model) try iso.sealModel();
 
         // The sandbox's own module is a script-visible constant (scripts may
         // read MRubyZigSandbox::FROZEN_TIME). Freeze it so a script cannot
         // reassign or remove its constants (e.g. repoint FROZEN_TIME to defeat
         // the clock pin) or reopen it to add methods: mrb_check_frozen guards
         // const-set, const-remove, and method definition on a frozen module.
-        _ = c.mrb_obj_freeze(m, c.mrz_obj_value(@ptrCast(iso.hidden)));
+        if (!c.mrz_protected_freeze(
+            m,
+            c.mrz_obj_value(@ptrCast(iso.hidden)),
+        )) return error.RubyException;
     }
 
     /// Freeze the core object model so `def`/`include`/const changes on
@@ -1051,7 +1033,7 @@ pub const Isolate = struct {
     /// definitions intact. Idempotent: `mrb_obj_freeze` on an
     /// already-frozen class is a no-op, so a host may also combine both
     /// phases defensively.
-    pub fn sealModel(iso: *Isolate) void {
+    pub fn sealModel(iso: *Isolate) !void {
         const m = iso.vm.mrb;
         const frozen_classes = [_][]const u8{
             "BasicObject",       "Object",              "Module",
@@ -1068,17 +1050,25 @@ pub const Isolate = struct {
             "ScriptError",       "NotImplementedError", "LocalJumpError",
         };
         for (frozen_classes) |name| {
-            const cls = iso.vm.getClass(name) catch continue;
-            _ = c.mrb_obj_freeze(m, c.mrz_obj_value(@ptrCast(cls.class)));
+            const cls = iso.vm.getClass(name) catch |err| switch (err) {
+                error.UnknownClass => continue,
+                else => return err,
+            };
+            if (!c.mrz_protected_freeze(
+                m,
+                cls.asValue().v,
+            )) return error.RubyException;
         }
     }
 
-    fn undef(cls: anytype, name: []const u8) void {
-        var buf: [64]u8 = undefined;
-        if (name.len >= buf.len) return;
-        @memcpy(buf[0..name.len], name);
-        buf[name.len] = 0;
-        c.mrb_undef_method(cls.mrb, cls.class, @ptrCast(&buf));
+    fn maskMethod(cls: anytype, name: []const u8) !void {
+        if (!c.mrz_protected_mask_method(
+            cls.mrb,
+            cls.class,
+            name.ptr,
+            name.len,
+            c.MRZ_MASK_INSTANCE,
+        )) return error.RubyException;
     }
 
     fn installFrozenClock(iso: *Isolate, epoch: i64) !void {
@@ -1086,31 +1076,56 @@ pub const Isolate = struct {
         const time = try iso.vm.getClass("Time");
         // Build Time.at(epoch) via funcall and root it as a constant on the
         // hidden module (mruby has no Ruby-level scoped const assignment).
-        const time_val = c.mrb_value{ .w = @intFromPtr(time.class) };
-        const frozen = try iso.vm.call(Value{ .mrb = m, .v = time_val }, "at", .{epoch});
-        c.mrb_define_const(m, iso.hidden, "FROZEN_TIME", frozen.v);
+        const frozen = try iso.vm.call(time.asValue(), "at", .{epoch});
+        if (!c.mrz_protected_define_const(
+            m,
+            iso.hidden,
+            "FROZEN_TIME",
+            "FROZEN_TIME".len,
+            frozen.v,
+        )) return error.RubyException;
+        iso.frozen_time = frozen.v;
         // Replace Time.now with a Zig class method returning the cached
         // constant (built once, so all calls return the same object).
         const Clock = struct {
             fn now(mrb: ?*c.mrb_state, self: c.mrb_value) callconv(.c) c.mrb_value {
                 _ = self;
                 const mm = mrb orelse return c.mrz_nil_value();
-                const sym = c.mrb_intern_cstr(mm, "FROZEN_TIME");
-                const hidden_mod = c.mrb_module_get(mm, "MRubyZigSandbox");
-                const val = c.mrz_obj_value(@ptrCast(hidden_mod));
-                return c.mrb_const_get(mm, val, sym);
+                const active: *Isolate =
+                    @ptrCast(@alignCast(c.mrz_get_ud(mm) orelse return c.mrz_nil_value()));
+                return active.frozen_time;
             }
         };
-        c.mrb_undef_class_method(m, time.class, "now");
-        _ = c.mrb_define_class_method(m, time.class, "now", Clock.now, c.MRB_ARGS_NONE);
+        if (!c.mrz_protected_mask_method(
+            m,
+            time.class,
+            "now",
+            "now".len,
+            c.MRZ_MASK_CLASS,
+        )) return error.RubyException;
+        if (!c.mrz_protected_define_method(
+            m,
+            time.class,
+            "now",
+            "now".len,
+            Clock.now,
+            c.MRB_ARGS_NONE,
+            c.MRZ_METHOD_CLASS,
+        )) return error.RubyException;
     }
 
     // ---- the instruction hook ----------------------------------------------
 
-    fn fetchHook(mrb: ?*c.mrb_state, irep: ?*const anyopaque, pc: ?*const anyopaque, regs: ?*anyopaque) callconv(.c) void {
+    fn fetchHook(
+        mrb: ?*c.mrb_state,
+        irep: ?*const anyopaque,
+        pc: ?*const anyopaque,
+        regs: ?*anyopaque,
+    ) callconv(.c) c.mrb_value {
         _ = regs;
-        const m = mrb orelse return;
-        const iso: *Isolate = @ptrCast(@alignCast(c.mrz_get_ud(m) orelse return));
+        const m = mrb orelse return c.mrz_nil_value();
+        const iso: *Isolate =
+            @ptrCast(@alignCast(c.mrz_get_ud(m) orelse return c.mrz_nil_value()));
 
         iso.instr_count +|= 1;
 
@@ -1138,7 +1153,8 @@ pub const Isolate = struct {
             if (c.mrz_pc_catchable(irep, pc) != 0 or iso.uncovered_waits >= uncovered_wait_limit) {
                 iso.raise_pending = false;
                 iso.uncovered_waits = 0;
-                if (currentTermination(iso)) |kind| raiseTerm(m, iso, kind);
+                if (currentTermination(iso)) |kind|
+                    return terminationException(iso, kind);
                 iso.raise_pending = false;
             } else {
                 iso.uncovered_waits += 1;
@@ -1161,7 +1177,8 @@ pub const Isolate = struct {
                     iso.raise_pending = true;
                 }
             }
-            if (iso.cell.hardOom()) return; // no gas/step accounting needed
+            if (iso.cell.hardOom())
+                return c.mrz_nil_value(); // no gas/step accounting needed
         }
 
         // Step the counters.
@@ -1178,6 +1195,7 @@ pub const Isolate = struct {
             iso.clock_countdown = clock_batch;
             iso.pollDeadline();
         }
+        return c.mrz_nil_value();
     }
 
     fn noteTerm(iso: *Isolate, kind: TerminationKind) void {
@@ -1212,14 +1230,13 @@ pub const Isolate = struct {
         return selectedTermination(iso.termination_bits.load(.acquire));
     }
 
-    fn raiseTerm(m: *c.mrb_state, iso: *Isolate, kind: TerminationKind) noreturn {
+    fn terminationException(iso: *Isolate, kind: TerminationKind) c.mrb_value {
         noteTerm(iso, kind);
         if (!iso.grace_armed) {
             iso.handler_grace = handler_grace_instructions;
             iso.grace_armed = true;
         }
-        const exc = c.mrb_ary_entry(iso.policy_exceptions, @backingInt(kind));
-        c.mrb_exc_raise(m, exc);
+        return c.mrb_ary_entry(iso.policy_exceptions, @backingInt(kind));
     }
 };
 
@@ -1234,33 +1251,12 @@ const SandboxBootstrap = struct {
     policy_exceptions: c.mrb_value,
 };
 
-/// All sandbox-specific class/root construction can allocate and raise. Keep
-/// the whole bootstrap inside one mruby protection frame so OOM returns from
-/// spawn instead of reaching exc_throw with mrb->jmp null.
+/// All sandbox-specific class/root construction can allocate and raise. The C
+/// shim owns the protection frame so no mruby longjmp can cross Zig frames.
 fn bootstrapSandbox(vm: *Vm) !SandboxBootstrap {
-    const Protected = struct {
-        const Context = struct {
-            hidden: ?*c.RClass = null,
-            error_root: c.mrb_value = undefined,
-            policy_exceptions: c.mrb_value = undefined,
-        };
-
-        fn create(mrb: ?*c.mrb_state, ud: ?*anyopaque) callconv(.c) c.mrb_value {
-            const m = mrb orelse return c.mrz_nil_value();
-            const context: *Context = @ptrCast(@alignCast(ud orelse return c.mrz_nil_value()));
-            const hidden = c.mrb_define_module(m, "MRubyZigSandbox");
-            defineTerminationClasses(m, hidden);
-            context.hidden = hidden;
-            context.error_root = c.mrz_error_root_new(m);
-            context.policy_exceptions = c.mrz_policy_exceptions_new(m, hidden);
-            return c.mrz_nil_value();
-        }
-    };
-
-    var context = Protected.Context{};
-    var failed = false;
-    _ = c.mrb_protect_error(vm.mrb, Protected.create, &context, &failed);
-    if (failed) return error.OutOfMemory;
+    var context: c.mrz_sandbox_bootstrap = undefined;
+    if (!c.mrz_protected_sandbox_bootstrap(vm.mrb, &context))
+        return error.OutOfMemory;
     return .{
         .hidden = context.hidden orelse return error.OutOfMemory,
         .error_root = context.error_root,
@@ -1295,21 +1291,6 @@ test "every sandbox bootstrap allocation failure returns OutOfMemory" {
     }
 }
 
-fn defineTerminationClasses(m: *c.mrb_state, hidden: *c.RClass) void {
-    const names = [_][]const u8{
-        "ScriptTerminated",    "DeadlineExceeded",  "GasExhausted",
-        "MemoryLimitExceeded", "CallDepthExceeded",
-    };
-    for (names) |name| {
-        var buf: [64]u8 = undefined;
-        if (name.len >= buf.len) continue;
-        @memcpy(buf[0..name.len], name);
-        buf[name.len] = 0;
-        const exc = c.mrb_class_get(m, "Exception");
-        _ = c.mrb_define_class_under(m, hidden, @ptrCast(&buf), exc);
-    }
-}
-
 const RawRite = struct {
     ptr: [*]u8,
     len: usize,
@@ -1336,35 +1317,37 @@ fn compileRaw(
     defer vm.deinit();
 
     // NUL-terminate for the lexer (same discipline as Vm.loadString).
-    const buf = try alloc_mod.gpa.alloc(u8, src.len + 1);
+    if (std.mem.indexOfScalar(u8, src, 0) != null) return error.InvalidSource;
+    const buffer_length = std.math.add(usize, src.len, 1) catch
+        return error.OutOfMemory;
+    const buf = try alloc_mod.gpa.alloc(u8, buffer_length);
     defer alloc_mod.gpa.free(buf);
     @memcpy(buf[0..src.len], src);
     buf[src.len] = 0;
 
-    const context: ?*c.mrb_ccontext = if (source_name) |name| blk: {
+    const name_z: ?[:0]u8 = if (source_name) |name| blk: {
         if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidSourceName;
-        const created = c.mrb_ccontext_new(vm.mrb) orelse return error.OutOfMemory;
-        errdefer c.mrb_ccontext_free(vm.mrb, created);
-        const name_z = try alloc_mod.gpa.allocSentinel(u8, name.len, 0);
-        defer alloc_mod.gpa.free(name_z);
-        @memcpy(name_z[0..name.len], name);
-        _ = c.mrb_ccontext_filename(vm.mrb, created, name_z.ptr) orelse
-            return error.OutOfMemory;
-        break :blk created;
+        const terminated = try alloc_mod.gpa.allocSentinel(u8, name.len, 0);
+        @memcpy(terminated[0..name.len], name);
+        break :blk terminated;
     } else null;
-    defer if (context) |created| c.mrb_ccontext_free(vm.mrb, created);
-
-    const parser = c.mrb_parse_nstring(vm.mrb, buf.ptr, src.len, context) orelse return error.CompileFailed;
-    defer c.mrb_parser_free(parser);
-    if (c.mrz_parse_nerr(parser) != 0) return error.CompileFailed;
-    const proc = c.mrb_generate_code(vm.mrb, parser) orelse return error.CompileFailed;
+    defer if (name_z) |allocated| alloc_mod.gpa.free(allocated);
 
     var bin: ?[*]u8 = null;
     var bin_size: usize = 0;
-    const rc = c.mrb_dump_irep(vm.mrb, c.mrz_proc_irep(proc), dump_flags, &bin, &bin_size);
-    if (rc != 0) {
-        if (bin) |allocated| mrb_free_via_allocator(allocated, bin_size);
-        return error.CompileFailed;
+    const status = c.mrz_protected_compile(
+        vm.mrb,
+        buf.ptr,
+        src.len,
+        if (name_z) |name| name.ptr else null,
+        dump_flags,
+        &bin,
+        &bin_size,
+    );
+    switch (status) {
+        c.MRZ_COMPILE_OK => {},
+        c.MRZ_COMPILE_OUT_OF_MEMORY => return error.OutOfMemory,
+        else => return error.CompileFailed,
     }
     return .{ .ptr = bin orelse return error.CompileFailed, .len = bin_size };
 }

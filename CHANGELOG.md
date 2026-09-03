@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+Production-safe Zig API:
+
+- Potentially allocating or raising safe-layer operations are now explicitly
+  fallible, including value construction, method/constant definition, data
+  wrapping, instance-variable reads, output hook installation, and
+  `Isolate.sealModel`.
+- All supported mruby operations that may raise now execute behind C protection
+  trampolines. Ruby `longjmp` never crosses a live Zig frame, including method
+  argument decoding, callback error construction, sandbox setup, compilation,
+  and instruction-hook termination delivery. Void operations return an
+  immediate result from those trampolines, avoiding ignored GC-arena roots.
+- `Value` and `Class` handles carry interpreter ownership. Calls, assignments,
+  superclass/constant definition, data wrappers, and callback returns reject
+  cross-VM handles with `error.ForeignValue`.
+- `Vm.loadString` and the RITE compilers reject embedded NUL bytes instead of
+  silently compiling only a source prefix. Error diagnostics preserve the
+  pending Ruby exception until the next safe-layer operation.
+- Capability stripping now installs protected, non-dispatching method masks;
+  policy setup neither requires nor executes guest `method_undefined` hooks.
+- Gem selection is a tested, fallible dependency resolver with deterministic
+  topological ordering and explicit diagnostics for unknown options.
+
+Migration:
+
+- Add `try`/`catch` around `Vm.intValue`, `floatValue`, and `stringValue`;
+  `Class.defineMethod`, `defineClassMethod`, `defineModuleFunction`, and
+  `defineConst`; `data.DataType.wrap`; and `Isolate.sealModel`.
+- Replace `DataType.wrap(mrb, class_ptr, ptr)` with `DataType.wrap(class, ptr)`
+  and `DataType.unwrap(mrb, value)` with `DataType.unwrap(value)`.
+- Handle the new error union from `Vm.getIvar`. Use `Class.asValue()` when a
+  class/module object is needed as a `Value`.
+
 ## 0.3.0 (2026-08-28)
 
 Typed artifacts and portable value transfer:

@@ -1,7 +1,7 @@
-# Toolchain: track Zig master during development.
-# `mise install` resolves master to the current snapshot; `mise up` moves forward.
+# Toolchain used by CI and release validation. Upgrade deliberately together
+# with build/API compatibility fixes rather than following a moving snapshot.
 [tools]
-zig = "master"
+zig = "0.17.0-dev.1978+c961124d9"
 
 [tasks.ci]
 description = "Run the Linux GitHub Actions jobs locally with act"

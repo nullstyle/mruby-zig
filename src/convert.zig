@@ -15,21 +15,41 @@ pub const Value = value_mod.Value;
 /// `error.Overflow`. Strings are copied into Ruby heap strings.
 pub fn toValue(mrb: *c.mrb_state, x: anytype) !Value {
     const T = @TypeOf(x);
-    if (T == Value) return x;
+    if (T == Value) {
+        try x.ensureOwnedBy(mrb);
+        return x;
+    }
     if (T == c.mrb_value) return .{ .mrb = mrb, .v = x };
     return switch (@typeInfo(T)) {
         .int => blk: {
             const n: i64 = std.math.cast(i64, x) orelse return error.Overflow;
-            break :blk .{ .mrb = mrb, .v = c.mrz_int_value(mrb, n) };
+            var value: c.mrb_value = undefined;
+            if (!c.mrz_protected_integer(mrb, n, &value))
+                return error.RubyException;
+            break :blk .{ .mrb = mrb, .v = value };
         },
-        .float => .{ .mrb = mrb, .v = c.mrz_float_value(mrb, x) },
+        .float => blk: {
+            var value: c.mrb_value = undefined;
+            if (!c.mrz_protected_float(mrb, x, &value))
+                return error.RubyException;
+            break :blk .{ .mrb = mrb, .v = value };
+        },
         .bool => .{ .mrb = mrb, .v = c.mrz_bool_value(x) },
         .optional => if (x) |inner| toValue(mrb, inner) else Value.nil(mrb),
         .pointer => |info| switch (info.size) {
             .slice => blk: {
                 const Elem = @typeInfo(T).pointer.child;
                 if (Elem == u8) {
-                    break :blk .{ .mrb = mrb, .v = c.mrb_str_new(mrb, if (x.len == 0) null else x.ptr, @intCast(x.len)) };
+                    _ = std.math.cast(c.mrb_int, x.len) orelse
+                        return error.Overflow;
+                    var value: c.mrb_value = undefined;
+                    if (!c.mrz_protected_string(
+                        mrb,
+                        if (x.len == 0) null else x.ptr,
+                        x.len,
+                        &value,
+                    )) return error.RubyException;
+                    break :blk .{ .mrb = mrb, .v = value };
                 }
                 @compileError("unsupported slice element type for toValue: " ++ @typeName(Elem));
             },

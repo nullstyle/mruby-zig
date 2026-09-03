@@ -21,6 +21,8 @@
 #include <mruby/string.h>
 #include <mruby/proc.h>
 #include <mruby/compile.h>
+#include <mruby/dump.h>
+#include <mruby/data.h>
 #include <mruby/throw.h>
 #include <mruby/variable.h>
 #include <stddef.h>
@@ -57,6 +59,744 @@ void mrz_exc_clear(mrb_state *mrb) { mrb->exc = NULL; }
 void mrz_exc_set(mrb_state *mrb, mrb_value exc) {
   if (mrb_immediate_p(exc)) return; /* not a heap object */
   mrb->exc = mrb_obj_ptr(exc);
+}
+
+/* ---- protected public operations ---------------------------------------- */
+
+/* Keep mruby's setjmp/longjmp entirely inside C. Every operation below has a
+ * C body, so a Ruby raise never skips a live Zig frame. Failures restore the
+ * exception in mrb->exc for the safe layer's lastError() contract. */
+static mrb_bool
+mrz_protect_result(mrb_state *mrb, mrb_protect_error_func *body, void *data,
+                   mrb_value *out)
+{
+  mrb_bool raised = FALSE;
+  /* A new safe-layer operation supersedes diagnostics from the previous one.
+   * Without this reset, non-executing operations such as string allocation
+   * falsely report the stale exception as their own failure. */
+  mrb->exc = NULL;
+  mrb_value result = mrb_protect_error(mrb, body, data, &raised);
+  if (out != NULL) *out = result;
+  if (raised) {
+    if (!mrb_immediate_p(result)) mrb->exc = mrb_obj_ptr(result);
+    return FALSE;
+  }
+  return mrb->exc == NULL;
+}
+
+struct mrz_load_string_context {
+  const char *source;
+};
+
+static mrb_value
+mrz_load_string_body(mrb_state *mrb, void *data)
+{
+  struct mrz_load_string_context *context =
+    (struct mrz_load_string_context*)data;
+  return mrb_load_string(mrb, context->source);
+}
+
+mrb_bool
+mrz_protected_load_string(mrb_state *mrb, const char *source, mrb_value *out)
+{
+  struct mrz_load_string_context context = { source };
+  return mrz_protect_result(mrb, mrz_load_string_body, &context, out);
+}
+
+struct mrz_load_irep_context {
+  const uint8_t *bytes;
+  size_t length;
+};
+
+static mrb_value
+mrz_load_irep_body(mrb_state *mrb, void *data)
+{
+  struct mrz_load_irep_context *context =
+    (struct mrz_load_irep_context*)data;
+  return mrb_load_irep_buf(mrb, context->bytes, context->length);
+}
+
+mrb_bool
+mrz_protected_load_irep(mrb_state *mrb, const uint8_t *bytes, size_t length,
+                        mrb_value *out)
+{
+  struct mrz_load_irep_context context = { bytes, length };
+  return mrz_protect_result(mrb, mrz_load_irep_body, &context, out);
+}
+
+struct mrz_funcall_context {
+  mrb_value receiver;
+  const char *name;
+  size_t name_length;
+  mrb_int argc;
+  const mrb_value *argv;
+};
+
+static mrb_value
+mrz_funcall_body(mrb_state *mrb, void *data)
+{
+  struct mrz_funcall_context *context = (struct mrz_funcall_context*)data;
+  mrb_sym method = mrb_intern(mrb, context->name, context->name_length);
+  return mrb_funcall_argv(mrb, context->receiver, method, context->argc,
+                          context->argv);
+}
+
+mrb_bool
+mrz_protected_funcall(mrb_state *mrb, mrb_value receiver,
+                      const char *name, size_t name_length,
+                      mrb_int argc, const mrb_value *argv, mrb_value *out)
+{
+  struct mrz_funcall_context context = {
+    receiver, name, name_length, argc, argv
+  };
+  return mrz_protect_result(mrb, mrz_funcall_body, &context, out);
+}
+
+mrb_bool
+mrz_protected_funcall_preserve_error(mrb_state *mrb, mrb_value receiver,
+                                     const char *name, size_t name_length,
+                                     mrb_value *out)
+{
+  struct RObject *pending = mrb->exc;
+  struct mrz_funcall_context context = {
+    receiver, name, name_length, 0, NULL
+  };
+  mrb_bool success =
+    mrz_protect_result(mrb, mrz_funcall_body, &context, out);
+  mrb->exc = pending;
+  return success;
+}
+
+static mrb_value
+mrz_print_error_body(mrb_state *mrb, void *data)
+{
+  (void)data;
+  mrb_print_error(mrb);
+  return mrb_nil_value();
+}
+
+void
+mrz_protected_print_error(mrb_state *mrb)
+{
+  struct RObject *pending = mrb->exc;
+  mrb_bool raised = FALSE;
+  (void)mrb_protect_error(mrb, mrz_print_error_body, NULL, &raised);
+  mrb->exc = pending;
+}
+
+struct mrz_bytes_context {
+  const uint8_t *bytes;
+  size_t length;
+};
+
+static mrb_value
+mrz_string_body(mrb_state *mrb, void *data)
+{
+  struct mrz_bytes_context *context = (struct mrz_bytes_context*)data;
+  if (context->length > MRB_INT_MAX) {
+    mrb_raise(mrb, E_RANGE_ERROR, "string is too long");
+  }
+  const char *bytes =
+    context->length == 0 ? NULL : (const char*)context->bytes;
+  return mrb_str_new(mrb, bytes, (mrb_int)context->length);
+}
+
+mrb_bool
+mrz_protected_string(mrb_state *mrb, const uint8_t *bytes, size_t length,
+                     mrb_value *out)
+{
+  struct mrz_bytes_context context = { bytes, length };
+  return mrz_protect_result(mrb, mrz_string_body, &context, out);
+}
+
+struct mrz_integer_context {
+  mrb_int integer;
+};
+
+static mrb_value
+mrz_integer_body(mrb_state *mrb, void *data)
+{
+  struct mrz_integer_context *context = (struct mrz_integer_context*)data;
+  mrb_value value;
+  SET_INT_VALUE(mrb, value, context->integer);
+  return value;
+}
+
+mrb_bool
+mrz_protected_integer(mrb_state *mrb, mrb_int integer, mrb_value *out)
+{
+  struct mrz_integer_context context = { integer };
+  return mrz_protect_result(mrb, mrz_integer_body, &context, out);
+}
+
+struct mrz_float_context {
+  mrb_float floating;
+};
+
+static mrb_value
+mrz_float_body(mrb_state *mrb, void *data)
+{
+  struct mrz_float_context *context = (struct mrz_float_context*)data;
+  mrb_value value;
+  SET_FLOAT_VALUE(mrb, value, context->floating);
+  return value;
+}
+
+mrb_bool
+mrz_protected_float(mrb_state *mrb, mrb_float floating, mrb_value *out)
+{
+  struct mrz_float_context context = { floating };
+  return mrz_protect_result(mrb, mrz_float_body, &context, out);
+}
+
+struct mrz_intern_context {
+  const char *name;
+  size_t length;
+  mrb_sym symbol;
+};
+
+static mrb_value
+mrz_intern_body(mrb_state *mrb, void *data)
+{
+  struct mrz_intern_context *context = (struct mrz_intern_context*)data;
+  context->symbol = mrb_intern(mrb, context->name, context->length);
+  return mrb_nil_value();
+}
+
+mrb_bool
+mrz_protected_intern(mrb_state *mrb, const char *name, size_t length,
+                     mrb_sym *out)
+{
+  struct mrz_intern_context context = { name, length, 0 };
+  if (!mrz_protect_result(mrb, mrz_intern_body, &context, NULL)) return FALSE;
+  if (out != NULL) *out = context.symbol;
+  return TRUE;
+}
+
+enum mrz_define_kind {
+  MRZ_DEFINE_CLASS = 0,
+  MRZ_DEFINE_MODULE = 1
+};
+
+struct mrz_define_context {
+  const char *name;
+  size_t name_length;
+  struct RClass *super;
+  uint8_t kind;
+};
+
+static mrb_value
+mrz_define_body(mrb_state *mrb, void *data)
+{
+  struct mrz_define_context *context = (struct mrz_define_context*)data;
+  mrb_sym name = mrb_intern(mrb, context->name, context->name_length);
+  struct RClass *klass;
+  if (context->kind == MRZ_DEFINE_MODULE) {
+    klass = mrb_define_module_id(mrb, name);
+  }
+  else {
+    struct RClass *super =
+      context->super == NULL ? mrb->object_class : context->super;
+    klass = mrb_define_class_id(mrb, name, super);
+  }
+  return mrb_obj_value(klass);
+}
+
+mrb_bool
+mrz_protected_define(mrb_state *mrb, const char *name, size_t name_length,
+                     struct RClass *super, uint8_t kind, mrb_value *out)
+{
+  struct mrz_define_context context = { name, name_length, super, kind };
+  return mrz_protect_result(mrb, mrz_define_body, &context, out);
+}
+
+struct mrz_lookup_context {
+  const char *name;
+  size_t length;
+};
+
+static mrb_bool
+mrz_namespace_p(mrb_value value)
+{
+  return mrb_class_p(value) || mrb_module_p(value) ||
+    mrb_type(value) == MRB_TT_SCLASS;
+}
+
+static mrb_value
+mrz_lookup_body(mrb_state *mrb, void *data)
+{
+  struct mrz_lookup_context *context = (struct mrz_lookup_context*)data;
+  mrb_value current = mrb_obj_value(mrb_class_get(mrb, "Object"));
+  size_t start = 0;
+
+  if (context->length == 0) return mrb_nil_value();
+  while (start <= context->length) {
+    /* mrb_const_defined assumes its receiver is an RClass. Reject a scalar
+     * intermediate constant before that unchecked cast can dereference it. */
+    if (!mrz_namespace_p(current)) return mrb_nil_value();
+    size_t end = start;
+    while (end < context->length &&
+           !(context->name[end] == ':' && end + 1 < context->length &&
+             context->name[end + 1] == ':')) {
+      end++;
+    }
+    size_t segment_length = end - start;
+    if (segment_length == 0) return mrb_nil_value();
+    mrb_sym symbol = mrb_intern(mrb, context->name + start, segment_length);
+    if (!mrb_const_defined(mrb, current, symbol)) return mrb_nil_value();
+    current = mrb_const_get(mrb, current, symbol);
+    if (end >= context->length) break;
+    start = end + 2;
+    if (start >= context->length) return mrb_nil_value();
+  }
+
+  if (!mrz_namespace_p(current)) return mrb_nil_value();
+  return current;
+}
+
+mrb_bool
+mrz_protected_lookup(mrb_state *mrb, const char *name, size_t length,
+                     mrb_value *out)
+{
+  struct mrz_lookup_context context = { name, length };
+  return mrz_protect_result(mrb, mrz_lookup_body, &context, out);
+}
+
+struct mrz_named_value_context {
+  const char *name;
+  size_t length;
+  mrb_value object;
+  mrb_value value;
+};
+
+static mrb_value
+mrz_global_get_body(mrb_state *mrb, void *data)
+{
+  struct mrz_named_value_context *context =
+    (struct mrz_named_value_context*)data;
+  mrb_sym symbol = mrb_intern(mrb, context->name, context->length);
+  return mrb_gv_get(mrb, symbol);
+}
+
+static mrb_value
+mrz_global_set_body(mrb_state *mrb, void *data)
+{
+  struct mrz_named_value_context *context =
+    (struct mrz_named_value_context*)data;
+  mrb_sym symbol = mrb_intern(mrb, context->name, context->length);
+  mrb_gv_set(mrb, symbol, context->value);
+  return mrb_nil_value();
+}
+
+static mrb_value
+mrz_ivar_get_body(mrb_state *mrb, void *data)
+{
+  struct mrz_named_value_context *context =
+    (struct mrz_named_value_context*)data;
+  mrb_sym symbol = mrb_intern(mrb, context->name, context->length);
+  return mrb_iv_get(mrb, context->object, symbol);
+}
+
+static mrb_value
+mrz_ivar_set_body(mrb_state *mrb, void *data)
+{
+  struct mrz_named_value_context *context =
+    (struct mrz_named_value_context*)data;
+  mrb_sym symbol = mrb_intern(mrb, context->name, context->length);
+  mrb_iv_set(mrb, context->object, symbol, context->value);
+  return mrb_nil_value();
+}
+
+mrb_bool
+mrz_protected_global_get(mrb_state *mrb, const char *name, size_t length,
+                         mrb_value *out)
+{
+  struct mrz_named_value_context context = {
+    name, length, mrb_nil_value(), mrb_nil_value()
+  };
+  return mrz_protect_result(mrb, mrz_global_get_body, &context, out);
+}
+
+mrb_bool
+mrz_protected_global_set(mrb_state *mrb, const char *name, size_t length,
+                         mrb_value value)
+{
+  struct mrz_named_value_context context = {
+    name, length, mrb_nil_value(), value
+  };
+  return mrz_protect_result(mrb, mrz_global_set_body, &context, NULL);
+}
+
+mrb_bool
+mrz_protected_ivar_get(mrb_state *mrb, mrb_value object,
+                       const char *name, size_t length, mrb_value *out)
+{
+  struct mrz_named_value_context context = {
+    name, length, object, mrb_nil_value()
+  };
+  return mrz_protect_result(mrb, mrz_ivar_get_body, &context, out);
+}
+
+mrb_bool
+mrz_protected_ivar_set(mrb_state *mrb, mrb_value object,
+                       const char *name, size_t length,
+                       mrb_value value)
+{
+  struct mrz_named_value_context context = { name, length, object, value };
+  return mrz_protect_result(mrb, mrz_ivar_set_body, &context, NULL);
+}
+
+struct mrz_define_const_context {
+  struct RClass *klass;
+  const char *name;
+  size_t name_length;
+  mrb_value value;
+};
+
+static mrb_value
+mrz_define_const_body(mrb_state *mrb, void *data)
+{
+  struct mrz_define_const_context *context =
+    (struct mrz_define_const_context*)data;
+  mrb_sym name = mrb_intern(mrb, context->name, context->name_length);
+  mrb_define_const_id(mrb, context->klass, name, context->value);
+  return mrb_nil_value();
+}
+
+mrb_bool
+mrz_protected_define_const(mrb_state *mrb, struct RClass *klass,
+                           const char *name, size_t name_length,
+                           mrb_value value)
+{
+  struct mrz_define_const_context context = {
+    klass, name, name_length, value
+  };
+  return mrz_protect_result(mrb, mrz_define_const_body, &context, NULL);
+}
+
+enum mrz_method_kind {
+  MRZ_METHOD_INSTANCE = 0,
+  MRZ_METHOD_CLASS = 1,
+  MRZ_METHOD_MODULE_FUNCTION = 2
+};
+
+struct mrz_define_method_context {
+  struct RClass *klass;
+  const char *name;
+  size_t name_length;
+  mrb_func_t function;
+  mrb_aspec aspec;
+  uint8_t kind;
+};
+
+static mrb_value
+mrz_define_method_body(mrb_state *mrb, void *data)
+{
+  struct mrz_define_method_context *context =
+    (struct mrz_define_method_context*)data;
+  mrb_sym name = mrb_intern(mrb, context->name, context->name_length);
+  switch (context->kind) {
+    case MRZ_METHOD_INSTANCE:
+      mrb_define_method_id(mrb, context->klass, name, context->function,
+                           context->aspec);
+      break;
+    case MRZ_METHOD_CLASS:
+      mrb_define_class_method_id(mrb, context->klass, name, context->function,
+                                 context->aspec);
+      break;
+    case MRZ_METHOD_MODULE_FUNCTION:
+      mrb_define_module_function_id(mrb, context->klass, name,
+                                    context->function, context->aspec);
+      break;
+    default:
+      return mrb_nil_value();
+  }
+  return mrb_nil_value();
+}
+
+mrb_bool
+mrz_protected_define_method(mrb_state *mrb, struct RClass *klass,
+                            const char *name, size_t name_length,
+                            mrb_func_t function, mrb_aspec aspec,
+                            uint8_t kind)
+{
+  struct mrz_define_method_context context = {
+    klass, name, name_length, function, aspec, kind
+  };
+  return mrz_protect_result(mrb, mrz_define_method_body, &context, NULL);
+}
+
+struct mrz_data_context {
+  struct RClass *klass;
+  void *pointer;
+  const struct mrb_data_type *data_type;
+};
+
+static mrb_value
+mrz_data_body(mrb_state *mrb, void *data)
+{
+  struct mrz_data_context *context = (struct mrz_data_context*)data;
+  MRB_SET_INSTANCE_TT(context->klass, MRB_TT_CDATA);
+  return mrb_obj_value(mrb_data_object_alloc(
+    mrb, context->klass, context->pointer, context->data_type));
+}
+
+mrb_bool
+mrz_protected_data(mrb_state *mrb, struct RClass *klass, void *pointer,
+                   const struct mrb_data_type *data_type, mrb_value *out)
+{
+  struct mrz_data_context context = { klass, pointer, data_type };
+  return mrz_protect_result(mrb, mrz_data_body, &context, out);
+}
+
+struct mrz_get_args_context {
+  const char *format;
+  void **slots;
+  mrb_int count;
+};
+
+static mrb_value
+mrz_get_args_body(mrb_state *mrb, void *data)
+{
+  struct mrz_get_args_context *context = (struct mrz_get_args_context*)data;
+  context->count = mrb_get_args_a(mrb, context->format, context->slots);
+  return mrb_nil_value();
+}
+
+mrb_bool
+mrz_protected_get_args(mrb_state *mrb, const char *format, void **slots,
+                       mrb_int *out)
+{
+  struct mrz_get_args_context context = { format, slots, 0 };
+  if (!mrz_protect_result(mrb, mrz_get_args_body, &context, NULL)) {
+    return FALSE;
+  }
+  if (out != NULL) *out = context.count;
+  return TRUE;
+}
+
+struct mrz_exception_context {
+  const char *class_name;
+  size_t class_name_length;
+  const uint8_t *message;
+  size_t message_length;
+};
+
+static mrb_value
+mrz_exception_body(mrb_state *mrb, void *data)
+{
+  struct mrz_exception_context *context =
+    (struct mrz_exception_context*)data;
+  if (context->message_length > MRB_INT_MAX) {
+    mrb_raise(mrb, E_RANGE_ERROR, "exception message is too long");
+  }
+  const char *message_bytes =
+    context->message_length == 0 ? NULL : (const char*)context->message;
+  mrb_value message = mrb_str_new(
+    mrb,
+    message_bytes,
+    (mrb_int)context->message_length);
+  mrb_sym class_name =
+    mrb_intern(mrb, context->class_name, context->class_name_length);
+  struct RClass *klass = mrb_class_get_id(mrb, class_name);
+  return mrb_funcall(mrb, mrb_obj_value(klass), "exception", 1, message);
+}
+
+mrb_bool
+mrz_protected_set_exception(mrb_state *mrb,
+                            const char *class_name, size_t class_name_length,
+                            const uint8_t *message, size_t message_length)
+{
+  struct mrz_exception_context context = {
+    class_name, class_name_length, message, message_length
+  };
+  mrb_value exception;
+  if (!mrz_protect_result(mrb, mrz_exception_body, &context, &exception)) {
+    return FALSE;
+  }
+  if (!mrb_immediate_p(exception)) {
+    mrb->exc = mrb_obj_ptr(exception);
+    return TRUE;
+  }
+  return FALSE;
+}
+
+enum mrz_mask_kind {
+  MRZ_MASK_INSTANCE = 0,
+  MRZ_MASK_CLASS = 1
+};
+
+struct mrz_mask_context {
+  struct RClass *klass;
+  const char *name;
+  size_t name_length;
+  uint8_t kind;
+};
+
+static mrb_value
+mrz_mask_method_body(mrb_state *mrb, void *data)
+{
+  struct mrz_mask_context *context = (struct mrz_mask_context*)data;
+  mrb_sym name = mrb_intern(mrb, context->name, context->name_length);
+  struct RClass *target = context->klass;
+  if (context->kind == MRZ_MASK_CLASS) {
+    target = mrb_singleton_class_ptr(
+      mrb, mrb_obj_value(context->klass)
+    );
+  }
+
+  /* Capability installation needs an undefined entry even when the method is
+   * inherited through a later ancestor. Defining that entry directly also
+   * avoids dispatching guest method_undefined hooks during preparation. */
+  mrb_method_t method;
+  MRB_METHOD_FROM_PROC(method, NULL);
+  mrb_define_method_raw(mrb, target, name, method);
+  return mrb_nil_value();
+}
+
+mrb_bool
+mrz_protected_mask_method(mrb_state *mrb, struct RClass *klass,
+                          const char *name, size_t name_length, uint8_t kind)
+{
+  struct mrz_mask_context context = {
+    klass, name, name_length, kind
+  };
+  return mrz_protect_result(mrb, mrz_mask_method_body, &context, NULL);
+}
+
+struct mrz_remove_const_context {
+  struct RClass *klass;
+  const char *name;
+  size_t name_length;
+};
+
+static mrb_value
+mrz_remove_const_body(mrb_state *mrb, void *data)
+{
+  struct mrz_remove_const_context *context =
+    (struct mrz_remove_const_context*)data;
+  mrb_sym name = mrb_intern(mrb, context->name, context->name_length);
+  mrb_const_remove(mrb, mrb_obj_value(context->klass), name);
+  return mrb_nil_value();
+}
+
+mrb_bool
+mrz_protected_remove_const(mrb_state *mrb, struct RClass *klass,
+                           const char *name, size_t name_length)
+{
+  struct mrz_remove_const_context context = {
+    klass, name, name_length
+  };
+  return mrz_protect_result(mrb, mrz_remove_const_body, &context, NULL);
+}
+
+struct mrz_freeze_context {
+  mrb_value value;
+};
+
+static mrb_value
+mrz_freeze_body(mrb_state *mrb, void *data)
+{
+  struct mrz_freeze_context *context = (struct mrz_freeze_context*)data;
+  (void)mrb_obj_freeze(mrb, context->value);
+  return mrb_nil_value();
+}
+
+mrb_bool
+mrz_protected_freeze(mrb_state *mrb, mrb_value value)
+{
+  struct mrz_freeze_context context = { value };
+  return mrz_protect_result(mrb, mrz_freeze_body, &context, NULL);
+}
+
+enum mrz_compile_status {
+  MRZ_COMPILE_OK = 0,
+  MRZ_COMPILE_FAILED = 1,
+  MRZ_COMPILE_OUT_OF_MEMORY = 2
+};
+
+struct mrz_compile_context {
+  const char *source;
+  size_t source_length;
+  const char *source_name;
+  uint8_t dump_flags;
+  mrb_ccontext *compiler_context;
+  struct mrb_parser_state *parser;
+  uint8_t *bytes;
+  size_t length;
+  uint8_t status;
+};
+
+static mrb_value
+mrz_compile_body(mrb_state *mrb, void *data)
+{
+  struct mrz_compile_context *context = (struct mrz_compile_context*)data;
+  if (context->source_name != NULL) {
+    context->compiler_context = mrb_ccontext_new(mrb);
+    if (context->compiler_context == NULL) {
+      context->status = MRZ_COMPILE_OUT_OF_MEMORY;
+      return mrb_nil_value();
+    }
+    if (mrb_ccontext_filename(
+          mrb, context->compiler_context, context->source_name) == NULL) {
+      context->status = MRZ_COMPILE_OUT_OF_MEMORY;
+      return mrb_nil_value();
+    }
+  }
+
+  context->parser = mrb_parse_nstring(
+    mrb, context->source, context->source_length, context->compiler_context);
+  if (context->parser == NULL || context->parser->nerr != 0) {
+    context->status = MRZ_COMPILE_FAILED;
+    return mrb_nil_value();
+  }
+
+  struct RProc *proc = mrb_generate_code(mrb, context->parser);
+  if (proc == NULL) {
+    context->status = MRZ_COMPILE_FAILED;
+    return mrb_nil_value();
+  }
+
+  if (mrb_dump_irep(mrb, proc->body.irep, context->dump_flags,
+                    &context->bytes, &context->length) != 0) {
+    context->status = MRZ_COMPILE_FAILED;
+    return mrb_nil_value();
+  }
+  context->status = MRZ_COMPILE_OK;
+  return mrb_nil_value();
+}
+
+uint8_t
+mrz_protected_compile(mrb_state *mrb,
+                      const char *source, size_t source_length,
+                      const char *source_name, uint8_t dump_flags,
+                      uint8_t **out_bytes, size_t *out_length)
+{
+  struct mrz_compile_context context = {
+    source, source_length, source_name, dump_flags,
+    NULL, NULL, NULL, 0, MRZ_COMPILE_FAILED
+  };
+  mrb_value result;
+  if (!mrz_protect_result(mrb, mrz_compile_body, &context, &result)) {
+    context.status =
+      !mrb_immediate_p(result) && mrb_obj_ptr(result) == mrb->nomem_err
+        ? MRZ_COMPILE_OUT_OF_MEMORY
+        : MRZ_COMPILE_FAILED;
+  }
+
+  if (context.parser != NULL) mrb_parser_free(context.parser);
+  if (context.compiler_context != NULL) {
+    mrb_ccontext_free(mrb, context.compiler_context);
+  }
+  if (context.status != MRZ_COMPILE_OK && context.bytes != NULL) {
+    mrb_free(mrb, context.bytes);
+    context.bytes = NULL;
+    context.length = 0;
+  }
+
+  if (out_bytes != NULL) *out_bytes = context.bytes;
+  if (out_length != NULL) *out_length = context.length;
+  return context.status;
 }
 
 struct mrz_exception_metadata {
@@ -140,20 +880,86 @@ mrb_value mrz_policy_exceptions_new(mrb_state *mrb, struct RClass *hidden) {
   return root;
 }
 
-/* mrb->ud auxiliary pointer (sandbox backreference) */
-void *mrz_get_ud(mrb_state *mrb) { return mrb->ud; }
-void mrz_set_ud(mrb_state *mrb, void *ud) { mrb->ud = ud; }
+struct mrz_sandbox_bootstrap {
+  struct RClass *hidden;
+  mrb_value error_root;
+  mrb_value policy_exceptions;
+};
+
+static mrb_value
+mrz_sandbox_bootstrap_body(mrb_state *mrb, void *data)
+{
+  static const char *names[] = {
+    "ScriptTerminated", "DeadlineExceeded", "GasExhausted",
+    "MemoryLimitExceeded", "CallDepthExceeded"
+  };
+  struct mrz_sandbox_bootstrap *bootstrap =
+    (struct mrz_sandbox_bootstrap*)data;
+  struct RClass *exception = mrb_class_get(mrb, "Exception");
+  bootstrap->hidden = mrb_define_module(mrb, "MRubyZigSandbox");
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+    (void)mrb_define_class_under(
+      mrb, bootstrap->hidden, names[i], exception);
+  }
+  bootstrap->error_root = mrz_error_root_new(mrb);
+  bootstrap->policy_exceptions =
+    mrz_policy_exceptions_new(mrb, bootstrap->hidden);
+  return mrb_nil_value();
+}
+
+mrb_bool
+mrz_protected_sandbox_bootstrap(mrb_state *mrb,
+                                struct mrz_sandbox_bootstrap *out)
+{
+  struct mrz_sandbox_bootstrap result;
+  memset(&result, 0, sizeof(result));
+  if (!mrz_protect_result(
+        mrb, mrz_sandbox_bootstrap_body, &result, NULL)) {
+    return FALSE;
+  }
+  if (result.hidden == NULL) return FALSE;
+  if (out != NULL) *out = result;
+  return TRUE;
+}
+
+struct mrz_sandbox_context {
+  void *userdata;
+  mrb_value (*observer)(struct mrb_state*, const void*, const void*, void*);
+};
+
+static void
+mrz_code_fetch_trampoline(struct mrb_state *mrb,
+                          const struct mrb_irep *irep,
+                          const mrb_code *pc,
+                          mrb_value *regs)
+{
+  struct mrz_sandbox_context *context =
+    (struct mrz_sandbox_context*)mrb->ud;
+  if (context == NULL || context->observer == NULL) return;
+  mrb_value exception = context->observer(mrb, irep, pc, regs);
+  if (!mrb_nil_p(exception)) mrb_exc_raise(mrb, exception);
+}
+
+/* mrb->ud auxiliary pointer (sandbox backreference and hook observer). */
+void *mrz_get_ud(mrb_state *mrb) {
+  struct mrz_sandbox_context *context =
+    (struct mrz_sandbox_context*)mrb->ud;
+  return context == NULL ? NULL : context->userdata;
+}
+
+void
+mrz_set_sandbox_context(mrb_state *mrb, struct mrz_sandbox_context *context)
+{
+  mrb->ud = context;
+  mrb->code_fetch_hook =
+    context == NULL ? NULL : mrz_code_fetch_trampoline;
+}
 
 /* irep of an irep-proc (for snapshot dump) */
 const mrb_irep *mrz_proc_irep(const struct RProc *p) { return p->body.irep; }
 
 /* parse error count */
 int mrz_parse_nerr(const struct mrb_parser_state *p) { return (int)p->nerr; }
-
-/* code fetch hook (only exists under MRB_USE_DEBUG_HOOK, same defines) */
-void mrz_set_code_fetch_hook(mrb_state *mrb, void (*hook)(struct mrb_state*, const struct mrb_irep *, const mrb_code *, mrb_value *)) {
-  mrb->code_fetch_hook = hook;
-}
 
 /* Would an exception raised at this program counter be caught by any
  * catch handler of this irep? Mirrors catch_handler_find's coverage rule
@@ -218,6 +1024,9 @@ void *mrz_ptr(mrb_value v) { return mrb_ptr(v); }
 
 const char *mrz_string_ptr(mrb_value v) { return RSTRING_PTR(v); }
 mrb_int mrz_string_len(mrb_value v) { return RSTRING_LEN(v); }
+size_t mrz_array_len(mrb_value v) {
+  return mrb_array_p(v) ? (size_t)RARRAY_LEN(v) : 0;
+}
 
 /* ---- value construction (macros / boxing helpers) ---- */
 

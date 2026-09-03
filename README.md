@@ -19,14 +19,15 @@ bytecode, compiles everything with `zig cc`, and hands you a `mruby` module.
 
 ## Status
 
-Pre-release, tracking **Zig master** via [mise](https://mise.jdx.dev)
-(`.mise.toml`; `mise install`, `mise x -- zig build test`). Developed and
-tested on aarch64-macos; linux targets should work out of the box.
+Pre-release, pinned to **Zig 0.17.0-dev.1978+c961124d9** via
+[mise](https://mise.jdx.dev) (`.mise.toml`; `mise install`,
+`mise x -- zig build test`). Developed and tested on aarch64-macos; linux
+targets should work out of the box.
 
 ## Quickstart
 
 ```sh
-mise install                 # or use your own zig master build
+mise install                 # install the repository's pinned Zig snapshot
 mise x -- zig build test     # unit + Ruby integration suites
 mise x -- zig build run-quickstart
 ```
@@ -57,7 +58,7 @@ In your application:
 ```zig
 const mruby = @import("mruby");
 
-var vm = try mruby.Vm.init();
+const vm = try mruby.Vm.init();
 defer vm.deinit();
 
 const result = try vm.loadString("[1, 2, 3].map { |x| x * x }.sum");
@@ -81,6 +82,18 @@ else and need no Ruby toolchain at build time.
 
 ## API tour
 
+The supported Zig layer is explicit about failure and interpreter ownership:
+
+- Any operation that can allocate or raise returns an error union. A Ruby
+  exception is always `error.RubyException`; inspect `vm.lastError()` before
+  starting the next VM operation, which supersedes the pending diagnostic.
+- `Value` and `Class` handles belong to the `Vm` that created them. APIs that
+  combine handles reject cross-VM use with `error.ForeignValue` instead of
+  passing a foreign heap pointer into mruby.
+- The exported `mruby.c` module is an intentionally unsafe escape hatch.
+  Supported safe-layer calls keep mruby's `setjmp`/`longjmp` entirely inside
+  the C shim, so Ruby exceptions never unwind across live Zig frames.
+
 ### Evaluating Ruby
 
 ```zig
@@ -89,7 +102,7 @@ try std.testing.expectEqualStrings("HELLO", try v.asString());
 ```
 
 Ruby exceptions (compile-time or runtime) surface as `error.RubyException`
-and never longjmp through Zig frames — everything runs under
+and never longjmp through Zig frames — the C shim runs each operation under
 `mrb_protect_error`:
 
 ```zig
@@ -116,7 +129,7 @@ arguments. The format string follows mruby's `mrb_get_args`:
 
 ```zig
 const math = try vm.defineClass("ZigMath", null);
-math.defineMethod("add", "ii", struct {
+try math.defineMethod("add", "ii", struct {
     fn call(vm: *mruby.Vm, self: mruby.Value, a: i64, b: i64) anyerror!mruby.Value {
         _ = self;
         return vm.intValue(a + b);
@@ -135,16 +148,17 @@ class from within a callback.
 ```zig
 const Conn = mruby.data.DataType(ConnState, "Conn", ConnState.destroy);
 const cls = try vm.defineClass("Conn", null);
-const obj = Conn.wrap(vm.mrb, cls.class, state_ptr);   // Ruby value
-const p   = Conn.unwrap(vm.mrb, some_value).?;          // *ConnState
+const obj = try Conn.wrap(cls, state_ptr); // Ruby value
+const p   = Conn.unwrap(some_value).?;     // *ConnState
 ```
 
-If `destroy` is non-null it runs when the GC collects the wrapper.
+If `destroy` is non-null it runs when the GC collects the wrapper. `wrap`
+transfers ownership of the pointer only when it succeeds.
 
 ### Calling Ruby from Zig
 
 ```zig
-const s = vm.stringValue("hello");
+const s = try vm.stringValue("hello");
 const up = try vm.call(s, "upcase", .{});            // up to 8 args
 const sqrt = try vm.call(try vm.loadString("Math"), "sqrt", .{@as(f64, 144.0)});
 ```
@@ -152,7 +166,7 @@ const sqrt = try vm.call(try vm.loadString("Math"), "sqrt", .{@as(f64, 144.0)});
 ### Output redirection
 
 ```zig
-mruby.output.setOutputWriter(vm, &some_writer.interface);
+try mruby.output.setOutputWriter(vm, &some_writer.interface);
 _ = try vm.loadString("puts 'hello from ruby'");     // -> some_writer
 ```
 
@@ -176,8 +190,8 @@ Two lifetime rules keep you safe:
 - String slices are **borrowed**: `Value.asString`, the `S`/`s`/`z` method
   parameters, and `Rest.get` point into the Ruby heap and are valid only
   until the next interpreter call — use `Value.dupeString(allocator)` to
-  keep them. `vm.loadString` evaluates a source slice only up to its first
-  NUL byte (the lexer's sentinel).
+  keep them. `vm.loadString` rejects source containing an interior NUL byte
+  rather than silently evaluating only the prefix visible to the lexer.
 
 ## Gem configuration
 
@@ -190,14 +204,15 @@ symbol/proc/kernel/toplevel/compar`), `struct`, `set`, `fiber`,
 
 ```sh
 mise x -- zig build -Dgem-set=minimal          # core + compiler + eval (+ deps)
-mise x -- zig build -Dwith-gems=mruby-io       # add gems on top
+mise x -- zig build -Dgem-set=minimal -Dwith-gems=mruby-string-ext
 mise x -- zig build -Dwithout-gems=mruby-pack  # remove gems
 ```
 
-Gem dependencies are honored like Rake's `add_dependency`: `-Dwith-gems`
-pulls in anything the added gem needs, and `-Dwithout-gems` cascade-removes
-gems that depend on what you removed (printed as configure-time notes), so
-misconfigurations can't silently produce an interpreter that fails to boot.
+`-Dwith-gems` accepts gems from the catalog in `build/gems.zig`. Gem
+dependencies are honored like Rake's `add_dependency`: additions pull in
+their dependencies, and `-Dwithout-gems` cascade-removes dependents.
+Unknown names are rejected during configuration, and the final set is
+topologically ordered before generating its initialization table.
 
 Excluded from defaults for portability: `io`, `socket`, `dir`, `errno`,
 `print`, and the math-extras (`bigint`, `complex`, `rational`, `cmath`).

@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
     try mruby.output.setOutputWriter(vm, &buffer.writer);
 
     const divider = try vm.defineClass("Divider", null);
-    divider.defineMethod("divide", "ii", Divider.divide);
+    try divider.defineMethod("divide", "ii", Divider.divide);
 
     // 1. A Zig-raised Ruby exception, caught in Ruby.
     _ = vm.loadString(

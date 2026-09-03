@@ -188,6 +188,187 @@ pub extern fn mrz_error_capture(mrb: *mrb_state, root: mrb_value, exc: mrb_value
 pub extern fn mrz_error_release(mrb: *mrb_state, root: mrb_value) bool;
 pub extern fn mrz_policy_exceptions_new(mrb: *mrb_state, hidden: *RClass) mrb_value;
 
+// ---- protected public operations ---------------------------------------
+
+/// These wrappers keep mruby's setjmp/longjmp inside C and restore a raised
+/// exception to `mrb->exc`. `false` therefore maps to `error.RubyException`.
+pub extern fn mrz_protected_load_string(
+    mrb: *mrb_state,
+    source: [*:0]const u8,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_load_irep(
+    mrb: *mrb_state,
+    bytes: [*]const u8,
+    length: usize,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_funcall(
+    mrb: *mrb_state,
+    receiver: mrb_value,
+    name: [*]const u8,
+    name_length: usize,
+    argc: mrb_int,
+    argv: [*]const mrb_value,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_funcall_preserve_error(
+    mrb: *mrb_state,
+    receiver: mrb_value,
+    name: [*]const u8,
+    name_length: usize,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_print_error(mrb: *mrb_state) void;
+pub extern fn mrz_protected_string(
+    mrb: *mrb_state,
+    bytes: ?[*]const u8,
+    length: usize,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_integer(
+    mrb: *mrb_state,
+    integer: mrb_int,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_float(
+    mrb: *mrb_state,
+    floating: mrb_float,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_intern(
+    mrb: *mrb_state,
+    name: [*]const u8,
+    length: usize,
+    out: *mrb_sym,
+) bool;
+pub const MRZ_DEFINE_CLASS: u8 = 0;
+pub const MRZ_DEFINE_MODULE: u8 = 1;
+pub extern fn mrz_protected_define(
+    mrb: *mrb_state,
+    name: [*]const u8,
+    name_length: usize,
+    super: ?*RClass,
+    kind: u8,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_lookup(
+    mrb: *mrb_state,
+    name: [*]const u8,
+    length: usize,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_global_get(
+    mrb: *mrb_state,
+    name: [*]const u8,
+    length: usize,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_global_set(
+    mrb: *mrb_state,
+    name: [*]const u8,
+    length: usize,
+    value: mrb_value,
+) bool;
+pub extern fn mrz_protected_ivar_get(
+    mrb: *mrb_state,
+    object: mrb_value,
+    name: [*]const u8,
+    length: usize,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_ivar_set(
+    mrb: *mrb_state,
+    object: mrb_value,
+    name: [*]const u8,
+    length: usize,
+    value: mrb_value,
+) bool;
+pub extern fn mrz_protected_define_const(
+    mrb: *mrb_state,
+    class: *RClass,
+    name: [*]const u8,
+    name_length: usize,
+    value: mrb_value,
+) bool;
+pub const MRZ_METHOD_INSTANCE: u8 = 0;
+pub const MRZ_METHOD_CLASS: u8 = 1;
+pub const MRZ_METHOD_MODULE_FUNCTION: u8 = 2;
+pub extern fn mrz_protected_define_method(
+    mrb: *mrb_state,
+    class: *RClass,
+    name: [*]const u8,
+    name_length: usize,
+    function: mrb_func_t,
+    aspec: mrb_aspec,
+    kind: u8,
+) bool;
+pub extern fn mrz_protected_data(
+    mrb: *mrb_state,
+    class: *RClass,
+    pointer: ?*anyopaque,
+    data_type: *const mrb_data_type,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_get_args(
+    mrb: *mrb_state,
+    format: [*:0]const u8,
+    slots: [*]?*anyopaque,
+    out: *mrb_int,
+) bool;
+pub extern fn mrz_protected_set_exception(
+    mrb: *mrb_state,
+    class_name: [*]const u8,
+    class_name_length: usize,
+    message: ?[*]const u8,
+    message_length: usize,
+) bool;
+/// Install an undefined method-table entry without lookup or Ruby hook
+/// dispatch. This is the sandbox's policy-enforcement primitive, not Ruby's
+/// observable `undef_method` operation.
+pub const MRZ_MASK_INSTANCE: u8 = 0;
+pub const MRZ_MASK_CLASS: u8 = 1;
+pub extern fn mrz_protected_mask_method(
+    mrb: *mrb_state,
+    class: *RClass,
+    name: [*]const u8,
+    name_length: usize,
+    kind: u8,
+) bool;
+pub extern fn mrz_protected_remove_const(
+    mrb: *mrb_state,
+    class: *RClass,
+    name: [*]const u8,
+    name_length: usize,
+) bool;
+pub extern fn mrz_protected_freeze(
+    mrb: *mrb_state,
+    value: mrb_value,
+) bool;
+
+pub const mrz_sandbox_bootstrap = extern struct {
+    hidden: ?*RClass,
+    error_root: mrb_value,
+    policy_exceptions: mrb_value,
+};
+pub extern fn mrz_protected_sandbox_bootstrap(
+    mrb: *mrb_state,
+    out: *mrz_sandbox_bootstrap,
+) bool;
+
+pub const MRZ_COMPILE_OK: u8 = 0;
+pub const MRZ_COMPILE_FAILED: u8 = 1;
+pub const MRZ_COMPILE_OUT_OF_MEMORY: u8 = 2;
+pub extern fn mrz_protected_compile(
+    mrb: *mrb_state,
+    source: [*]const u8,
+    source_length: usize,
+    source_name: ?[*:0]const u8,
+    dump_flags: u8,
+    out_bytes: *?[*]u8,
+    out_length: *usize,
+) u8;
+
 // ---- misc -------------------------------------------------------------
 
 pub extern fn mrb_obj_freeze(mrb: *mrb_state, obj: mrb_value) mrb_value;
@@ -206,11 +387,23 @@ pub extern fn mrz_exc_value(mrb: *mrb_state) mrb_value;
 pub extern fn mrz_exc_clear(mrb: *mrb_state) void;
 pub extern fn mrz_exc_set(mrb: *mrb_state, exc: mrb_value) void;
 pub extern fn mrz_set_instance_tt(cls: *RClass, tt: mrb_vtype) void;
-pub extern fn mrz_set_code_fetch_hook(mrb: *mrb_state, hook: ?*const fn (?*mrb_state, ?*const anyopaque, ?*const anyopaque, ?*anyopaque) callconv(.c) void) void;
+pub const mrz_code_fetch_observer = *const fn (
+    ?*mrb_state,
+    ?*const anyopaque,
+    ?*const anyopaque,
+    ?*anyopaque,
+) callconv(.c) mrb_value;
+pub const mrz_sandbox_context = extern struct {
+    userdata: ?*anyopaque,
+    observer: mrz_code_fetch_observer,
+};
+pub extern fn mrz_set_sandbox_context(
+    mrb: *mrb_state,
+    context: ?*mrz_sandbox_context,
+) void;
 pub extern fn mrz_ci_depth(mrb: *mrb_state) c_int;
 pub extern fn mrz_pc_catchable(irep: ?*const anyopaque, pc: ?*const anyopaque) c_int;
 pub extern fn mrz_get_ud(mrb: *mrb_state) ?*anyopaque;
-pub extern fn mrz_set_ud(mrb: *mrb_state, ud: ?*anyopaque) void;
 pub extern fn mrz_proc_irep(proc: *const anyopaque) ?*const anyopaque;
 pub extern fn mrz_parse_nerr(p: ?*const anyopaque) c_int;
 pub extern fn mrb_parse_nstring(mrb: *mrb_state, s: [*]const u8, len: usize, cxt: ?*mrb_ccontext) ?*anyopaque;
@@ -243,6 +436,7 @@ pub extern fn mrz_ptr(v: mrb_value) ?*anyopaque;
 
 pub extern fn mrz_string_ptr(v: mrb_value) ?[*]const u8;
 pub extern fn mrz_string_len(v: mrb_value) mrb_int;
+pub extern fn mrz_array_len(v: mrb_value) usize;
 
 pub extern fn mrz_nil_value() mrb_value;
 pub extern fn mrz_false_value() mrb_value;

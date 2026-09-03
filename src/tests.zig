@@ -87,7 +87,7 @@ test "nested isolate lifecycle restores outer allocator attribution" {
     defer outer.deinit();
 
     const cls = try outer.vm.defineClass("NestedLifecycle", null);
-    cls.defineClassMethod("check", "", struct {
+    try cls.defineClassMethod("check", "", struct {
         fn call(m: *mruby.Vm, self: mruby.Value) !mruby.Value {
             _ = self;
             const expected = mruby.alloc.currentIsolateCell() orelse return error.MissingOuterAttribution;
@@ -122,7 +122,7 @@ test "plain Vm retained from callback outlives its allocator Isolate" {
     var iso_live = true;
     defer if (iso_live) iso.deinit();
     const cls = try iso.vm.defineClass("RetainPlainVm", null);
-    cls.defineClassMethod("create", "", Retained.create);
+    try cls.defineClassMethod("create", "", Retained.create);
     _ = try iso.run("RetainPlainVm.create");
 
     iso.deinit();
@@ -157,10 +157,37 @@ test "captures ruby exceptions" {
     try std.testing.expectEqualStrings("boom", message);
 }
 
+test "error diagnostics preserve the pending exception until the next operation" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    try std.testing.expectError(error.RubyException, vm.loadString("raise 'original'"));
+    const exc = vm.lastError() orelse return error.MissingRubyException;
+    const class_name = exc.className();
+    defer mruby.alloc.gpa.free(class_name);
+    const message = exc.message();
+    defer mruby.alloc.gpa.free(message);
+    try std.testing.expectEqualStrings("RuntimeError", class_name);
+    try std.testing.expectEqualStrings("original", message);
+    try std.testing.expect(vm.lastError() != null);
+
+    // Starting another safe-layer operation deliberately supersedes the old
+    // diagnostic instead of making a non-raising allocation fail spuriously.
+    const recovered = try vm.stringValue("recovered");
+    try std.testing.expectEqualStrings("recovered", try recovered.asString());
+    try std.testing.expect(vm.lastError() == null);
+}
+
 test "syntax errors are ruby exceptions" {
     const vm = try mruby.Vm.init();
     defer vm.deinit();
     try std.testing.expectError(error.RubyException, vm.loadString("def oops("));
+}
+
+test "source with an interior NUL is rejected" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+    try std.testing.expectError(error.InvalidSource, vm.loadString("1\x00 + 1"));
 }
 
 test "stdlib gems are loaded" {
@@ -186,25 +213,25 @@ test "define and call zig methods" {
     defer vm.deinit();
 
     const math = try vm.defineClass("ZigMath", null);
-    math.defineMethod("add", "ii", struct {
+    try math.defineMethod("add", "ii", struct {
         fn call(m: *mruby.Vm, self: mruby.Value, a: i64, b: i64) anyerror!mruby.Value {
             _ = self;
             return m.intValue(a + b);
         }
     }.call);
-    math.defineMethod("greet", "S", struct {
+    try math.defineMethod("greet", "S", struct {
         fn call(m: *mruby.Vm, self: mruby.Value, name: []const u8) anyerror!mruby.Value {
             _ = self;
             return m.stringValue(name);
         }
     }.call);
-    math.defineMethod("opt", "i|f", struct {
+    try math.defineMethod("opt", "i|f", struct {
         fn call(m: *mruby.Vm, self: mruby.Value, a: i64, b: f64) anyerror!mruby.Value {
             _ = self;
             return m.floatValue(@as(f64, @floatFromInt(a)) + b);
         }
     }.call);
-    math.defineMethod("sum", "*", struct {
+    try math.defineMethod("sum", "*", struct {
         fn call(m: *mruby.Vm, self: mruby.Value, rest: mruby.Rest) anyerror!mruby.Value {
             _ = self;
             var total: i64 = 0;
@@ -212,7 +239,7 @@ test "define and call zig methods" {
             return m.intValue(total);
         }
     }.call);
-    math.defineClassMethod("version", "", struct {
+    try math.defineClassMethod("version", "", struct {
         fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
             _ = self;
             return m.stringValue("1.0");
@@ -238,7 +265,7 @@ test "blocks reach zig methods" {
     defer vm.deinit();
 
     const runner = try vm.defineClass("Runner", null);
-    runner.defineMethod("twice", "&", struct {
+    try runner.defineMethod("twice", "&", struct {
         fn call(m: *mruby.Vm, self: mruby.Value, blk: mruby.Value) anyerror!mruby.Value {
             _ = self;
             if (blk.isNil()) return m.raise("ArgumentError", "no block given");
@@ -257,7 +284,7 @@ test "zig errors surface as runtime errors" {
     defer vm.deinit();
 
     const bomb = try vm.defineClass("Bomb", null);
-    bomb.defineMethod("explode", "", struct {
+    try bomb.defineMethod("explode", "", struct {
         fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
             _ = self;
             _ = m;
@@ -280,7 +307,7 @@ test "zig raise surfaces custom exceptions" {
     defer vm.deinit();
 
     const guard = try vm.defineClass("Guard", null);
-    guard.defineMethod("check", "i", struct {
+    try guard.defineMethod("check", "i", struct {
         fn call(m: *mruby.Vm, self: mruby.Value, n: i64) anyerror!mruby.Value {
             _ = self;
             if (n < 0) return m.raise("ArgumentError", "negative");
@@ -296,13 +323,38 @@ test "zig raise surfaces custom exceptions" {
     try std.testing.expectEqualStrings("ArgumentError", class_name);
 }
 
+test "zig callbacks reject values owned by another Vm" {
+    const ForeignReturn = struct {
+        var value: ?mruby.Value = null;
+
+        fn call(_: *mruby.Vm, _: mruby.Value) !mruby.Value {
+            return value orelse error.MissingForeignValue;
+        }
+    };
+
+    const owner = try mruby.Vm.init();
+    defer owner.deinit();
+    const other = try mruby.Vm.init();
+    defer other.deinit();
+    ForeignReturn.value = try owner.stringValue("foreign");
+    defer ForeignReturn.value = null;
+
+    const cls = try other.defineClass("ForeignReturn", null);
+    try cls.defineClassMethod("value", "", ForeignReturn.call);
+    try std.testing.expectError(error.RubyException, other.loadString("ForeignReturn.value"));
+    const exc = other.lastError().?;
+    const message = exc.message();
+    defer mruby.alloc.gpa.free(message);
+    try std.testing.expectEqualStrings("zig error: ForeignValue", message);
+}
+
 // ---- calling Ruby from Zig -------------------------------------------------
 
 test "vm.call invokes ruby methods" {
     const vm = try mruby.Vm.init();
     defer vm.deinit();
 
-    const str = vm.stringValue("hello");
+    const str = try vm.stringValue("hello");
     const up = try vm.call(str, "upcase", .{});
     try std.testing.expectEqualStrings("HELLO", try up.asString());
 
@@ -314,18 +366,79 @@ test "vm.call invokes ruby methods" {
     try std.testing.expectError(error.RubyException, vm.call(str, "nope", .{}));
 }
 
+test "vm.call rejects a receiver owned by another Vm" {
+    const owner = try mruby.Vm.init();
+    defer owner.deinit();
+    const other = try mruby.Vm.init();
+    defer other.deinit();
+
+    const foreign = try owner.stringValue("hello");
+    try std.testing.expectError(error.ForeignValue, other.call(foreign, "upcase", .{}));
+}
+
+test "vm.call rejects arguments owned by another Vm" {
+    const owner = try mruby.Vm.init();
+    defer owner.deinit();
+    const other = try mruby.Vm.init();
+    defer other.deinit();
+
+    const receiver = try other.stringValue("hello");
+    const foreign = try owner.stringValue("!");
+    try std.testing.expectError(error.ForeignValue, other.call(receiver, "+", .{foreign}));
+}
+
 test "globals and ivars" {
     const vm = try mruby.Vm.init();
     defer vm.deinit();
 
     _ = try vm.loadString("$answer = 42");
     try std.testing.expectEqual(@as(i64, 42), try (try vm.getGlobal("answer")).asInt());
-    try vm.setGlobal("name", vm.stringValue("zig"));
+    try vm.setGlobal("name", try vm.stringValue("zig"));
     try std.testing.expectEqualStrings("zig", try (try vm.loadString("$name")).asString());
 
     const obj = try vm.loadString("Object.new");
-    try vm.setIvar(obj, "@v", vm.intValue(7));
-    try std.testing.expectEqual(@as(i64, 7), try vm.getIvar(obj, "@v").asInt());
+    try vm.setIvar(obj, "@v", try vm.intValue(7));
+    try std.testing.expectEqual(@as(i64, 7), try (try vm.getIvar(obj, "@v")).asInt());
+}
+
+test "global assignment rejects a value owned by another Vm" {
+    const owner = try mruby.Vm.init();
+    defer owner.deinit();
+    const other = try mruby.Vm.init();
+    defer other.deinit();
+
+    try std.testing.expectError(
+        error.ForeignValue,
+        other.setGlobal("foreign", try owner.stringValue("value")),
+    );
+}
+
+test "instance variable assignment rejects values owned by another Vm" {
+    const owner = try mruby.Vm.init();
+    defer owner.deinit();
+    const other = try mruby.Vm.init();
+    defer other.deinit();
+
+    const local = try other.loadString("Object.new");
+    const foreign = try owner.loadString("Object.new");
+    try std.testing.expectError(
+        error.ForeignValue,
+        other.setIvar(foreign, "@value", try other.intValue(1)),
+    );
+    try std.testing.expectError(
+        error.ForeignValue,
+        other.setIvar(local, "@value", foreign),
+    );
+}
+
+test "instance variable lookup rejects an object owned by another Vm" {
+    const owner = try mruby.Vm.init();
+    defer owner.deinit();
+    const other = try mruby.Vm.init();
+    defer other.deinit();
+
+    const foreign = try owner.loadString("Object.new");
+    try std.testing.expectError(error.ForeignValue, other.getIvar(foreign, "@value"));
 }
 
 // ---- classes ---------------------------------------------------------------
@@ -336,11 +449,45 @@ test "class lookup and constants" {
 
     _ = try vm.loadString("module LookupOuter; class Inner; end; end");
     const inner = try vm.getClass("LookupOuter::Inner");
-    inner.defineConst("MRB_ZIG", vm.intValue(1));
+    try inner.defineConst("MRB_ZIG", try vm.intValue(1));
     try std.testing.expectEqual(@as(i64, 1), try (try vm.loadString("LookupOuter::Inner::MRB_ZIG")).asInt());
 
     try std.testing.expectError(error.UnknownClass, vm.getClass("NoSuchThing"));
     try std.testing.expectError(error.UnknownClass, vm.getClass("Enumerator::Nope"));
+    try std.testing.expectError(error.UnknownClass, vm.getClass(""));
+    try std.testing.expectError(error.UnknownClass, vm.getClass("LookupOuter::"));
+
+    _ = try vm.loadString("LookupOuter::VALUE = 1");
+    try std.testing.expectError(
+        error.UnknownClass,
+        vm.getClass("LookupOuter::VALUE::Nested"),
+    );
+}
+
+test "class definition rejects a superclass owned by another Vm" {
+    const owner = try mruby.Vm.init();
+    defer owner.deinit();
+    const other = try mruby.Vm.init();
+    defer other.deinit();
+
+    const foreign_super = try owner.getClass("Object");
+    try std.testing.expectError(
+        error.ForeignValue,
+        other.defineClass("ForeignSuperclass", foreign_super),
+    );
+}
+
+test "constant definition rejects a value owned by another Vm" {
+    const owner = try mruby.Vm.init();
+    defer owner.deinit();
+    const other = try mruby.Vm.init();
+    defer other.deinit();
+
+    const namespace = try other.defineModule("ForeignConstantNamespace");
+    try std.testing.expectError(
+        error.ForeignValue,
+        namespace.defineConst("VALUE", try owner.stringValue("foreign")),
+    );
 }
 
 // ---- data wrapping ---------------------------------------------------------
@@ -359,10 +506,10 @@ test "wrap zig state in ruby objects" {
     }.destroy);
 
     const CounterImpl = struct {
-        var class_ptr: ?*mruby.c.RClass = null;
+        var class: ?mruby.Class = null;
 
         fn bump(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
-            const p = Counter.unwrap(m.mrb, self) orelse return m.raise("TypeError", "not a Counter");
+            const p = Counter.unwrap(self) orelse return m.raise("TypeError", "not a Counter");
             p.* += 1;
             return m.intValue(p.*);
         }
@@ -370,15 +517,18 @@ test "wrap zig state in ruby objects" {
         fn newCount(m: *mruby.Vm, self: mruby.Value, start: i64) anyerror!mruby.Value {
             _ = self;
             const p = try mruby.alloc.gpa.create(i32);
+            errdefer mruby.alloc.gpa.destroy(p);
             p.* = @intCast(start);
-            return Counter.wrap(m.mrb, class_ptr.?, p);
+            const cls = class orelse return error.MissingClass;
+            try cls.ensureOwnedBy(m.mrb);
+            return Counter.wrap(cls, p);
         }
     };
 
     const counter_class = try vm.defineClass("Counter", null);
-    CounterImpl.class_ptr = counter_class.class;
-    counter_class.defineMethod("bump", "", CounterImpl.bump);
-    counter_class.defineClassMethod("new_count", "i", CounterImpl.newCount);
+    CounterImpl.class = counter_class;
+    try counter_class.defineMethod("bump", "", CounterImpl.bump);
+    try counter_class.defineClassMethod("new_count", "i", CounterImpl.newCount);
 
     try std.testing.expectEqual(@as(i64, 6), try (try vm.loadString("Counter.new_count(5).bump")).asInt());
 
@@ -386,6 +536,20 @@ test "wrap zig state in ruby objects" {
     // the Zig destructor must run (the counter was bumped to 6).
     _ = try vm.loadString("GC.start");
     try std.testing.expectEqual(@as(i32, 6), destroyed_total);
+}
+
+test "data wrappers derive interpreter ownership from their handles" {
+    const Data = mruby.data.DataType(i32, "OwnedData", null);
+    const owner = try mruby.Vm.init();
+    defer owner.deinit();
+    const other = try mruby.Vm.init();
+    defer other.deinit();
+
+    const cls = try owner.defineClass("OwnedData", null);
+    var payload: i32 = 42;
+    const wrapped = try Data.wrap(cls, &payload);
+    try std.testing.expect(Data.unwrap(wrapped).? == &payload);
+    try std.testing.expect(Data.unwrap(try other.loadString("Object.new")) == null);
 }
 
 // ---- output redirection ----------------------------------------------------
@@ -404,15 +568,79 @@ test "ruby print output reaches zig writer" {
     try std.testing.expectEqualStrings("ab\n42\n", out);
 }
 
+test "ruby puts renders recursive arrays without native recursion" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buffer.deinit();
+    try mruby.output.setOutputWriter(vm, &buffer.writer);
+
+    _ = try vm.loadString("array = []; array << array; puts array");
+    const out = buffer.writer.buffer[0..buffer.writer.end];
+    try std.testing.expectEqualStrings("[...]\n", out);
+}
+
+test "output callbacks retain arguments across nested interpreter calls" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buffer.deinit();
+    try mruby.output.setOutputWriter(vm, &buffer.writer);
+
+    _ = try vm.loadString(
+        \\class OutputArgument
+        \\  def initialize(text)
+        \\    @text = text
+        \\  end
+        \\  def churn(depth)
+        \\    depth == 0 ? nil : churn(depth - 1)
+        \\  end
+        \\  def to_s
+        \\    churn(100)
+        \\    @text
+        \\  end
+        \\end
+        \\print OutputArgument.new("first"), OutputArgument.new("second")
+    );
+    const out = buffer.writer.buffer[0..buffer.writer.end];
+    try std.testing.expectEqualStrings("firstsecond", out);
+}
+
+test "puts tolerates an element mutating its containing array" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buffer.deinit();
+    try mruby.output.setOutputWriter(vm, &buffer.writer);
+
+    _ = try vm.loadString(
+        \\class ArrayMutator
+        \\  def initialize(parent)
+        \\    @parent = parent
+        \\  end
+        \\  def to_s
+        \\    100.times { @parent << "late" }
+        \\    "first"
+        \\  end
+        \\end
+        \\values = []
+        \\values << ArrayMutator.new(values) << "second"
+        \\puts values
+    );
+    const out = buffer.writer.buffer[0..buffer.writer.end];
+    try std.testing.expectEqualStrings("first\nsecond\n", out);
+}
+
 // ---- arena -----------------------------------------------------------------
 
 test "values rooted in globals survive gc churn" {
     const vm = try mruby.Vm.init();
     defer vm.deinit();
 
-    // Values returned by loadString are not GC-rooted after the call
-    // returns; to hold them across further Ruby execution, root them (a
-    // global here; ivars or the GC register API work too).
+    // A Ruby global remains a root independently of temporary arena scopes.
     _ = try vm.loadString("$held = 'i am a string'");
     var i: usize = 0;
     while (i < 100) : (i += 1) {
@@ -422,6 +650,30 @@ test "values rooted in globals survive gc churn" {
     }
     const held = try vm.getGlobal("held");
     try std.testing.expectEqualStrings("i am a string", try held.asString());
+}
+
+test "void safe-layer operations do not grow the GC arena" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    const namespace = try vm.defineModule("ArenaStable");
+    const object = try vm.loadString("Object.new");
+    const value = try vm.stringValue("rooted by assignment");
+    const before = vm.arenaScope().idx;
+
+    for (0..64) |_| {
+        try vm.setGlobal("arena_value", value);
+        try vm.setIvar(object, "@arena_value", value);
+        try namespace.defineConst("VALUE", value);
+        try namespace.defineMethod("value", "", struct {
+            fn call(m: *mruby.Vm, _: mruby.Value) !mruby.Value {
+                return m.nilValue();
+            }
+        }.call);
+    }
+
+    const after = vm.arenaScope().idx;
+    try std.testing.expectEqual(before, after);
 }
 
 // ---- robustness (regression tests for review findings) ---------------------
@@ -480,8 +732,8 @@ test "unsigned overflow in toValue errors rather than panics" {
     const vm = try mruby.Vm.init();
     defer vm.deinit();
     try std.testing.expectError(error.Overflow, mruby.convert.toValue(vm.mrb, @as(u64, std.math.maxInt(u64))));
-    // Saturation for the infallible callback helper.
-    const v = vm.intValue(@as(u64, std.math.maxInt(u64)));
+    // The callback helper saturates before performing its protected boxing.
+    const v = try vm.intValue(@as(u64, std.math.maxInt(u64)));
     try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), try v.asInt());
 }
 
@@ -555,7 +807,7 @@ test "sandbox: gas cleanup cannot erase an in-flight terminate" {
     Race.released.store(false, .release);
 
     const cls = try iso.vm.defineClass("GasCleanupRace", null);
-    cls.defineMethod("pause", "", Race.pause);
+    try cls.defineMethod("pause", "", Race.pause);
 
     var stopper = try std.Thread.spawn(.{}, Race.terminate, .{iso});
     const outcome = iso.run(
@@ -606,7 +858,7 @@ test "sandbox: deadline is arbitrated after final native work" {
     defer iso.deinit();
 
     const cls = try iso.vm.defineClass("DeadlineNative", null);
-    cls.defineMethod("wait", "", struct {
+    try cls.defineMethod("wait", "", struct {
         fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
             _ = self;
             sandbox.sleepNs(5 * std.time.ns_per_ms);
@@ -682,6 +934,21 @@ test "sandbox: typed RITE rejects embedded NUL in source name" {
             "1",
             .{ .source_name = "bad\x00name" },
         ),
+    );
+}
+
+test "sandbox: RITE compilers reject embedded NUL in source" {
+    try std.testing.expectError(
+        error.InvalidSource,
+        mruby.sandbox.compileRite(
+            std.testing.allocator,
+            "1\x00 + 1",
+            .{},
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSource,
+        mruby.sandbox.compile("1\x00 + 1"),
     );
 }
 
@@ -769,7 +1036,7 @@ test "sandbox: concurrent operations on one isolate fail instead of racing" {
     const iso = try mruby.sandbox.Isolate.spawn(.{});
     defer iso.deinit();
     const class = try iso.vm.defineClass("ConcurrentGate", null);
-    class.defineClassMethod("block", "", Gate.block);
+    try class.defineClassMethod("block", "", Gate.block);
 
     var runner = Runner{ .iso = iso };
     const thread = try std.Thread.spawn(.{}, Runner.run, .{&runner});
@@ -858,8 +1125,8 @@ test "sandbox: StateCapsule copies distinct inline symbol names during export" {
 test "sandbox: StateCapsule full-i64 Hash keys survive hash-table materialization" {
     const producer = try mruby.sandbox.Isolate.spawn(.{});
     defer producer.deinit();
-    try producer.vm.setGlobal("maximum_key", producer.vm.intValue(std.math.maxInt(i64)));
-    try producer.vm.setGlobal("minimum_key", producer.vm.intValue(std.math.minInt(i64)));
+    try producer.vm.setGlobal("maximum_key", try producer.vm.intValue(std.math.maxInt(i64)));
+    try producer.vm.setGlobal("minimum_key", try producer.vm.intValue(std.math.minInt(i64)));
     const root = try producer.run(
         \\mapping = {}
         \\index = 0
@@ -878,8 +1145,8 @@ test "sandbox: StateCapsule full-i64 Hash keys survive hash-table materializatio
     defer consumer.deinit();
     const restored = try consumer.importValue(capsule.view(), .{});
     try consumer.vm.setGlobal("wide_integer_keys", restored);
-    try consumer.vm.setGlobal("maximum_key", consumer.vm.intValue(std.math.maxInt(i64)));
-    try consumer.vm.setGlobal("minimum_key", consumer.vm.intValue(std.math.minInt(i64)));
+    try consumer.vm.setGlobal("maximum_key", try consumer.vm.intValue(std.math.maxInt(i64)));
+    try consumer.vm.setGlobal("minimum_key", try consumer.vm.intValue(std.math.minInt(i64)));
     const matches = try consumer.run(
         \\$wide_integer_keys.size == 22 &&
         \\  $wide_integer_keys[$maximum_key] == :maximum &&
@@ -896,7 +1163,7 @@ test "sandbox: StateCapsule export enforces Hash insertion work admission" {
     defer iso.deinit();
     // Seed through the C ABI because this pinned parser rejects some decimal
     // literals outside its immediate-integer range even though mrb_int is i64.
-    try iso.vm.setGlobal("hash_collision_stride", iso.vm.intValue(0x1_0000_0000));
+    try iso.vm.setGlobal("hash_collision_stride", try iso.vm.intValue(0x1_0000_0000));
     const collision_hash = try iso.run(
         \\mapping = {}
         \\index = 0
@@ -984,7 +1251,7 @@ test "sandbox: StateCapsule import distinguishes soft policy refusal" {
     @memset(source_bytes, 's');
     var capsule = try producer.exportValue(
         std.testing.allocator,
-        producer.vm.stringValue(source_bytes),
+        try producer.vm.stringValue(source_bytes),
         .{},
     );
     defer capsule.deinit(std.testing.allocator);
@@ -1498,7 +1765,7 @@ test "sandbox: StateCapsule operations reject a concurrently running Isolate" {
     const iso = try mruby.sandbox.Isolate.spawn(.{});
     defer iso.deinit();
     const class = try iso.vm.defineClass("ArtifactConcurrentGate", null);
-    class.defineClassMethod("block", "", Gate.block);
+    try class.defineClassMethod("block", "", Gate.block);
     const root = try iso.run("[1, 2]");
     var capsule = try iso.exportValue(std.testing.allocator, root, .{});
     defer capsule.deinit(std.testing.allocator);
@@ -1571,8 +1838,8 @@ test "sandbox: StateCapsule operations from same-Isolate callbacks are busy" {
     }
 
     const class = try iso.vm.defineClass("ArtifactCallback", null);
-    class.defineClassMethod("export_busy", "", Callback.exportBusy);
-    class.defineClassMethod("import_busy", "", Callback.importBusy);
+    try class.defineClassMethod("export_busy", "", Callback.exportBusy);
+    try class.defineClassMethod("import_busy", "", Callback.importBusy);
     try std.testing.expect((try iso.run("ArtifactCallback.export_busy")).isTruthy());
     try std.testing.expect((try iso.run("ArtifactCallback.import_busy")).isTruthy());
 }
@@ -2071,13 +2338,13 @@ test "sandbox: nested run from a method callback" {
             _ = self;
             const r = inner.?.run("'nested'") catch return error.NestedFailed;
             const s = r.asString() catch return error.NestedFailed;
-            _ = m.stringValue(s);
+            _ = try m.stringValue(s);
             return m.intValue(n * 2);
         }
     };
     Outer.inner = iso;
     const cls = try iso.vm.defineClass("Nested", null);
-    cls.defineMethod("scale", "i", Outer.call);
+    try cls.defineMethod("scale", "i", Outer.call);
 
     const r = try iso.run("Nested.new.scale(21)");
     try std.testing.expectEqual(@as(i64, 42), try r.asInt());
@@ -2115,7 +2382,7 @@ test "sandbox: nested callback re-entry shares the active gas generation" {
     Reenter.used_after = 0;
 
     const cls = try iso.vm.defineClass("GasReenter", null);
-    cls.defineMethod("call", "", Reenter.call);
+    try cls.defineMethod("call", "", Reenter.call);
 
     const result = try iso.run("GasReenter.new.call");
     try std.testing.expectEqual(@as(i64, 42), try result.asInt());
@@ -2142,7 +2409,7 @@ test "sandbox: nested callback cannot mint a replacement gas generation" {
     };
     Reenter.target = iso;
     const cls = try iso.vm.defineClass("GasNestedExhaust", null);
-    cls.defineMethod("call", "", Reenter.call);
+    try cls.defineMethod("call", "", Reenter.call);
 
     try std.testing.expectError(error.GasExhausted, iso.run("GasNestedExhaust.new.call"));
     const exhausted = iso.stats().gas.?;
@@ -2181,7 +2448,7 @@ test "sandbox: irep snapshots compile and run" {
     const iso = try sandbox.Isolate.spawn(.{});
     defer iso.deinit();
     const r = try iso.runImage(image);
-    const arr = try iso.call(r, "join", .{iso.vm.stringValue(",")});
+    const arr = try iso.call(r, "join", .{try iso.vm.stringValue(",")});
     const str = try arr.asString();
     try std.testing.expectEqualStrings("1,4,9", str);
 
@@ -2426,7 +2693,7 @@ test "sandbox: sealModel is the two-phase freeze_object_model" {
     // Phase 2: seal at a host-chosen time; every later run sees the same
     // frozen model the capability produces, and the load-time definitions
     // survive and stay callable.
-    iso.sealModel();
+    try iso.sealModel();
     try std.testing.expectError(error.RubyException, iso.run("class String; def later; end; end"));
     iso.vm.clearError();
     try std.testing.expectError(error.RubyException, iso.run("class NilClass; def boom; end; end"));
@@ -2436,7 +2703,7 @@ test "sandbox: sealModel is the two-phase freeze_object_model" {
     _ = try iso.run("LoadTime.new");
 
     // Idempotent: sealing again changes nothing.
-    iso.sealModel();
+    try iso.sealModel();
     try std.testing.expectError(error.RubyException, iso.run("class String; def later; end; end"));
 }
 
@@ -2463,6 +2730,31 @@ test "live allocations return to zero after teardown" {
     try std.testing.expectEqual(@as(usize, 0), mruby.alloc.liveAllocs());
 }
 
+test "vm: value-construction OOM is contained as a Ruby exception" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    var bytes: [4096]u8 = undefined;
+    @memset(&bytes, 'x');
+    const previous = mruby.alloc.gpa;
+    var failing = std.testing.FailingAllocator.init(previous, .{ .fail_index = 0 });
+    const result = blk: {
+        mruby.alloc.gpa = failing.allocator();
+        defer mruby.alloc.gpa = previous;
+        break :blk vm.stringValue(&bytes);
+    };
+
+    try std.testing.expectError(error.RubyException, result);
+    try std.testing.expect(failing.has_induced_failure);
+    const exception = vm.lastError() orelse return error.MissingRubyException;
+    const class_name = exception.className();
+    defer mruby.alloc.gpa.free(class_name);
+    try std.testing.expectEqualStrings("NoMemoryError", class_name);
+
+    vm.clearError();
+    try std.testing.expectEqualStrings("recovered", try (try vm.stringValue("recovered")).asString());
+}
+
 // ---- crash regressions -------------------------------------------------------
 
 test "vm: loadString/call results stay rooted across a later GC" {
@@ -2482,7 +2774,7 @@ test "class: omitted optional |S argument yields empty string, not a NULL deref"
     const vm = try mruby.Vm.init();
     defer vm.deinit();
     const cls = try vm.defineClass("Greeter", null);
-    cls.defineMethod("greet", "|S", struct {
+    try cls.defineMethod("greet", "|S", struct {
         fn f(m: *mruby.Vm, self: mruby.Value, name: []const u8) anyerror!mruby.Value {
             _ = self;
             var buf: [64]u8 = undefined;
@@ -2510,7 +2802,7 @@ test "sandbox: reallocating a pre-run buffer does not underflow accounting" {
     const bytes = try std.testing.allocator.alloc(u8, 5_000_000);
     defer std.testing.allocator.free(bytes);
     @memset(bytes, 'x');
-    const buf = iso.vm.stringValue(bytes);
+    const buf = try iso.vm.stringValue(bytes);
     try iso.vm.setGlobal("buf", buf);
 
     // Growing it under the isolate cell reallocs a block whose `old` exceeds
@@ -2592,7 +2884,7 @@ test "class: bool 'b' method argument round-trips" {
     const cls = try vm.defineClass("Flag", null);
     // The documented 'b' spec was a compile error (bool != 0), so any method
     // using it failed to build. Exercise it here.
-    cls.defineMethod("check", "b", struct {
+    try cls.defineMethod("check", "b", struct {
         fn f(m: *mruby.Vm, self: mruby.Value, flag: bool) anyerror!mruby.Value {
             _ = self;
             return m.stringValue(if (flag) "yes" else "no");
