@@ -36,7 +36,7 @@ std.debug.print("{d}\n", .{try result.asInt()});
 Depending on this package (once published):
 
 ```
-zig fetch --save=mruby https://github.com/nullstyle/mruby-zig/archive/refs/tags/v0.3.0.tar.gz
+zig fetch --save=mruby https://github.com/nullstyle/mruby-zig/archive/refs/tags/v0.4.0.tar.gz
 ```
 
 ```zig
