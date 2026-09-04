@@ -395,12 +395,14 @@ pub fn build(b: *std.Build) !void {
     // ABI shim: exposes mruby's macro-only inline APIs as plain functions.
     mruby_mod.addCSourceFile(.{ .file = b.path("src/shim.c"), .flags = shim_flags });
     if (worker_decision.enabled) {
+        const worker_spawn_flags_macos = [_][]const u8{ "-Wall", "-Wextra", "-pthread", no_c_fuzz_coverage };
+        const worker_spawn_flags = [_][]const u8{ "-Wall", "-Wextra", no_c_fuzz_coverage };
         mruby_mod.addCSourceFile(.{
             .file = b.path("src/worker_spawn.c"),
             .flags = if (target.result.os.tag == .macos)
-                &.{ "-Wall", "-Wextra", "-pthread" }
+                &worker_spawn_flags_macos
             else
-                &.{ "-Wall", "-Wextra" },
+                &worker_spawn_flags,
         });
         if (target.result.os.tag == .macos) {
             mruby_mod.linkSystemLibrary("pthread", .{ .use_pkg_config = .no });
@@ -677,6 +679,26 @@ pub fn build(b: *std.Build) !void {
         "fuzz the pure StateCapsule frame and graph parser",
     );
     fuzz_state_capsule_step.dependOn(&run_state_capsule_fuzz_tests.step);
+
+    // C materialization fuzz target: the same inputs driven through
+    // Isolate.importValue inside a live, memory-capped isolate.
+    const state_materialize_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/state_materialize_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    state_materialize_fuzz_mod.addImport("mruby", mruby_mod);
+    const state_materialize_fuzz_tests = b.addTest(.{ .root_module = state_materialize_fuzz_mod });
+    check_step.dependOn(&state_materialize_fuzz_tests.step);
+    const run_state_materialize_fuzz_tests = b.addRunArtifact(state_materialize_fuzz_tests);
+    test_step.dependOn(&run_state_materialize_fuzz_tests.step);
+    const fuzz_state_materialize_step = b.step(
+        "fuzz-state-materialize",
+        "fuzz StateCapsule admission and C materialization through a live isolate",
+    );
+    fuzz_state_materialize_step.dependOn(&run_state_materialize_fuzz_tests.step);
 
     // The integration suite above roots at src/tests.zig and pulls in the
     // library as an imported module, so Zig never collects the `test` blocks

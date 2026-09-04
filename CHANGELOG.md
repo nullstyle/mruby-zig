@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+Security review follow-up:
+
+- Added `zig build fuzz-state-materialize`: a coverage-guided fuzz target
+  that drives inputs through `Isolate.importValue` — envelope validation,
+  graph admission, and C-side construction of live objects — inside a
+  memory-capped isolate, closing security review finding 1. The weekly
+  scheduled fuzzing job runs it alongside the pure parser target.
+
 ## 0.4.0 (2026-09-04)
 
 Security review:

@@ -114,6 +114,7 @@ jobs:
           install: true
       - run: mise install
       - run: mise x -- zig build fuzz-state-capsule --fuzz=2000000
+      - run: mise x -- zig build fuzz-state-materialize --fuzz=500000
 
   gem-sets:
     name: gem set (${{ matrix.gem_set }})
