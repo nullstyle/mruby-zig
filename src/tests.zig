@@ -1562,6 +1562,53 @@ test "sandbox: legacy raw RITE retains its null source-name semantics" {
     try std.testing.expectEqualStrings("(null)", try (try iso.runImage(image)).asString());
 }
 
+// ---- cross-version artifact fixtures --------------------------------------
+// Byte fixtures produced by the v0.3.0 tag (see
+// src/tests_artifacts/MANIFEST.md). These pin the current build's
+// admission and restoration behavior against real older-producer bytes.
+
+test "cross-version: v0.3.0 RITE image is rejected without execution" {
+    const bytes = @embedFile("tests_artifacts/rite_image_v0_3_0.bin");
+    const iso = try spawnSealed(.{ .limits = .{
+        .gas = .{ .per_execution = 10_000 },
+    } });
+    defer iso.deinit();
+
+    // The compatibility fingerprint changed after 0.3.0 (presym digest,
+    // semantic defines, gem identity), so the old image must be rejected
+    // by classification, never parsed or executed.
+    try std.testing.expectError(
+        error.IncompatibleRiteImage,
+        iso.runRite(.{ .bytes = bytes }),
+    );
+    // The rejected execution leaves lifecycle state untouched.
+    const stats = iso.stats();
+    try std.testing.expectEqual(@as(u64, 0), stats.gas.?.generation);
+    try std.testing.expect(iso.lastError() == null);
+    // The same build's own image still executes.
+    var image = try mruby.sandbox.compileRite(std.testing.allocator, "41 + 1", .{});
+    defer image.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 42), try (try iso.runRite(image.view())).asInt());
+}
+
+test "cross-version: v0.3.0 state capsule restores into the current build" {
+    const bytes = @embedFile("tests_artifacts/state_capsule_v0_3_0.bin");
+    const iso = try spawnSealed(.{});
+    defer iso.deinit();
+
+    // Capsule envelopes carry schema identity, not a build fingerprint:
+    // format v1 stays forward-compatible across releases.
+    const restored = try iso.importValue(.{ .bytes = bytes }, .{});
+    try iso.setGlobal("restored_fixture", restored);
+    const check = try iso.run(
+        \\$restored_fixture.size == 20 &&
+        \\  $restored_fixture["0"] == [0, 0] &&
+        \\  $restored_fixture["7"] == [7, 14] &&
+        \\  $restored_fixture["19"] == [19, 38]
+    );
+    try std.testing.expect(check.isTruthy());
+}
+
 test "sandbox: invalid typed RITE leaves execution lifecycle untouched" {
     var image = try mruby.sandbox.compileRite(
         std.testing.allocator,

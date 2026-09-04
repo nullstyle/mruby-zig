@@ -116,3 +116,11 @@ the importing isolate.
 A coverage-guided fuzz target (`zig build fuzz-state-capsule`) exercises the
 pure parser, and a golden producer/consumer subprocess fixture verifies byte
 stability and restoration into a separate OS process.
+
+Cross-version fixtures in `src/tests_artifacts/` pin admission behavior
+against bytes produced by the **v0.3.0** tag (see its `MANIFEST.md` for
+provenance): the old RITE image is rejected with `IncompatibleRiteImage`
+(its compatibility fingerprint predates later presym/semantic-identity
+changes) while the old state capsule restores fully — capsule envelopes
+carry schema identity, not a build fingerprint, so format v1 is
+forward-compatible across releases.

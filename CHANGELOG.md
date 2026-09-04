@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+Cross-version artifact fixtures:
+
+- Checked-in byte fixtures produced by the v0.3.0 tag
+  (`src/tests_artifacts/`, with a provenance manifest and regeneration
+  recipe) pin cross-version behavior: a v0.3.0 RITE image is rejected
+  with `IncompatibleRiteImage` — its compatibility fingerprint predates
+  later presym and semantic-identity changes — while a v0.3.0 state
+  capsule restores completely into the current build, demonstrating that
+  capsule format v1 is forward-compatible by design.
+
 Sanitizer and platform coverage:
 
 - Added `-Dsanitize-c`, wiring C undefined-behavior detection into every
