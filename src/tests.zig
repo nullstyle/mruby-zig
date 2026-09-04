@@ -1,6 +1,7 @@
 //! Test root: `zig build test`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mruby = @import("mruby");
 const test_config = @import("test_config");
 
@@ -52,6 +53,7 @@ test "features: generated manifest matches the build" {
     try std.testing.expect(features.has_compiler);
     try std.testing.expect(features.has_debug_hook);
     try std.testing.expect(features.sandbox_supported);
+    try std.testing.expectEqual(mruby.worker.supported, features.worker_process_supported);
     try std.testing.expectEqual(@as(u16, 64), features.pointer_bits);
 
     // Identity surfaces are consistent with the artifact config.
@@ -3847,4 +3849,404 @@ test "class: bool 'b' method argument round-trips" {
     try std.testing.expectEqualStrings("yes", try yes.asString());
     const no = try vm.loadString("Flag.new.check(false)");
     try std.testing.expectEqualStrings("no", try no.asString());
+}
+
+test "worker: typed capsule input and output cross a fresh process" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    const input_schema: mruby.artifact.Schema = .{
+        .id = @splat(0x31),
+        .major = 1,
+    };
+    const output_schema: mruby.artifact.Schema = .{
+        .id = @splat(0x42),
+        .major = 1,
+    };
+
+    const source = try spawnSealed(.{});
+    defer source.deinit();
+    const input_value = try source.run("41");
+    var input_capsule = try source.exportValue(std.testing.allocator, input_value, .{
+        .schema = input_schema,
+    });
+    defer input_capsule.deinit(std.testing.allocator);
+
+    // Core print writes to C stdout. The helper must keep that stream away
+    // from its framed protocol while still returning the typed result.
+    var image = try sandbox.compileRite(
+        std.testing.allocator,
+        "print 'discarded worker output'; $input + 1",
+        .{},
+    );
+    defer image.deinit(std.testing.allocator);
+    var report = try mruby.worker.runRite(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{
+            .image = image.view(),
+            .input = .{
+                .capsule = input_capsule.view(),
+                .accepted_schema = input_schema,
+            },
+            .output_schema = output_schema,
+        },
+    );
+    defer report.deinit(std.testing.allocator);
+
+    const destination = try spawnSealed(.{});
+    defer destination.deinit();
+    switch (report.outcome) {
+        .value => |capsule| {
+            const restored = try destination.importValue(capsule.view(), .{
+                .accepted_schema = output_schema,
+            });
+            try std.testing.expectEqual(@as(i64, 42), try restored.asInt());
+        },
+        else => return error.UnexpectedWorkerOutcome,
+    }
+    try std.testing.expect(report.sandbox_stats != null);
+}
+
+test "worker: Ruby exceptions are owned after the helper exits" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    var image = try sandbox.compileRite(std.testing.allocator, "raise 'worker boom'", .{});
+    defer image.deinit(std.testing.allocator);
+    var report = try mruby.worker.runRite(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{ .image = image.view() },
+    );
+    defer report.deinit(std.testing.allocator);
+
+    switch (report.outcome) {
+        .ruby_exception => |exception| {
+            try std.testing.expectEqualStrings("RuntimeError", exception.class_name);
+            try std.testing.expectEqualStrings("worker boom", exception.message);
+            try std.testing.expect(!exception.truncated);
+        },
+        else => return error.UnexpectedWorkerOutcome,
+    }
+}
+
+test "worker: sandbox gas and malformed artifacts are typed outcomes" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    var looping_image = try sandbox.compileRite(std.testing.allocator, "while true; end", .{});
+    defer looping_image.deinit(std.testing.allocator);
+    var limited = try mruby.worker.runRite(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{
+            .image = looping_image.view(),
+            .policy = .{ .limits = .{ .gas = .{ .per_execution = 1000 } } },
+        },
+    );
+    defer limited.deinit(std.testing.allocator);
+    switch (limited.outcome) {
+        .limit => |kind| try std.testing.expectEqual(mruby.worker.LimitKind.sandbox_gas, kind),
+        else => return error.UnexpectedWorkerOutcome,
+    }
+
+    var damaged_image = try sandbox.compileRite(std.testing.allocator, "1", .{});
+    defer damaged_image.deinit(std.testing.allocator);
+    damaged_image.encoded[damaged_image.encoded.len - 1] ^= 1;
+    var rejected = try mruby.worker.runRite(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{ .image = damaged_image.view() },
+    );
+    defer rejected.deinit(std.testing.allocator);
+    switch (rejected.outcome) {
+        .artifact_rejected => |failure| {
+            try std.testing.expectEqual(mruby.worker.Phase.execute, failure.phase);
+            try std.testing.expectEqual(mruby.worker.ArtifactRejection.Reason.checksum_mismatch, failure.reason);
+        },
+        else => return error.UnexpectedWorkerOutcome,
+    }
+}
+
+test "worker: supervisor deadline hard-kills and reaps runaway Ruby" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    var image = try sandbox.compileRite(std.testing.allocator, "while true; end", .{});
+    defer image.deinit(std.testing.allocator);
+    var report = try mruby.worker.runRite(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{
+            .image = image.view(),
+            .process = .{
+                .wall_time_ns = 100 * std.time.ns_per_ms,
+                .cpu_seconds = 30,
+            },
+        },
+    );
+    defer report.deinit(std.testing.allocator);
+    switch (report.outcome) {
+        .limit => |kind| try std.testing.expectEqual(mruby.worker.LimitKind.process_wall, kind),
+        else => return error.UnexpectedWorkerOutcome,
+    }
+}
+
+test "worker: process CPU exhaustion is a typed limit" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    var image = try sandbox.compileRite(std.testing.allocator, "while true; end", .{});
+    defer image.deinit(std.testing.allocator);
+    var report = try mruby.worker.runRite(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{
+            .image = image.view(),
+            .process = .{
+                .wall_time_ns = 5 * std.time.ns_per_s,
+                .cpu_seconds = 1,
+            },
+        },
+    );
+    defer report.deinit(std.testing.allocator);
+    switch (report.outcome) {
+        .limit => |kind| try std.testing.expectEqual(mruby.worker.LimitKind.process_cpu, kind),
+        else => return error.UnexpectedWorkerOutcome,
+    }
+}
+
+test "worker: inherited SIGXCPU ignore and mask cannot disable CPU exhaustion" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    var image = try sandbox.compileRite(std.testing.allocator, "while true; end", .{});
+    defer image.deinit(std.testing.allocator);
+    var report = try mruby.worker.runRite(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_signal_fixture,
+        .{
+            .image = image.view(),
+            .process = .{
+                .wall_time_ns = 5 * std.time.ns_per_s,
+                .cpu_seconds = 1,
+            },
+        },
+    );
+    defer report.deinit(std.testing.allocator);
+    switch (report.outcome) {
+        .limit => |kind| try std.testing.expectEqual(mruby.worker.LimitKind.process_cpu, kind),
+        else => return error.UnexpectedWorkerOutcome,
+    }
+}
+
+test "worker: a complete frame still requires clean helper exit" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    try std.testing.expectError(
+        error.WorkerFailed,
+        mruby.worker.runRite(
+            std.testing.io,
+            std.testing.allocator,
+            test_config.worker_descendant_fixture,
+            .{ .image = .{ .bytes = "fixture:exit-nonzero" } },
+        ),
+    );
+}
+
+test "worker: an empty helper response fails closed at EOF" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    try std.testing.expectError(
+        error.TransportFailure,
+        mruby.worker.runRite(
+            std.testing.io,
+            std.testing.allocator,
+            test_config.worker_descendant_fixture,
+            .{ .image = .{ .bytes = "fixture:exit-without-response" } },
+        ),
+    );
+}
+
+test "worker: a helper cannot hang after closing a complete response" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    try std.testing.expectError(
+        error.WorkerFailed,
+        mruby.worker.runRite(
+            std.testing.io,
+            std.testing.allocator,
+            test_config.worker_descendant_fixture,
+            .{
+                .image = .{ .bytes = "fixture:frame-and-hang" },
+                .process = .{
+                    .wall_time_ns = 100 * std.time.ns_per_ms,
+                    .cpu_seconds = 30,
+                },
+            },
+        ),
+    );
+}
+
+test "worker: successful one-shot execution kills remaining descendants" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(tmp_path);
+    const sentinel_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/survived",
+        .{tmp_path},
+    );
+    defer std.testing.allocator.free(sentinel_path);
+
+    var report = try mruby.worker.runRite(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_descendant_fixture,
+        .{
+            .image = .{ .bytes = sentinel_path },
+            .process = .{
+                .wall_time_ns = 5 * std.time.ns_per_s,
+                .cpu_seconds = 1,
+            },
+        },
+    );
+    defer report.deinit(std.testing.allocator);
+    switch (report.outcome) {
+        .limit => |kind| try std.testing.expectEqual(
+            mruby.worker.LimitKind.script_terminated,
+            kind,
+        ),
+        else => return error.UnexpectedWorkerOutcome,
+    }
+
+    try std.Io.sleep(
+        std.testing.io,
+        std.Io.Duration.fromNanoseconds(3 * std.time.ns_per_s),
+        .awake,
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(std.testing.io, "survived", .{}),
+    );
+}
+
+test "worker: Linux address-space exhaustion remains a typed limit when Ruby rescues" {
+    if (!mruby.worker.supported or builtin.os.tag != .linux or test_config.sanitize_thread) {
+        return error.SkipZigTest;
+    }
+
+    const source =
+        \\begin
+        \\  chunks = []
+        \\  while true
+        \\    chunks << ("x" * 1_048_576)
+        \\  end
+        \\rescue NoMemoryError
+        \\  42
+        \\end
+    ;
+    var image = try sandbox.compileRite(std.testing.allocator, source, .{});
+    defer image.deinit(std.testing.allocator);
+    var report = try mruby.worker.runRite(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{
+            .image = image.view(),
+            .process = .{
+                .wall_time_ns = 10 * std.time.ns_per_s,
+                .cpu_seconds = 5,
+                .address_space = .{ .bytes = 128 * 1024 * 1024 },
+            },
+        },
+    );
+    defer report.deinit(std.testing.allocator);
+    switch (report.outcome) {
+        .limit => |kind| try std.testing.expectEqual(
+            mruby.worker.LimitKind.process_address_space,
+            kind,
+        ),
+        else => return error.UnexpectedWorkerOutcome,
+    }
+    try std.testing.expect(report.sandbox_stats != null);
+}
+
+test "worker: inherited Linux address-space ceilings remain typed limits" {
+    if (!mruby.worker.supported or builtin.os.tag != .linux or test_config.sanitize_thread) {
+        return error.SkipZigTest;
+    }
+
+    const source =
+        \\chunks = []
+        \\while true
+        \\  chunks << ("x" * 1_048_576)
+        \\end
+    ;
+    var image = try sandbox.compileRite(std.testing.allocator, source, .{});
+    defer image.deinit(std.testing.allocator);
+    var report = try mruby.worker.runRite(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_address_space_fixture,
+        .{
+            .image = image.view(),
+            .process = .{
+                .wall_time_ns = 10 * std.time.ns_per_s,
+                .cpu_seconds = 5,
+            },
+        },
+    );
+    defer report.deinit(std.testing.allocator);
+    switch (report.outcome) {
+        .limit => |kind| try std.testing.expectEqual(
+            mruby.worker.LimitKind.process_address_space,
+            kind,
+        ),
+        else => return error.UnexpectedWorkerOutcome,
+    }
+}
+
+test "worker: Linux pre-body address-space refusal survives a closed request pipe" {
+    if (!mruby.worker.supported or builtin.os.tag != .linux or test_config.sanitize_thread) {
+        return error.SkipZigTest;
+    }
+
+    const image_bytes = try std.testing.allocator.alloc(u8, 2 * 1024 * 1024);
+    defer std.testing.allocator.free(image_bytes);
+    @memset(image_bytes, 0);
+
+    var report = try mruby.worker.runRite(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{
+            .image = .{ .bytes = image_bytes },
+            .policy = .{ .artifacts = .{ .limits = .{
+                .max_rite_bytes = image_bytes.len,
+            } } },
+            .process = .{
+                .wall_time_ns = 5 * std.time.ns_per_s,
+                .cpu_seconds = 5,
+                .address_space = .{ .bytes = 1 },
+            },
+        },
+    );
+    defer report.deinit(std.testing.allocator);
+    switch (report.outcome) {
+        .limit => |kind| try std.testing.expectEqual(
+            mruby.worker.LimitKind.process_address_space,
+            kind,
+        ),
+        else => return error.UnexpectedWorkerOutcome,
+    }
 }

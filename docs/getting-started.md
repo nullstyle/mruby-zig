@@ -41,12 +41,24 @@ zig fetch --save=mruby https://github.com/nullstyle/mruby-zig/archive/refs/tags/
 
 ```zig
 // build.zig
-const dep = b.dependency("mruby", .{});
+const target = b.standardTargetOptions(.{});
+const optimize = b.standardOptimizeOption(.{});
+const dep = b.dependency("mruby", .{
+    .target = target,
+    .optimize = optimize,
+});
 exe.root_module.addImport("mruby", dep.module("mruby"));
+
+// Only needed for mruby.worker.runRite: install the helper built with the
+// same target, gem set, and compatibility fingerprint as the module.
+const worker = dep.artifact("mruby-worker");
+b.installArtifact(worker);
 ```
 
-The entire C library is compiled into the module — consumers link nothing
-else and need no Ruby toolchain at build time.
+The entire C library is compiled into the module — in-process consumers link
+nothing else and need no Ruby toolchain at build time. Process-isolated users
+must deploy that separate helper and pass its explicit path to
+`mruby.worker.runRite`; see [workers.md](workers.md).
 
 ## Gem configuration
 
@@ -124,6 +136,12 @@ if (mruby.features.hasGem("mruby-time")) {
 | `pointer_bits`, `endian` | Target constraints (the package requires 64-bit targets) |
 | `has_compiler`, `has_debug_hook` | Always true today: codegen and the sandbox's instruction hook are linked into every build; a future runtime-only profile would flip them |
 | `sandbox_supported` | Debug hook compiled in and the target satisfies the ABI constraint |
+| `worker_process_supported` | The target can run the bundled one-shot worker tier (currently 64-bit Linux and macOS) |
+
+`mruby.alloc.backingAllocationFailures()` exposes a saturating, monotonic
+process-wide diagnostic count of backing-allocator rejections. The worker
+samples it to preserve finite address-space failures as typed limit outcomes,
+even if Ruby rescues the immediate `NoMemoryError`.
 
 ## Development commands
 
@@ -159,4 +177,5 @@ mise run ci -- --job gem-sets --matrix gem_set:minimal --pull=false
 
 See [safe-api.md](safe-api.md) for the embedding API,
 [sandboxing.md](sandboxing.md) for policy and threat model, and
-[artifacts.md](artifacts.md) for compiled images and state transfer.
+[artifacts.md](artifacts.md) for compiled images and state transfer. The
+[worker guide](workers.md) covers fresh-process execution and deployment.

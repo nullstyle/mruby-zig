@@ -56,6 +56,7 @@ pub var gpa: std.mem.Allocator = configuredAllocator();
 var any_allocation = std.atomic.Value(bool).init(false);
 var live_bytes = std.atomic.Value(usize).init(0);
 var live_allocs = std.atomic.Value(usize).init(0);
+var backing_allocation_failures = std.atomic.Value(usize).init(0);
 
 /// Replace the configured allocator backing all mruby heaps. Must be called
 /// before the first `Vm` is initialized (i.e. before any mruby allocation).
@@ -74,6 +75,26 @@ pub fn liveBytes() usize {
 /// Approximate number of live mruby allocations.
 pub fn liveAllocs() usize {
     return live_allocs.load(.monotonic);
+}
+
+/// Monotonic process-wide count of allocation requests rejected by the
+/// backing allocator (as distinct from an Isolate policy cap). The worker
+/// supervisor samples this to make OS address-space exhaustion sticky even
+/// when Ruby rescues the immediate `NoMemoryError`.
+pub fn backingAllocationFailures() usize {
+    return backing_allocation_failures.load(.acquire);
+}
+
+fn noteBackingAllocationFailure() void {
+    var current = backing_allocation_failures.load(.monotonic);
+    while (current != std.math.maxInt(usize)) {
+        current = backing_allocation_failures.cmpxchgWeak(
+            current,
+            current + 1,
+            .release,
+            .monotonic,
+        ) orelse return;
+    }
 }
 
 /// Per-isolate accounting for the sandboxing layer. The allocator
@@ -396,7 +417,10 @@ export fn mrb_basic_alloc_func(p: ?*anyopaque, size: usize) callconv(.c) ?*anyop
             return @ptrCast(new_raw + header_bytes);
         }
 
-        const new_raw = gpa.rawAlloc(total, .fromByteUnits(header_align), @returnAddress()) orelse return null;
+        const new_raw = gpa.rawAlloc(total, .fromByteUnits(header_align), @returnAddress()) orelse {
+            noteBackingAllocationFailure();
+            return null;
+        };
         // Copy only what fits the new buffer: on a shrink (size < old) both
         // slices must be `size` long — @memcpy requires equal lengths, so the
         // source must be clamped too, not just the destination.
@@ -411,7 +435,10 @@ export fn mrb_basic_alloc_func(p: ?*anyopaque, size: usize) callconv(.c) ?*anyop
         return @ptrCast(new_raw + header_bytes);
     }
 
-    const raw = gpa.rawAlloc(total, .fromByteUnits(header_align), @returnAddress()) orelse return null;
+    const raw = gpa.rawAlloc(total, .fromByteUnits(header_align), @returnAddress()) orelse {
+        noteBackingAllocationFailure();
+        return null;
+    };
     writeHeader(raw, .{ .size = size, .owner = owner });
     _ = live_bytes.fetchAdd(size, .monotonic);
     _ = live_allocs.fetchAdd(1, .monotonic);
@@ -496,4 +523,15 @@ test "roundtrip alloc/realloc/free" {
     _ = mrb_basic_alloc_func(p2, 0);
     try std.testing.expectEqual(@as(usize, 0), liveBytes());
     try std.testing.expectEqual(@as(usize, 0), liveAllocs());
+}
+
+test "backing allocator failures are counted separately" {
+    const previous = gpa;
+    var failing = std.testing.FailingAllocator.init(previous, .{ .fail_index = 0 });
+    gpa = failing.allocator();
+    defer gpa = previous;
+
+    const before = backingAllocationFailures();
+    try std.testing.expect(mrb_basic_alloc_func(null, 1) == null);
+    try std.testing.expectEqual(before + 1, backingAllocationFailures());
 }

@@ -27,9 +27,9 @@
 //! time. Keep callbacks bounded; they may poll `Isolate.pendingTermination`
 //! for an external or already-recorded cause.
 //!
-//! Out-of-process isolates (worker processes with IPC, OS-level memory
-//! separation) are a planned follow-up tier; the in-process API here is
-//! designed to front it unchanged.
+//! For a fresh-process boundary, `mruby.worker.runRite` exposes a smaller
+//! one-shot interface around this machinery: typed RITE and StateCapsules in,
+//! a typed capsule or failure out, with OS-level supervision on Linux/macOS.
 
 const std = @import("std");
 const c = @import("c.zig");

@@ -87,6 +87,15 @@ pub const has_compiler: bool = true;
 /// must be compiled in and the target must satisfy the ABI constraint.
 pub const sandbox_supported: bool = has_debug_hook and pointer_bits == 64;
 
+/// Whether this target supports the bundled one-shot worker-process tier.
+/// The first implementation deliberately limits its OS-level enforcement
+/// contract to 64-bit Linux and macOS.
+pub const worker_process_supported: bool = sandbox_supported and
+    std.process.can_spawn and switch (@import("builtin").os.tag) {
+    .linux, .macos => true,
+    else => false,
+};
+
 comptime {
     if (sandbox_supported and @bitSizeOf(usize) != pointer_bits) {
         @compileError("features.sandbox_supported disagrees with the compiled target");

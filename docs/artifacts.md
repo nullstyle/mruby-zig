@@ -21,16 +21,16 @@ var image = try mruby.sandbox.compileRite(allocator, worker_source, .{
 });
 defer image.deinit(allocator);
 
-var worker_boot = try mruby.sandbox.BootstrapIsolate.spawn(
+var iso_boot = try mruby.sandbox.BootstrapIsolate.spawn(
     mruby.sandbox.Policy.trusted(.{
         .artifacts = .{ .application = app },
     }),
 );
-defer worker_boot.deinit();
-const worker = try worker_boot.seal();
-defer worker.deinit();
+defer iso_boot.deinit();
+const iso = try iso_boot.seal();
+defer iso.deinit();
 
-const result = try worker.runRite(image.view());
+const result = try iso.runRite(image.view());
 ```
 
 `source_name` controls `__FILE__` even when debug information is omitted.
@@ -38,7 +38,9 @@ const result = try worker.runRite(image.view());
 `compileRite` to `deinit`. Across a process boundary, send
 `image.view().bytes` and construct `.{ .bytes = received_bytes }` at the
 destination. Every `runRite` revalidates the envelope, checksum, generated
-compatibility fingerprint, application fingerprint, and byte ceiling.
+compatibility fingerprint, application fingerprint, and byte ceiling. For
+application-independent images executed in a disposable OS process, see the
+one-shot [worker guide](workers.md).
 
 ### Compatibility policy
 

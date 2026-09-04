@@ -34,6 +34,7 @@ pub const convert = @import("convert.zig");
 pub const alloc = @import("alloc.zig");
 pub const artifact = @import("artifact.zig");
 pub const sandbox = @import("sandbox.zig");
+pub const worker = @import("worker.zig");
 pub const features = @import("features.zig");
 
 /// Test-build-only access to private seams used by standalone fuzz targets.
@@ -57,4 +58,5 @@ test {
     _ = @import("artifact.zig");
     _ = @import("artifact_value.zig");
     _ = @import("sandbox.zig");
+    _ = @import("worker.zig");
 }

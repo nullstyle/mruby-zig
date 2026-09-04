@@ -45,6 +45,10 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const sanitize_thread = b.option(bool, "sanitize-thread", "enable ThreadSanitizer") orelse false;
+    const worker_supported = switch (target.result.os.tag) {
+        .linux, .macos => target.result.ptrBitWidth() == 64,
+        else => false,
+    };
 
     const allocator_name = b.option(
         []const u8,
@@ -271,6 +275,15 @@ pub fn build(b: *std.Build) !void {
         break :flags f.items;
     };
 
+    // The worker wire format is VM-independent and shared by the public
+    // controller module and the separately linked helper executable.
+    const worker_protocol_mod = b.createModule(.{
+        .root_source_file = b.path("src/worker_protocol.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+    });
+
     const mruby_mod = b.addModule("mruby", .{
         .root_source_file = b.path("src/mruby.zig"),
         .target = target,
@@ -278,6 +291,7 @@ pub fn build(b: *std.Build) !void {
         .sanitize_thread = sanitize_thread,
         .link_libc = true,
     });
+    mruby_mod.addImport("worker_protocol", worker_protocol_mod);
     const allocator_config = b.addOptions();
     allocator_config.addOption(bool, "use_arena", allocator_profile == .arena);
     mruby_mod.addOptions("allocator_config", allocator_config);
@@ -323,6 +337,18 @@ pub fn build(b: *std.Build) !void {
     }
     // ABI shim: exposes mruby's macro-only inline APIs as plain functions.
     mruby_mod.addCSourceFile(.{ .file = b.path("src/shim.c"), .flags = shim_flags });
+    if (worker_supported) {
+        mruby_mod.addCSourceFile(.{
+            .file = b.path("src/worker_spawn.c"),
+            .flags = if (target.result.os.tag == .macos)
+                &.{ "-Wall", "-Wextra", "-pthread" }
+            else
+                &.{ "-Wall", "-Wextra" },
+        });
+        if (target.result.os.tag == .macos) {
+            mruby_mod.linkSystemLibrary("pthread", .{ .use_pkg_config = .no });
+        }
+    }
     mruby_mod.addIncludePath(try root.join(arena, "include"));
     mruby_mod.addIncludePath(lib_presym_dir);
     for (gem_include_dirs.items) |dir| mruby_mod.addIncludePath(dir);
@@ -331,6 +357,107 @@ pub fn build(b: *std.Build) !void {
         "check",
         "compile all tests, tools, and examples without running them",
     );
+
+    // One-shot process-isolated RITE worker. The controller takes this exact
+    // path explicitly; it never searches PATH or guesses an install layout.
+    // Do not add the POSIX-only helper to unsupported target graphs.
+    var worker_mod_for_tests: ?*std.Build.Module = null;
+    var worker_descendant_fixture: ?*std.Build.Step.Compile = null;
+    var worker_signal_fixture: ?*std.Build.Step.Compile = null;
+    var worker_address_space_fixture: ?*std.Build.Step.Compile = null;
+    var worker_sigchld_fixture: ?*std.Build.Step.Compile = null;
+    const worker_executable: ?*std.Build.Step.Compile = if (worker_supported) worker: {
+        const worker_mod = b.createModule(.{
+            .root_source_file = b.path("tools/mruby_worker.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+        });
+        worker_mod.addImport("mruby", mruby_mod);
+        worker_mod.addImport("worker_protocol", worker_protocol_mod);
+        worker_mod_for_tests = worker_mod;
+        const executable = b.addExecutable(.{
+            .name = "mruby-worker",
+            .root_module = worker_mod,
+        });
+        check_step.dependOn(&executable.step);
+        b.installArtifact(executable);
+
+        const descendant_fixture_mod = b.createModule(.{
+            .root_source_file = b.path("tools/worker_descendant_fixture.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+        });
+        descendant_fixture_mod.addImport("worker_protocol", worker_protocol_mod);
+        const descendant_fixture = b.addExecutable(.{
+            .name = "worker-descendant-fixture",
+            .root_module = descendant_fixture_mod,
+        });
+        check_step.dependOn(&descendant_fixture.step);
+        worker_descendant_fixture = descendant_fixture;
+
+        const signal_fixture_config = b.addOptions();
+        signal_fixture_config.addOptionPath("worker_executable", executable.getEmittedBin());
+        const signal_fixture_mod = b.createModule(.{
+            .root_source_file = b.path("tools/worker_signal_fixture.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+        });
+        signal_fixture_mod.addOptions("worker_signal_fixture_config", signal_fixture_config);
+        const signal_fixture = b.addExecutable(.{
+            .name = "worker-signal-fixture",
+            .root_module = signal_fixture_mod,
+        });
+        check_step.dependOn(&signal_fixture.step);
+        worker_signal_fixture = signal_fixture;
+
+        if (target.result.os.tag == .linux) {
+            const address_space_fixture_config = b.addOptions();
+            address_space_fixture_config.addOptionPath(
+                "worker_executable",
+                executable.getEmittedBin(),
+            );
+            const address_space_fixture_mod = b.createModule(.{
+                .root_source_file = b.path("tools/worker_address_space_fixture.zig"),
+                .target = target,
+                .optimize = optimize,
+                .sanitize_thread = sanitize_thread,
+            });
+            address_space_fixture_mod.addOptions(
+                "worker_address_space_fixture_config",
+                address_space_fixture_config,
+            );
+            const address_space_fixture = b.addExecutable(.{
+                .name = "worker-address-space-fixture",
+                .root_module = address_space_fixture_mod,
+            });
+            check_step.dependOn(&address_space_fixture.step);
+            worker_address_space_fixture = address_space_fixture;
+        }
+
+        const sigchld_fixture_config = b.addOptions();
+        sigchld_fixture_config.addOptionPath("worker_executable", executable.getEmittedBin());
+        const sigchld_fixture_mod = b.createModule(.{
+            .root_source_file = b.path("tools/worker_sigchld_fixture.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+        });
+        sigchld_fixture_mod.addImport("mruby", mruby_mod);
+        sigchld_fixture_mod.addOptions(
+            "worker_sigchld_fixture_config",
+            sigchld_fixture_config,
+        );
+        const sigchld_fixture = b.addExecutable(.{
+            .name = "worker-sigchld-fixture",
+            .root_module = sigchld_fixture_mod,
+        });
+        check_step.dependOn(&sigchld_fixture.step);
+        worker_sigchld_fixture = sigchld_fixture;
+        break :worker executable;
+    } else null;
 
     // REPL tool.
     const repl_mod = b.createModule(.{
@@ -374,12 +501,44 @@ pub fn build(b: *std.Build) !void {
     test_config.addOption(bool, "has_random", hasGem(selected_gems, "mruby-random"));
     test_config.addOption(bool, "has_time", hasGem(selected_gems, "mruby-time"));
     test_config.addOption(bool, "has_object_space", hasGem(selected_gems, "mruby-objectspace"));
+    test_config.addOption(bool, "sanitize_thread", sanitize_thread);
+    if (worker_executable) |executable| {
+        test_config.addOptionPath("worker_executable", executable.getEmittedBin());
+    } else {
+        test_config.addOption([]const u8, "worker_executable", "");
+    }
+    if (worker_descendant_fixture) |fixture| {
+        test_config.addOptionPath("worker_descendant_fixture", fixture.getEmittedBin());
+    } else {
+        test_config.addOption([]const u8, "worker_descendant_fixture", "");
+    }
+    if (worker_signal_fixture) |fixture| {
+        test_config.addOptionPath("worker_signal_fixture", fixture.getEmittedBin());
+    } else {
+        test_config.addOption([]const u8, "worker_signal_fixture", "");
+    }
+    if (worker_address_space_fixture) |fixture| {
+        test_config.addOptionPath("worker_address_space_fixture", fixture.getEmittedBin());
+    } else {
+        test_config.addOption([]const u8, "worker_address_space_fixture", "");
+    }
     test_mod.addOptions("test_config", test_config);
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     check_step.dependOn(&unit_tests.step);
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "run unit and integration tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    if (worker_mod_for_tests) |worker_mod| {
+        const worker_tests = b.addTest(.{ .root_module = worker_mod });
+        check_step.dependOn(&worker_tests.step);
+        const run_worker_tests = b.addRunArtifact(worker_tests);
+        test_step.dependOn(&run_worker_tests.step);
+    }
+    if (worker_sigchld_fixture) |fixture| {
+        const run_sigchld_fixture = b.addRunArtifact(fixture);
+        test_step.dependOn(&run_sigchld_fixture.step);
+    }
 
     const artifact_identity_test_mod = b.createModule(.{
         .root_source_file = b.path("build/artifact_identity.zig"),
@@ -430,6 +589,11 @@ pub fn build(b: *std.Build) !void {
     check_step.dependOn(&mod_tests.step);
     const run_mod_tests = b.addRunArtifact(mod_tests);
     test_step.dependOn(&run_mod_tests.step);
+
+    const worker_protocol_tests = b.addTest(.{ .root_module = worker_protocol_mod });
+    check_step.dependOn(&worker_protocol_tests.step);
+    const run_worker_protocol_tests = b.addRunArtifact(worker_protocol_tests);
+    test_step.dependOn(&run_worker_protocol_tests.step);
 
     // A real producer and consumer executable exchange the encoded capsule
     // through captured stdout/stdin. They are separately linked OS processes;

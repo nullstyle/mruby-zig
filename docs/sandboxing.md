@@ -158,7 +158,9 @@ report prospective generation 0; actual requests start at generation 1.
   caps constrain only allocations attributed to the Isolate, not CPU time.
   Keep callbacks bounded. They may poll `iso.pendingTermination()` for an
   external or already-recorded cause; a lifetime deadline is also arbitrated
-  when the native call returns.
+  when the native call returns. For typed RITE jobs that need a hard outer
+  deadline even when the VM hook cannot run, use the fresh-process
+  [`worker.runRite`](workers.md) tier.
 - **Boundaries**: the final charged opcode may finish with `remaining == 0`
   and `exhausted == false`; exhaustion is observed on the next fetch. A zero
   limit admits no charged opcode, but bounded uncharged delivery work may run
@@ -211,15 +213,26 @@ configuration or plugin code the host authored, ships, or curates, with
 resource ceilings and capability stripping to contain bugs, runaway loops,
 and accidental abuse.
 
-**Not covered** (by design, same as v8 isolates): no address-space
-separation from the host. A determined adversary with the full language
-surface — including bugs in mruby, its gems, or host callbacks — can corrupt
-the process. Do not run genuinely hostile input in-process. The planned
-out-of-process tier (worker processes with IPC: run/call/terminate/stats
-plus structured value transfer, OS-level memory separation and optional
-seccomp/pledge) fronts this same API; typed RITE images give those workers
-cheap warm-starts, and StateCapsules provide deliberate structured value
-transfer (see [artifacts.md](artifacts.md)).
+**Not covered in-process**: there is no address-space separation from the
+host. A determined adversary with the full language surface — including bugs
+in mruby, its gems, or host callbacks — can corrupt the process. Do not run
+genuinely hostile input in-process.
+
+`mruby.worker.runRite` provides the first out-of-process tier for one-shot
+jobs. It starts a fresh helper, transfers only typed RITE and StateCapsule
+bytes, applies a hard parent deadline and CPU limit, optionally caps the Linux
+address space, and always reaps the direct child before returning. It does not
+front the stateful Isolate API: there is no source compilation, persistent
+session, arbitrary method call, custom host bootstrap, or explicit terminate
+operation across the process boundary.
+
+The helper is still not a complete hostile-code sandbox. It runs as the same
+OS user and currently has no syscall filter, filesystem jail, network
+namespace, or privilege separation. The default gems omit filesystem,
+network, and general I/O access, but custom gem selections can add that
+authority. Authenticate executable artifacts and add an external
+OS/container sandbox where fully hostile code is in scope. See
+[workers.md](workers.md) for the exact platform and enforcement contract.
 
 Run `examples/sandbox.zig` (`zig build run-sandbox`) for a runnable
 end-to-end tour of presets, limits, sealing, and host access.

@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+One-shot worker processes:
+
+- Added `mruby.worker.runRite`, a synchronous fresh-process boundary for one
+  typed RITE image, an optional StateCapsule exposed as `$input`, and a typed
+  StateCapsule result. Ruby exceptions, sandbox/process limits, and artifact
+  rejection are structured outcomes with owned diagnostics; transport,
+  protocol, spawn, and helper-setup failures remain errors.
+- The installed `mruby-worker` helper uses a bounded, versioned private wire
+  format, receives an empty environment, separates guest stdout from the
+  protocol, applies CPU/core limits before body allocation, supports finite
+  Linux `RLIMIT_AS`, and is hard-killed and reaped under one parent boot-clock
+  deadline. The controller revalidates every returned StateCapsule before
+  exposing it. Its `posix_spawn` seam also keeps failed launches from leaking
+  pipes or zombies. A backing allocation failure under `RLIMIT_AS` remains a
+  typed process-address-space limit even if Ruby rescues its immediate
+  `NoMemoryError`.
+- Added `mruby.features.worker_process_supported`, integration coverage for
+  typed transfer, exceptions, artifact/gas failures, and hard timeout cleanup,
+  plus a deployment and threat-model guide. The worker tier supports Linux and
+  macOS, but does not yet provide syscall, filesystem, network, or user-identity
+  confinement.
+
 Post-seal host-operation accounting:
 
 - Allocating host operations invoked through the sealed `Isolate` interface
