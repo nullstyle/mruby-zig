@@ -23,12 +23,41 @@ Production-safe Zig API:
   policy setup neither requires nor executes guest `method_undefined` hooks.
 - Gem selection is a tested, fallible dependency resolver with deterministic
   topological ordering and explicit diagnostics for unknown options.
+- Added `-Dallocator=libc|arena` build profiles and a compile-only `check`
+  step. The legacy `-Dstdlib-gems` spelling maps to the current standard or
+  minimal gem set and rejects conflicts with `-Dgem-set`.
+- Added `Vm.loadStringWithOptions` source names, so `__FILE__`, diagnostics,
+  and backtraces carry host-provided source identity.
+- Added `Vm.callWithOptions` for passing Ruby blocks and removed the fixed
+  eight-positional-argument limit from `Vm.call`.
+- Added direct nested class/module and constant operations on `Class`, with
+  protected exception handling and VM ownership checks.
+- Added typed `Array` and `Hash` handles, construction and controlled mutation,
+  conversion integration, and a hash lookup result that distinguishes missing
+  keys from present Ruby `nil`.
+- Added `Vm.root` and `RootedValue` for values that must outlive a GC arena
+  scope. Roots have explicit release, enforce VM ownership, and safely
+  reference-count duplicate roots for the same mruby object.
+- Numeric and Boolean conversion semantics are now explicit: `Vm.intValue`
+  returns `error.Overflow`, `Vm.saturatingIntValue` opts into clamping, finite
+  Float conversions report destination overflow, and
+  `convert.fromValue(bool, ...)` accepts only Ruby `true` or `false`.
+- `RubyError.message` and `className` now take a caller-selected allocator and
+  report allocation or diagnostic failures instead of returning an ambiguous
+  empty string. `RubyError.details` captures owned class, message, and bounded
+  backtrace data; sandbox diagnostics use inert metadata without guest
+  dispatch.
 
 Migration:
 
 - Add `try`/`catch` around `Vm.intValue`, `floatValue`, and `stringValue`;
   `Class.defineMethod`, `defineClassMethod`, `defineModuleFunction`, and
   `defineConst`; `data.DataType.wrap`; and `Isolate.sealModel`.
+- Pass an allocator to `RubyError.message` and `RubyError.className`, and free
+  the result with that same allocator. Use `Vm.saturatingIntValue` if the old
+  clamping behavior is required. Code that converted arbitrary Ruby truthy or
+  falsey values to Zig `bool` must now check truthiness explicitly or pass an
+  actual Ruby Boolean.
 - Replace `DataType.wrap(mrb, class_ptr, ptr)` with `DataType.wrap(class, ptr)`
   and `DataType.unwrap(mrb, value)` with `DataType.unwrap(value)`.
 - Handle the new error union from `Vm.getIvar`. Use `Class.asValue()` when a

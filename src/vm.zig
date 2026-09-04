@@ -10,9 +10,24 @@ const convert = @import("convert.zig");
 const alloc_mod = @import("alloc.zig");
 
 pub const Value = value_mod.Value;
+pub const Array = value_mod.Array;
+pub const Hash = value_mod.Hash;
+pub const HashEntry = value_mod.HashEntry;
 pub const RubyError = error_mod.RubyError;
 pub const Class = class_mod.Class;
 pub const Rest = class_mod.Rest;
+pub const RootedValue = arena_mod.RootedValue;
+
+pub const LoadOptions = struct {
+    /// Ruby source identity used by `__FILE__`, syntax diagnostics, and
+    /// backtraces. Null retains mruby's default `"(eval)"` identity.
+    source_name: ?[]const u8 = null,
+};
+
+pub const CallOptions = struct {
+    /// Proc passed as the Ruby block. mruby applies `to_proc` to other values.
+    block: ?Value = null,
+};
 
 /// mrb_state -> Vm registry, so method callbacks (which receive only the
 /// C state) can hand Zig code a `*Vm`. Guarded by a spinlock; critical
@@ -37,6 +52,7 @@ fn registryUnlock() void {
 /// used from multiple threads simultaneously (like MRI).
 pub const Vm = struct {
     mrb: *c.mrb_state,
+    roots: arena_mod.RootRegistry,
     /// Destination for Ruby-level `print`/`puts`/`p` output (see
     /// `setOutputWriter`). When null, those methods write to the process
     /// stdout via mruby's default `print` (cstdio).
@@ -67,7 +83,10 @@ pub const Vm = struct {
         }
         const vm = try alloc_mod.gpa.create(Vm);
         errdefer alloc_mod.gpa.destroy(vm);
-        vm.* = .{ .mrb = mrb };
+        vm.* = .{
+            .mrb = mrb,
+            .roots = arena_mod.RootRegistry.init(alloc_mod.gpa, mrb),
+        };
         registryLock();
         defer registryUnlock();
         try registry.put(alloc_mod.gpa, mrb, vm);
@@ -82,9 +101,15 @@ pub const Vm = struct {
 
     fn captureInitFailure(mrb: *c.mrb_state) void {
         const exc = RubyError.fromValue(mrb, c.mrz_exc_value(mrb));
-        const cls = exc.className();
+        const cls = exc.className(alloc_mod.gpa) catch {
+            init_failure_len = 0;
+            return;
+        };
         defer alloc_mod.gpa.free(cls);
-        const msg = exc.message();
+        const msg = exc.message(alloc_mod.gpa) catch {
+            init_failure_len = 0;
+            return;
+        };
         defer alloc_mod.gpa.free(msg);
         if (std.fmt.bufPrint(&init_failure_buf, "{s}: {s}", .{ cls, msg })) |written| {
             init_failure_len = written.len;
@@ -94,6 +119,7 @@ pub const Vm = struct {
     }
 
     pub fn deinit(vm: *Vm) void {
+        vm.roots.deinit();
         {
             registryLock();
             defer registryUnlock();
@@ -112,7 +138,23 @@ pub const Vm = struct {
     /// Source containing an interior NUL is rejected rather than silently
     /// evaluating only the prefix visible to mruby's lexer.
     pub fn loadString(vm: *Vm, src: []const u8) !Value {
+        return vm.loadStringWithOptions(src, .{});
+    }
+
+    /// Parse, compile, and execute source with explicit source metadata.
+    pub fn loadStringWithOptions(
+        vm: *Vm,
+        src: []const u8,
+        options: LoadOptions,
+    ) !Value {
         if (std.mem.indexOfScalar(u8, src, 0) != null) return error.InvalidSource;
+        if (options.source_name) |source_name| {
+            if (source_name.len == 0 or
+                std.mem.indexOfScalar(u8, source_name, 0) != null)
+            {
+                return error.InvalidSourceName;
+            }
+        }
 
         // mruby's lexer reads to a NUL sentinel (mrb_load_nstring's length is
         // not a hard bound in 4.0), so the source is always copied into a
@@ -136,7 +178,14 @@ pub const Vm = struct {
         // allocation triggers GC). Callers that loop should bound growth with
         // `vm.arenaScope()`.
         var v: c.mrb_value = undefined;
-        if (!c.mrz_protected_load_string(vm.mrb, @ptrCast(buf.ptr), &v))
+        if (!c.mrz_protected_load_string(
+            vm.mrb,
+            @ptrCast(buf.ptr),
+            src.len,
+            if (options.source_name) |name| name.ptr else null,
+            if (options.source_name) |name| name.len else 0,
+            &v,
+        ))
             return error.RubyException;
         return .{ .mrb = vm.mrb, .v = v };
     }
@@ -155,17 +204,30 @@ pub const Vm = struct {
 
     // ---- calling Ruby from Zig -------------------------------------------
 
-    /// Call `name` on `recv` with up to 8 positional arguments (any type
-    /// accepted by `convert.toValue`). Exceptions are reported as
-    /// `error.RubyException` (never longjmp into Zig frames).
+    /// Call `name` on `recv` with positional arguments (any type accepted by
+    /// `convert.toValue`). Exceptions are reported as `error.RubyException`
+    /// (never longjmp into Zig frames).
     pub fn call(vm: *Vm, recv: Value, name: []const u8, args: anytype) !Value {
+        return vm.callWithOptions(recv, name, args, .{});
+    }
+
+    /// Call a Ruby method with positional arguments and an optional block.
+    pub fn callWithOptions(
+        vm: *Vm,
+        recv: Value,
+        name: []const u8,
+        args: anytype,
+        options: CallOptions,
+    ) !Value {
         try recv.ensureOwnedBy(vm.mrb);
+        if (options.block) |block| try block.ensureOwnedBy(vm.mrb);
 
         if (name.len >= 256) return error.NameTooLong;
         const n = comptime @typeInfo(@TypeOf(args)).@"struct".field_types.len;
-        if (n > 8) @compileError("vm.call supports at most 8 arguments");
+        const argc = std.math.cast(c.mrb_int, n) orelse
+            return error.TooManyArguments;
 
-        var argv: [8]c.mrb_value = undefined;
+        var argv: [n]c.mrb_value = undefined;
         inline for (0..n) |i| {
             argv[i] = (try convert.toValue(vm.mrb, args[i])).v;
         }
@@ -174,13 +236,14 @@ pub const Vm = struct {
         // save+restore would pop that slot and un-root the returned Value.
         // See loadString for the full rationale.
         var v: c.mrb_value = undefined;
-        if (!c.mrz_protected_funcall(
+        if (!c.mrz_protected_funcall_with_block(
             vm.mrb,
             recv.v,
             name.ptr,
             name.len,
-            n,
+            argc,
             &argv,
+            if (options.block) |block| block.v else c.mrz_nil_value(),
             &v,
         )) {
             return error.RubyException;
@@ -376,12 +439,24 @@ pub const Vm = struct {
         return .{ .mrb = vm.mrb, .idx = c.mrz_gc_arena_save(vm.mrb) };
     }
 
+    /// Keep `value` alive independently of the GC arena until the returned
+    /// root is destroyed. Roots must be destroyed before this VM.
+    pub fn root(vm: *Vm, value: Value) arena_mod.RootError!RootedValue {
+        return vm.roots.add(value);
+    }
+
     // ---- value construction ------------------------------------------------
 
-    /// Integer value. Integers outside the representable i64 range (possible
-    /// for u64 inputs, since this build has no bigint) saturate to the nearest
-    /// bound. Heap-boxing allocation failure is reported as a Ruby exception.
+    /// Integer value. Inputs outside mruby's signed 64-bit Integer range return
+    /// `error.Overflow`; heap-boxing allocation failure is a Ruby exception.
     pub fn intValue(vm: *Vm, x: anytype) !Value {
+        requireInteger(@TypeOf(x));
+        return convert.toValue(vm.mrb, x);
+    }
+
+    /// Integer value with explicit saturation to mruby's signed 64-bit range.
+    pub fn saturatingIntValue(vm: *Vm, x: anytype) !Value {
+        requireInteger(@TypeOf(x));
         const n: i64 = std.math.cast(i64, x) orelse if (x < 0)
             std.math.minInt(i64)
         else
@@ -406,7 +481,57 @@ pub const Vm = struct {
     pub fn nilValue(vm: *Vm) Value {
         return Value.nil(vm.mrb);
     }
+
+    /// Construct a Ruby Array from values owned by this VM.
+    pub fn array(vm: *Vm, values: []const Value) !Array {
+        _ = std.math.cast(c.mrb_int, values.len) orelse
+            return error.Overflow;
+        const raw = try alloc_mod.gpa.alloc(c.mrb_value, values.len);
+        defer alloc_mod.gpa.free(raw);
+        for (values, raw) |value, *slot| {
+            try value.ensureOwnedBy(vm.mrb);
+            slot.* = value.v;
+        }
+
+        var result: c.mrb_value = undefined;
+        if (!c.mrz_protected_array_new(
+            vm.mrb,
+            if (raw.len == 0) null else raw.ptr,
+            raw.len,
+            &result,
+        )) return error.RubyException;
+        return (Value{ .mrb = vm.mrb, .v = result }).asArray();
+    }
+
+    /// Construct a Ruby Hash from key/value entries owned by this VM.
+    pub fn hash(vm: *Vm, entries: []const HashEntry) !Hash {
+        _ = std.math.cast(c.mrb_int, entries.len) orelse
+            return error.Overflow;
+        const raw = try alloc_mod.gpa.alloc(c.mrz_hash_entry, entries.len);
+        defer alloc_mod.gpa.free(raw);
+        for (entries, raw) |entry, *slot| {
+            try entry.key.ensureOwnedBy(vm.mrb);
+            try entry.value.ensureOwnedBy(vm.mrb);
+            slot.* = .{ .key = entry.key.v, .value = entry.value.v };
+        }
+
+        var result: c.mrb_value = undefined;
+        if (!c.mrz_protected_hash_new(
+            vm.mrb,
+            if (raw.len == 0) null else raw.ptr,
+            raw.len,
+            &result,
+        )) return error.RubyException;
+        return (Value{ .mrb = vm.mrb, .v = result }).asHash();
+    }
 };
+
+fn requireInteger(comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .int, .comptime_int => {},
+        else => @compileError("expected an integer, found " ++ @typeName(T)),
+    }
+}
 
 test {
     @import("std").testing.refAllDecls(@This());

@@ -15,10 +15,18 @@
 
 pub const Vm = @import("vm.zig").Vm;
 pub const Value = @import("value.zig").Value;
+pub const Array = @import("value.zig").Array;
+pub const Hash = @import("value.zig").Hash;
+pub const HashEntry = @import("value.zig").HashEntry;
 pub const RubyError = @import("error.zig").RubyError;
+pub const ExceptionDetails = @import("error.zig").Details;
+pub const ExceptionDetailOptions = @import("error.zig").DetailOptions;
 pub const Class = @import("class.zig").Class;
 pub const Rest = @import("class.zig").Rest;
 pub const Scope = @import("arena.zig").Scope;
+pub const RootedValue = @import("arena.zig").RootedValue;
+pub const LoadOptions = @import("vm.zig").LoadOptions;
+pub const CallOptions = @import("vm.zig").CallOptions;
 pub const data = @import("data.zig");
 pub const output = @import("output.zig");
 pub const convert = @import("convert.zig");

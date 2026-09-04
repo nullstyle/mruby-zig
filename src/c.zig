@@ -192,9 +192,14 @@ pub extern fn mrz_policy_exceptions_new(mrb: *mrb_state, hidden: *RClass) mrb_va
 
 /// These wrappers keep mruby's setjmp/longjmp inside C and restore a raised
 /// exception to `mrb->exc`. `false` therefore maps to `error.RubyException`.
+pub extern fn mrz_protected_gc_register(mrb: *mrb_state, value: mrb_value) bool;
+pub extern fn mrz_gc_unregister(mrb: *mrb_state, value: mrb_value) void;
 pub extern fn mrz_protected_load_string(
     mrb: *mrb_state,
     source: [*:0]const u8,
+    source_length: usize,
+    source_name: ?[*]const u8,
+    source_name_length: usize,
     out: *mrb_value,
 ) bool;
 pub extern fn mrz_protected_load_irep(
@@ -210,6 +215,16 @@ pub extern fn mrz_protected_funcall(
     name_length: usize,
     argc: mrb_int,
     argv: [*]const mrb_value,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_funcall_with_block(
+    mrb: *mrb_state,
+    receiver: mrb_value,
+    name: [*]const u8,
+    name_length: usize,
+    argc: mrb_int,
+    argv: [*]const mrb_value,
+    block: mrb_value,
     out: *mrb_value,
 ) bool;
 pub extern fn mrz_protected_funcall_preserve_error(
@@ -236,6 +251,57 @@ pub extern fn mrz_protected_float(
     floating: mrb_float,
     out: *mrb_value,
 ) bool;
+pub extern fn mrz_protected_array_new(
+    mrb: *mrb_state,
+    values: ?[*]const mrb_value,
+    length: usize,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_array_get(
+    mrb: *mrb_state,
+    array: mrb_value,
+    index: mrb_int,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_array_set(
+    mrb: *mrb_state,
+    array: mrb_value,
+    index: mrb_int,
+    value: mrb_value,
+) bool;
+pub extern fn mrz_protected_array_push(
+    mrb: *mrb_state,
+    array: mrb_value,
+    value: mrb_value,
+) bool;
+pub const mrz_hash_entry = extern struct {
+    key: mrb_value,
+    value: mrb_value,
+};
+pub extern fn mrz_protected_hash_new(
+    mrb: *mrb_state,
+    entries: ?[*]const mrz_hash_entry,
+    length: usize,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_hash_get(
+    mrb: *mrb_state,
+    hash: mrb_value,
+    key: mrb_value,
+    found: *bool,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_hash_set(
+    mrb: *mrb_state,
+    hash: mrb_value,
+    key: mrb_value,
+    value: mrb_value,
+) bool;
+pub extern fn mrz_protected_hash_keys(
+    mrb: *mrb_state,
+    hash: mrb_value,
+    out: *mrb_value,
+) bool;
 pub extern fn mrz_protected_intern(
     mrb: *mrb_state,
     name: [*]const u8,
@@ -252,10 +318,27 @@ pub extern fn mrz_protected_define(
     kind: u8,
     out: *mrb_value,
 ) bool;
+pub extern fn mrz_protected_define_under(
+    mrb: *mrb_state,
+    outer: *RClass,
+    name: [*]const u8,
+    name_length: usize,
+    super: ?*RClass,
+    kind: u8,
+    out: *mrb_value,
+) bool;
 pub extern fn mrz_protected_lookup(
     mrb: *mrb_state,
     name: [*]const u8,
     length: usize,
+    out: *mrb_value,
+) bool;
+pub extern fn mrz_protected_const_get(
+    mrb: *mrb_state,
+    outer: *RClass,
+    name: [*]const u8,
+    length: usize,
+    found: *bool,
     out: *mrb_value,
 ) bool;
 pub extern fn mrz_protected_global_get(

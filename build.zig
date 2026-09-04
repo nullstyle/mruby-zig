@@ -46,7 +46,39 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
     const sanitize_thread = b.option(bool, "sanitize-thread", "enable ThreadSanitizer") orelse false;
 
-    const gem_set = b.option([]const u8, "gem-set", "gem set: \"standard\" or \"minimal\"") orelse "standard";
+    const allocator_name = b.option(
+        []const u8,
+        "allocator",
+        "default mruby allocator: \"libc\" or process-lifetime \"arena\"",
+    ) orelse "libc";
+    const allocator_profile = parseAllocatorProfile(allocator_name) catch |err| {
+        std.debug.print(
+            "error: unknown -Dallocator={s} (expected \"libc\" or \"arena\")\n",
+            .{allocator_name},
+        );
+        return err;
+    };
+
+    const explicit_gem_set = b.option([]const u8, "gem-set", "gem set: \"standard\" or \"minimal\"");
+    const stdlib_gems = b.option(
+        bool,
+        "stdlib-gems",
+        "deprecated gem-set alias: true selects \"standard\", false selects \"minimal\"",
+    );
+    const legacy_gem_set: ?[]const u8 = if (stdlib_gems) |enabled|
+        if (enabled) "standard" else "minimal"
+    else
+        null;
+    if (explicit_gem_set != null and legacy_gem_set != null and
+        !std.mem.eql(u8, explicit_gem_set.?, legacy_gem_set.?))
+    {
+        std.debug.print(
+            "error: conflicting -Dgem-set={s} and -Dstdlib-gems={}\n",
+            .{ explicit_gem_set.?, stdlib_gems.? },
+        );
+        return error.ConflictingGemOptions;
+    }
+    const gem_set = explicit_gem_set orelse legacy_gem_set orelse "standard";
     const with_gems = b.option([]const u8, "with-gems", "comma-separated extra gems to enable on top of the gem set");
     const without_gems = b.option([]const u8, "without-gems", "comma-separated gems to remove from the gem set");
 
@@ -246,6 +278,9 @@ pub fn build(b: *std.Build) !void {
         .sanitize_thread = sanitize_thread,
         .link_libc = true,
     });
+    const allocator_config = b.addOptions();
+    allocator_config.addOption(bool, "use_arena", allocator_profile == .arena);
+    mruby_mod.addOptions("allocator_config", allocator_config);
     const artifact_config = try artifactConfigModule(
         b,
         artifact_config_gen,
@@ -274,6 +309,11 @@ pub fn build(b: *std.Build) !void {
     mruby_mod.addIncludePath(lib_presym_dir);
     for (gem_include_dirs.items) |dir| mruby_mod.addIncludePath(dir);
 
+    const check_step = b.step(
+        "check",
+        "compile all tests, tools, and examples without running them",
+    );
+
     // REPL tool.
     const repl_mod = b.createModule(.{
         .root_source_file = b.path("tools/repl.zig"),
@@ -283,6 +323,7 @@ pub fn build(b: *std.Build) !void {
     });
     repl_mod.addImport("mruby", mruby_mod);
     const repl = b.addExecutable(.{ .name = "mruby-repl", .root_module = repl_mod });
+    check_step.dependOn(&repl.step);
     b.installArtifact(repl);
     const run_repl = b.addRunArtifact(repl);
     run_repl.step.dependOn(b.getInstallStep());
@@ -317,6 +358,7 @@ pub fn build(b: *std.Build) !void {
     test_config.addOption(bool, "has_object_space", hasGem(selected_gems, "mruby-objectspace"));
     test_mod.addOptions("test_config", test_config);
     const unit_tests = b.addTest(.{ .root_module = test_mod });
+    check_step.dependOn(&unit_tests.step);
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "run unit and integration tests");
     test_step.dependOn(&run_unit_tests.step);
@@ -327,6 +369,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = .Debug,
     });
     const artifact_identity_tests = b.addTest(.{ .root_module = artifact_identity_test_mod });
+    check_step.dependOn(&artifact_identity_tests.step);
     const run_artifact_identity_tests = b.addRunArtifact(artifact_identity_tests);
     test_step.dependOn(&run_artifact_identity_tests.step);
 
@@ -336,6 +379,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = .Debug,
     });
     const gem_tests = b.addTest(.{ .root_module = gem_tests_mod });
+    check_step.dependOn(&gem_tests.step);
     const run_gem_tests = b.addRunArtifact(gem_tests);
     test_step.dependOn(&run_gem_tests.step);
 
@@ -350,6 +394,7 @@ pub fn build(b: *std.Build) !void {
     });
     state_capsule_fuzz_mod.addImport("mruby", mruby_mod);
     const state_capsule_fuzz_tests = b.addTest(.{ .root_module = state_capsule_fuzz_mod });
+    check_step.dependOn(&state_capsule_fuzz_tests.step);
     const run_state_capsule_fuzz_tests = b.addRunArtifact(state_capsule_fuzz_tests);
     test_step.dependOn(&run_state_capsule_fuzz_tests.step);
     const fuzz_state_capsule_step = b.step(
@@ -364,6 +409,7 @@ pub fn build(b: *std.Build) !void {
     // ...). Run those with the module itself as the test root; src/mruby.zig's
     // aggregator (`_ = @import(...)`) reaches every test-bearing file.
     const mod_tests = b.addTest(.{ .root_module = mruby_mod });
+    check_step.dependOn(&mod_tests.step);
     const run_mod_tests = b.addRunArtifact(mod_tests);
     test_step.dependOn(&run_mod_tests.step);
 
@@ -381,6 +427,7 @@ pub fn build(b: *std.Build) !void {
         .name = "state-capsule-process-producer",
         .root_module = capsule_producer_mod,
     });
+    check_step.dependOn(&capsule_producer.step);
     const run_capsule_producer = b.addRunArtifact(capsule_producer);
     const transferred_capsule = run_capsule_producer.captureStdOut(.{
         .basename = "state-capsule.bin",
@@ -397,6 +444,7 @@ pub fn build(b: *std.Build) !void {
         .name = "state-capsule-process-consumer",
         .root_module = capsule_consumer_mod,
     });
+    check_step.dependOn(&capsule_consumer.step);
     const run_capsule_consumer = b.addRunArtifact(capsule_consumer);
     run_capsule_consumer.setStdIn(.{ .lazy_path = transferred_capsule });
     test_step.dependOn(&run_capsule_consumer.step);
@@ -417,6 +465,7 @@ pub fn build(b: *std.Build) !void {
         });
         ex_mod.addImport("mruby", mruby_mod);
         const ex = b.addExecutable(.{ .name = ex_name, .root_module = ex_mod });
+        check_step.dependOn(&ex.step);
         b.installArtifact(ex);
 
         const run_cmd = b.addRunArtifact(ex);
@@ -436,6 +485,16 @@ const ScanInput = struct {
     includes: []const []const u8 = &.{},
 };
 const GeneratedC = struct { lp: std.Build.LazyPath, pp_name: []const u8 };
+
+const AllocatorProfile = enum {
+    libc,
+    arena,
+};
+
+fn parseAllocatorProfile(name: []const u8) !AllocatorProfile {
+    return std.meta.stringToEnum(AllocatorProfile, name) orelse
+        error.UnknownAllocator;
+}
 
 fn artifactConfigModule(
     b: *std.Build,

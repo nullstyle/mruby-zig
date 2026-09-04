@@ -99,6 +99,10 @@ The supported Zig layer is explicit about failure and interpreter ownership:
 ```zig
 const v = try vm.loadString("'hello'.upcase");
 try std.testing.expectEqualStrings("HELLO", try v.asString());
+
+const named = try vm.loadStringWithOptions("__FILE__", .{
+    .source_name = "jobs/worker.rb",
+});
 ```
 
 Ruby exceptions (compile-time or runtime) surface as `error.RubyException`
@@ -106,13 +110,24 @@ and never longjmp through Zig frames — the C shim runs each operation under
 `mrb_protect_error`:
 
 ```zig
-const v = vm.loadString("raise 'boom'") catch {
-    const exc = vm.lastError().?;
-    defer mruby.alloc.gpa.free(exc.className());
-    defer mruby.alloc.gpa.free(exc.message());
-    // "RuntimeError: boom"
-};
+if (vm.loadString("raise 'boom'")) |_| {
+    unreachable;
+} else |err| {
+    std.debug.assert(err == error.RubyException);
+    var details = try vm.lastError().?.details(allocator, .{
+        .max_backtrace_frames = 32,
+    });
+    defer details.deinit();
+    // details.class_name == "RuntimeError"
+    // details.message == "boom"
+}
 ```
+
+`RubyError.details` owns its class name, message, and bounded backtrace.
+`RubyError.className` and `message` are also available when only one field is
+needed; each takes the allocator that will own its returned bytes. Sandbox
+errors use metadata captured before guest execution ends, so reading their
+details never dispatches guest methods.
 
 ### Calling Zig from Ruby
 
@@ -143,6 +158,16 @@ A Zig `error` returned from a callback becomes a Ruby `RuntimeError`
 (`"zig error: Kaboom"`); `vm.raise("ArgumentError", "msg")` raises a specific
 class from within a callback.
 
+Classes and modules can define and inspect direct child namespaces and
+constants without constructing qualified names:
+
+```zig
+const api = try vm.defineModule("API");
+const widget = try api.defineClass("Widget", null);
+try widget.defineConst("VERSION", try vm.stringValue("1"));
+const version = try (try api.getClass("Widget")).getConst("VERSION");
+```
+
 ### Wrapping Zig state in Ruby objects
 
 ```zig
@@ -159,9 +184,44 @@ transfers ownership of the pointer only when it succeeds.
 
 ```zig
 const s = try vm.stringValue("hello");
-const up = try vm.call(s, "upcase", .{});            // up to 8 args
+const up = try vm.call(s, "upcase", .{});
 const sqrt = try vm.call(try vm.loadString("Math"), "sqrt", .{@as(f64, 144.0)});
+
+const items = try vm.loadString("[1, 2, 3]");
+const double = try vm.loadString("->(x) { x * 2 }");
+_ = try vm.callWithOptions(items, "each", .{}, .{ .block = double });
 ```
+
+The positional argument tuple has no fixed eight-argument cap.
+`callWithOptions` additionally accepts an optional Ruby block and enforces the
+same VM ownership rule for that block.
+
+### Typed collections and conversions
+
+```zig
+const one = try vm.intValue(1);
+const array = try vm.array(&.{one});
+try array.append(try vm.intValue(2));
+
+const key = try vm.stringValue("answer");
+const hash = try vm.hash(&.{
+    .{ .key = key, .value = try vm.intValue(42) },
+});
+const answer: ?mruby.Value = try hash.get(key);
+```
+
+`Array` supports checked indexing, extension by assignment, and append.
+`Hash.get` bypasses Hash defaults: it returns `null` for a missing key and a
+non-null nil `Value` for a present Ruby `nil`. Hashes also support assignment
+and typed `keys`. Both handles convert through `mruby.convert` and retain their
+underlying `Value`'s arena lifetime and VM ownership.
+
+Integer conversion is exact: values outside mruby's signed 64-bit range return
+`error.Overflow`; use `Vm.saturatingIntValue` only when clamping is intended.
+Finite Float conversions that exceed the destination format also return
+`error.Overflow`.
+Converting Ruby to Zig `bool` accepts only the actual Ruby `true` and `false`
+values rather than applying Ruby truthiness.
 
 ### Output redirection
 
@@ -181,12 +241,32 @@ the first `Vm`), `mruby.alloc.liveBytes()` / `liveAllocs()` for
 observability. It is process-global — an upstream 4.0 constraint — and
 defaults to the thread-safe `std.heap.c_allocator`.
 
+`-Dallocator=libc|arena` selects the initial process allocator. The arena
+profile is thread-safe with the pinned Zig toolchain, but retains backing
+allocations for the process lifetime; it is intended for bounded workloads and
+allocator-compatibility testing. `setAllocator` can replace either build
+default before the first mruby allocation. The selected build default is
+available as `mruby.alloc.configured_default`.
+
 Two lifetime rules keep you safe:
 
 - Values returned by `loadString`/`call` stay GC-rooted in the arena, so
   they are safe to hold across further Ruby execution. Each returned value
   occupies one arena slot, so bracket a tight loop of calls with
-  `vm.arenaScope()` to keep the arena from growing.
+  `vm.arenaScope()` to keep the arena from growing. To keep selected values
+  after restoring a scope, promote them to explicit long-lived roots:
+
+  ```zig
+  const scope = vm.arenaScope();
+  const temporary = try vm.loadString("Object.new");
+  var held = try vm.root(temporary);
+  scope.restore();
+  defer held.deinit(); // every RootedValue must be released before its Vm
+
+  _ = try vm.call(held.get(), "inspect", .{});
+  ```
+
+  Multiple roots for the same Ruby object have independent lifetimes.
 - String slices are **borrowed**: `Value.asString`, the `S`/`s`/`z` method
   parameters, and `Rest.get` point into the Ruby heap and are valid only
   until the next interpreter call — use `Value.dupeString(allocator)` to
@@ -213,6 +293,9 @@ dependencies are honored like Rake's `add_dependency`: additions pull in
 their dependencies, and `-Dwithout-gems` cascade-removes dependents.
 Unknown names are rejected during configuration, and the final set is
 topologically ordered before generating its initialization table.
+The deprecated `-Dstdlib-gems=false` spelling remains an alias for
+`-Dgem-set=minimal` (`true` maps to `standard`); conflicting spellings are
+rejected.
 
 Excluded from defaults for portability: `io`, `socket`, `dir`, `errno`,
 `print`, and the math-extras (`bigint`, `complex`, `rational`, `cmath`).
@@ -514,6 +597,7 @@ functions, keeping every layout decision on the C side.
 ## Development
 
 ```sh
+mise x -- zig build check             # compile tests, tools, and examples
 mise x -- zig build test              # unit + Ruby integration suites
 mise x -- zig build test-state-capsule-process
 mise x -- zig build fuzz-state-capsule --fuzz=100K

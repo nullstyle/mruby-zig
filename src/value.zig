@@ -99,6 +99,122 @@ pub const Value = struct {
     pub fn isException(self: Value) bool {
         return c.mrz_exception_p(self.v);
     }
+
+    pub fn asArray(self: Value) error{TypeMismatch}!Array {
+        if (!c.mrz_array_p(self.v)) return error.TypeMismatch;
+        return .{ .inner = self };
+    }
+
+    pub fn asHash(self: Value) error{TypeMismatch}!Hash {
+        if (!c.mrz_hash_p(self.v)) return error.TypeMismatch;
+        return .{ .inner = self };
+    }
+};
+
+/// A typed view over a Ruby Array. It has the same arena lifetime as its
+/// underlying `Value`; use `Vm.root(array.asValue())` for long-lived storage.
+pub const Array = struct {
+    inner: Value,
+
+    pub fn asValue(array: Array) Value {
+        return array.inner;
+    }
+
+    pub fn len(array: Array) usize {
+        return c.mrz_array_len(array.inner.v);
+    }
+
+    pub fn get(array: Array, index: usize) !Value {
+        if (index >= array.len()) return error.IndexOutOfBounds;
+        const raw_index = std.math.cast(c.mrb_int, index) orelse
+            return error.Overflow;
+        var result: c.mrb_value = undefined;
+        if (!c.mrz_protected_array_get(
+            array.inner.mrb,
+            array.inner.v,
+            raw_index,
+            &result,
+        )) return error.RubyException;
+        return .{ .mrb = array.inner.mrb, .v = result };
+    }
+
+    /// Set `index`, extending the Ruby Array with nil values when needed.
+    pub fn set(array: Array, index: usize, value: Value) !void {
+        try value.ensureOwnedBy(array.inner.mrb);
+        const raw_index = std.math.cast(c.mrb_int, index) orelse
+            return error.Overflow;
+        if (!c.mrz_protected_array_set(
+            array.inner.mrb,
+            array.inner.v,
+            raw_index,
+            value.v,
+        )) return error.RubyException;
+    }
+
+    pub fn append(array: Array, value: Value) !void {
+        try value.ensureOwnedBy(array.inner.mrb);
+        if (!c.mrz_protected_array_push(
+            array.inner.mrb,
+            array.inner.v,
+            value.v,
+        )) return error.RubyException;
+    }
+};
+
+pub const HashEntry = struct {
+    key: Value,
+    value: Value,
+};
+
+/// A typed view over a Ruby Hash. Lookup bypasses Hash defaults and
+/// distinguishes a missing key (`null`) from a present key whose value is
+/// Ruby `nil`.
+pub const Hash = struct {
+    inner: Value,
+
+    pub fn asValue(hash: Hash) Value {
+        return hash.inner;
+    }
+
+    pub fn len(hash: Hash) usize {
+        return @intCast(c.mrb_hash_size(hash.inner.mrb, hash.inner.v));
+    }
+
+    pub fn get(hash: Hash, key: Value) !?Value {
+        try key.ensureOwnedBy(hash.inner.mrb);
+        var found = false;
+        var result: c.mrb_value = undefined;
+        if (!c.mrz_protected_hash_get(
+            hash.inner.mrb,
+            hash.inner.v,
+            key.v,
+            &found,
+            &result,
+        )) return error.RubyException;
+        if (!found) return null;
+        return .{ .mrb = hash.inner.mrb, .v = result };
+    }
+
+    pub fn set(hash: Hash, key: Value, value: Value) !void {
+        try key.ensureOwnedBy(hash.inner.mrb);
+        try value.ensureOwnedBy(hash.inner.mrb);
+        if (!c.mrz_protected_hash_set(
+            hash.inner.mrb,
+            hash.inner.v,
+            key.v,
+            value.v,
+        )) return error.RubyException;
+    }
+
+    pub fn keys(hash: Hash) !Array {
+        var result: c.mrb_value = undefined;
+        if (!c.mrz_protected_hash_keys(
+            hash.inner.mrb,
+            hash.inner.v,
+            &result,
+        )) return error.RubyException;
+        return (Value{ .mrb = hash.inner.mrb, .v = result }).asArray();
+    }
 };
 
 test {

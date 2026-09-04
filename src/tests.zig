@@ -35,10 +35,10 @@ test "ruby integration suite" {
         defer vm.deinit();
         _ = vm.loadString(suite.src) catch {
             const exc = vm.lastError().?;
-            const cls = exc.className();
-            defer mruby.alloc.gpa.free(cls);
-            const msg = exc.message();
-            defer mruby.alloc.gpa.free(msg);
+            const cls = try exc.className(std.testing.allocator);
+            defer std.testing.allocator.free(cls);
+            const msg = try exc.message(std.testing.allocator);
+            defer std.testing.allocator.free(msg);
             std.debug.print("ruby suite '{s}' failed: {s}: {s}\n", .{ suite.name, cls, msg });
             // Bisect: accumulate lines until they parse standalone (so a
             // multi-line def/class is consumed as a unit), then report the
@@ -149,10 +149,10 @@ test "captures ruby exceptions" {
     defer vm.deinit();
     try std.testing.expectError(error.RubyException, vm.loadString("raise 'boom'"));
     const exc = vm.lastError().?;
-    const class_name = exc.className();
-    defer mruby.alloc.gpa.free(class_name);
-    const message = exc.message();
-    defer mruby.alloc.gpa.free(message);
+    const class_name = try exc.className(std.testing.allocator);
+    defer std.testing.allocator.free(class_name);
+    const message = try exc.message(std.testing.allocator);
+    defer std.testing.allocator.free(message);
     try std.testing.expectEqualStrings("RuntimeError", class_name);
     try std.testing.expectEqualStrings("boom", message);
 }
@@ -163,10 +163,10 @@ test "error diagnostics preserve the pending exception until the next operation"
 
     try std.testing.expectError(error.RubyException, vm.loadString("raise 'original'"));
     const exc = vm.lastError() orelse return error.MissingRubyException;
-    const class_name = exc.className();
-    defer mruby.alloc.gpa.free(class_name);
-    const message = exc.message();
-    defer mruby.alloc.gpa.free(message);
+    const class_name = try exc.className(std.testing.allocator);
+    defer std.testing.allocator.free(class_name);
+    const message = try exc.message(std.testing.allocator);
+    defer std.testing.allocator.free(message);
     try std.testing.expectEqualStrings("RuntimeError", class_name);
     try std.testing.expectEqualStrings("original", message);
     try std.testing.expect(vm.lastError() != null);
@@ -188,6 +188,83 @@ test "source with an interior NUL is rejected" {
     const vm = try mruby.Vm.init();
     defer vm.deinit();
     try std.testing.expectError(error.InvalidSource, vm.loadString("1\x00 + 1"));
+}
+
+test "source metadata drives __FILE__ and structured backtraces" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    const file = try vm.loadStringWithOptions("__FILE__", .{
+        .source_name = "jobs/worker.rb",
+    });
+    try std.testing.expectEqualStrings("jobs/worker.rb", try file.asString());
+
+    try std.testing.expectError(
+        error.RubyException,
+        vm.loadStringWithOptions("raise 'named failure'", .{
+            .source_name = "jobs/worker.rb",
+        }),
+    );
+    var details = try vm.lastError().?.details(std.testing.allocator, .{});
+    defer details.deinit();
+    try std.testing.expectEqualStrings("RuntimeError", details.class_name);
+    try std.testing.expectEqualStrings("named failure", details.message);
+    try std.testing.expect(details.backtrace.len > 0);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        details.backtrace[0],
+        "jobs/worker.rb:1",
+    ) != null);
+
+    try std.testing.expectError(
+        error.InvalidSourceName,
+        vm.loadStringWithOptions("1", .{ .source_name = "" }),
+    );
+    try std.testing.expectError(
+        error.InvalidSourceName,
+        vm.loadStringWithOptions("1", .{ .source_name = "bad\x00name.rb" }),
+    );
+}
+
+test "structured exception details are owned and backtraces are bounded" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    try std.testing.expectError(
+        error.RubyException,
+        vm.loadStringWithOptions(
+            \\def detail_inner
+            \\  raise "bounded failure"
+            \\end
+            \\def detail_outer
+            \\  detail_inner
+            \\end
+            \\detail_outer
+        , .{ .source_name = "details.rb" }),
+    );
+    const exception = vm.lastError().?;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        exception.details(std.testing.failing_allocator, .{}),
+    );
+
+    var details = try exception.details(std.testing.allocator, .{
+        .max_backtrace_frames = 1,
+    });
+    defer details.deinit();
+    try std.testing.expectEqualStrings("RuntimeError", details.class_name);
+    try std.testing.expectEqualStrings("bounded failure", details.message);
+    try std.testing.expectEqual(@as(usize, 1), details.backtrace.len);
+    try std.testing.expect(details.backtrace_truncated);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        details.backtrace[0],
+        "details.rb:",
+    ) != null);
+
+    _ = try vm.loadString("nil");
+    try std.testing.expectEqualStrings("RuntimeError", details.class_name);
+    try std.testing.expectEqualStrings("bounded failure", details.message);
 }
 
 test "stdlib gems are loaded" {
@@ -294,10 +371,10 @@ test "zig errors surface as runtime errors" {
 
     try std.testing.expectError(error.RubyException, vm.loadString("Bomb.new.explode"));
     const exc = vm.lastError().?;
-    const class_name = exc.className();
-    defer mruby.alloc.gpa.free(class_name);
-    const message = exc.message();
-    defer mruby.alloc.gpa.free(message);
+    const class_name = try exc.className(std.testing.allocator);
+    defer std.testing.allocator.free(class_name);
+    const message = try exc.message(std.testing.allocator);
+    defer std.testing.allocator.free(message);
     try std.testing.expectEqualStrings("RuntimeError", class_name);
     try std.testing.expectEqualStrings("zig error: Kaboom", message);
 }
@@ -318,8 +395,8 @@ test "zig raise surfaces custom exceptions" {
     try std.testing.expectEqual(@as(i64, 3), try (try vm.loadString("Guard.new.check(3)")).asInt());
     try std.testing.expectError(error.RubyException, vm.loadString("Guard.new.check(-1)"));
     const exc = vm.lastError().?;
-    const class_name = exc.className();
-    defer mruby.alloc.gpa.free(class_name);
+    const class_name = try exc.className(std.testing.allocator);
+    defer std.testing.allocator.free(class_name);
     try std.testing.expectEqualStrings("ArgumentError", class_name);
 }
 
@@ -343,8 +420,8 @@ test "zig callbacks reject values owned by another Vm" {
     try cls.defineClassMethod("value", "", ForeignReturn.call);
     try std.testing.expectError(error.RubyException, other.loadString("ForeignReturn.value"));
     const exc = other.lastError().?;
-    const message = exc.message();
-    defer mruby.alloc.gpa.free(message);
+    const message = try exc.message(std.testing.allocator);
+    defer std.testing.allocator.free(message);
     try std.testing.expectEqualStrings("zig error: ForeignValue", message);
 }
 
@@ -366,6 +443,17 @@ test "vm.call invokes ruby methods" {
     try std.testing.expectError(error.RubyException, vm.call(str, "nope", .{}));
 }
 
+test "vm.call accepts more than eight positional arguments" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    const sum = try vm.loadString(
+        "->(a, b, c, d, e, f, g, h, i) { a + b + c + d + e + f + g + h + i }",
+    );
+    const result = try vm.call(sum, "call", .{ 1, 2, 3, 4, 5, 6, 7, 8, 9 });
+    try std.testing.expectEqual(@as(i64, 45), try result.asInt());
+}
+
 test "vm.call rejects a receiver owned by another Vm" {
     const owner = try mruby.Vm.init();
     defer owner.deinit();
@@ -385,6 +473,42 @@ test "vm.call rejects arguments owned by another Vm" {
     const receiver = try other.stringValue("hello");
     const foreign = try owner.stringValue("!");
     try std.testing.expectError(error.ForeignValue, other.call(receiver, "+", .{foreign}));
+}
+
+test "vm.callWithOptions passes a Ruby block" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    const target = try vm.loadString(
+        "class BlockTarget; def self.apply(x); yield(x) * 2; end; end; BlockTarget",
+    );
+    const block = try vm.loadString("->(x) { x + 3 }");
+    const result = try vm.callWithOptions(
+        target,
+        "apply",
+        .{4},
+        .{ .block = block },
+    );
+    try std.testing.expectEqual(@as(i64, 14), try result.asInt());
+}
+
+test "vm.callWithOptions rejects a block owned by another Vm" {
+    const owner = try mruby.Vm.init();
+    defer owner.deinit();
+    const other = try mruby.Vm.init();
+    defer other.deinit();
+
+    const receiver = try other.loadString("Object.new");
+    const foreign_block = try owner.loadString("-> { 1 }");
+    try std.testing.expectError(
+        error.ForeignValue,
+        other.callWithOptions(
+            receiver,
+            "tap",
+            .{},
+            .{ .block = foreign_block },
+        ),
+    );
 }
 
 test "globals and ivars" {
@@ -477,6 +601,38 @@ test "class definition rejects a superclass owned by another Vm" {
     );
 }
 
+test "classes define and inspect scoped namespaces and constants" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    const outer = try vm.defineModule("ScopedOuter");
+    const inner = try outer.defineClass("Inner", null);
+    const base = try outer.defineClass("Base", null);
+    const child = try outer.defineClass("Child", base);
+    _ = try outer.defineModule("Helpers");
+    try inner.defineConst("ANSWER", try vm.intValue(42));
+    try base.defineConst("INHERITED", try vm.intValue(7));
+    try outer.defineConst("NOTHING", vm.nilValue());
+    try outer.defineConst("SCALAR", try vm.intValue(1));
+
+    const looked_up = try outer.getClass("Inner");
+    try std.testing.expectEqual(
+        @as(i64, 42),
+        try (try looked_up.getConst("ANSWER")).asInt(),
+    );
+    try std.testing.expect((try outer.getConst("NOTHING")).isNil());
+    _ = try outer.getClass("Helpers");
+    try std.testing.expectError(error.UnknownConstant, outer.getConst("MISSING"));
+    try std.testing.expectError(error.UnknownConstant, child.getConst("INHERITED"));
+    try std.testing.expectError(error.UnknownClass, outer.getClass("MISSING"));
+    try std.testing.expectError(error.UnknownClass, outer.getClass("NOTHING"));
+    try std.testing.expectError(error.RubyException, outer.defineClass("SCALAR", null));
+    try std.testing.expectEqual(
+        @as(i64, 42),
+        try (try vm.loadString("ScopedOuter::Inner::ANSWER")).asInt(),
+    );
+}
+
 test "constant definition rejects a value owned by another Vm" {
     const owner = try mruby.Vm.init();
     defer owner.deinit();
@@ -550,6 +706,108 @@ test "data wrappers derive interpreter ownership from their handles" {
     const wrapped = try Data.wrap(cls, &payload);
     try std.testing.expect(Data.unwrap(wrapped).? == &payload);
     try std.testing.expect(Data.unwrap(try other.loadString("Object.new")) == null);
+}
+
+// ---- arrays and hashes ------------------------------------------------------
+
+test "typed arrays construct, access, extend, and append" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    const one = try vm.intValue(1);
+    const two = try vm.intValue(2);
+    const text = try vm.stringValue("three");
+    const values = [_]mruby.Value{ one, two };
+    const array = try vm.array(&values);
+    const converted = try mruby.convert.fromValue(mruby.Array, array.asValue());
+
+    try std.testing.expectEqual(@as(usize, 2), array.len());
+    try std.testing.expectEqual(array.len(), converted.len());
+    try std.testing.expectEqual(@as(i64, 1), try (try array.get(0)).asInt());
+    try std.testing.expectError(error.TypeMismatch, one.asArray());
+    try std.testing.expectError(error.IndexOutOfBounds, array.get(2));
+
+    try array.set(3, text);
+    try std.testing.expectEqual(@as(usize, 4), array.len());
+    try std.testing.expect((try array.get(2)).isNil());
+    try std.testing.expectEqualStrings("three", try (try array.get(3)).asString());
+    try array.append(try vm.intValue(4));
+    try std.testing.expectEqual(@as(i64, 4), try (try array.get(4)).asInt());
+    try std.testing.expectEqual(
+        @as(i64, 5),
+        try (try vm.call(array.asValue(), "length", .{})).asInt(),
+    );
+    try std.testing.expect(
+        (try vm.call(array.asValue(), "equal?", .{array})).isTruthy(),
+    );
+}
+
+test "typed hashes distinguish missing keys from present nil" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    const answer = try vm.stringValue("answer");
+    const empty = try vm.stringValue("empty");
+    const missing = try vm.stringValue("missing");
+    const entries = [_]mruby.HashEntry{
+        .{ .key = answer, .value = try vm.intValue(42) },
+        .{ .key = empty, .value = vm.nilValue() },
+    };
+    const hash = try vm.hash(&entries);
+    const converted = try mruby.convert.fromValue(mruby.Hash, hash.asValue());
+
+    try std.testing.expectEqual(@as(usize, 2), hash.len());
+    try std.testing.expectEqual(hash.len(), converted.len());
+    try std.testing.expectEqual(
+        @as(i64, 42),
+        try (try hash.get(answer)).?.asInt(),
+    );
+    try std.testing.expect((try hash.get(empty)).?.isNil());
+    try std.testing.expect((try hash.get(missing)) == null);
+
+    try hash.set(missing, vm.boolValue(true));
+    try std.testing.expect((try hash.get(missing)).?.isTruthy());
+    try std.testing.expectEqual(@as(usize, 3), (try hash.keys()).len());
+}
+
+test "typed collection mutation contains Ruby exceptions" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    const value = try vm.intValue(2);
+    const key = try vm.stringValue("key");
+    const frozen_array = try (try vm.loadString("[1].freeze")).asArray();
+    const frozen_hash = try (try vm.loadString("{}.freeze")).asHash();
+
+    try std.testing.expectError(error.RubyException, frozen_array.append(value));
+    try std.testing.expectError(error.RubyException, frozen_hash.set(key, value));
+    try std.testing.expect(vm.lastError() != null);
+}
+
+test "typed collections enforce VM ownership" {
+    const owner = try mruby.Vm.init();
+    defer owner.deinit();
+    const other = try mruby.Vm.init();
+    defer other.deinit();
+
+    const local = try owner.stringValue("local");
+    const foreign = try other.stringValue("foreign");
+    try std.testing.expectError(
+        error.ForeignValue,
+        owner.array(&.{ local, foreign }),
+    );
+
+    const array = try owner.array(&.{local});
+    try std.testing.expectError(error.ForeignValue, array.append(foreign));
+    const hash = try owner.hash(&.{});
+    try std.testing.expectError(error.ForeignValue, hash.set(local, foreign));
+    try std.testing.expectError(error.ForeignValue, hash.get(foreign));
+
+    const receiver = try other.loadString("Object.new");
+    try std.testing.expectError(
+        error.ForeignValue,
+        other.call(receiver, "equal?", .{array}),
+    );
 }
 
 // ---- output redirection ----------------------------------------------------
@@ -652,6 +910,48 @@ test "values rooted in globals survive gc churn" {
     try std.testing.expectEqualStrings("i am a string", try held.asString());
 }
 
+test "RootedValue survives arena restoration and GC churn" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    const scope = vm.arenaScope();
+    const temporary = try vm.loadString("'long-' + 'lived'");
+    var rooted = try vm.root(temporary);
+    defer rooted.deinit();
+    scope.restore();
+
+    for (0..32) |_| {
+        _ = try vm.loadString("100.times { Object.new }; GC.start");
+    }
+    try std.testing.expectEqualStrings("long-lived", try rooted.get().asString());
+}
+
+test "duplicate RootedValues have independent lifetimes" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    const scope = vm.arenaScope();
+    const temporary = try vm.loadString("'shared root'");
+    var first = try vm.root(temporary);
+    var second = try vm.root(temporary);
+    scope.restore();
+
+    first.deinit();
+    mruby.c.mrb_full_gc(vm.mrb);
+    try std.testing.expectEqualStrings("shared root", try second.get().asString());
+    second.deinit();
+}
+
+test "root rejects a value from another VM" {
+    const first = try mruby.Vm.init();
+    defer first.deinit();
+    const second = try mruby.Vm.init();
+    defer second.deinit();
+
+    const foreign = try first.loadString("Object.new");
+    try std.testing.expectError(error.ForeignValue, second.root(foreign));
+}
+
 test "void safe-layer operations do not grow the GC arena" {
     const vm = try mruby.Vm.init();
     defer vm.deinit();
@@ -732,8 +1032,8 @@ test "unsigned overflow in toValue errors rather than panics" {
     const vm = try mruby.Vm.init();
     defer vm.deinit();
     try std.testing.expectError(error.Overflow, mruby.convert.toValue(vm.mrb, @as(u64, std.math.maxInt(u64))));
-    // The callback helper saturates before performing its protected boxing.
-    const v = try vm.intValue(@as(u64, std.math.maxInt(u64)));
+    try std.testing.expectError(error.Overflow, vm.intValue(@as(u64, std.math.maxInt(u64))));
+    const v = try vm.saturatingIntValue(@as(u64, std.math.maxInt(u64)));
     try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), try v.asInt());
 }
 
@@ -1002,8 +1302,8 @@ test "sandbox: invalid typed RITE preserves a prior Ruby error" {
     try std.testing.expectEqual(before.wall_time_ns, after.wall_time_ns);
     try std.testing.expectEqual(before.gas.?.generation, after.gas.?.generation);
     try std.testing.expectEqual(before.gas.?.used, after.gas.?.used);
-    const message = iso.lastError().?.message();
-    defer mruby.alloc.gpa.free(message);
+    const message = try iso.lastError().?.message(std.testing.allocator);
+    defer std.testing.allocator.free(message);
     try std.testing.expectEqualStrings("RITE sentinel", message);
 }
 
@@ -1677,8 +1977,8 @@ test "sandbox: StateCapsule control operations preserve execution state and last
 
     try std.testing.expectError(error.RubyException, iso.run("raise 'artifact sentinel'"));
     const before = iso.stats();
-    const before_message = iso.lastError().?.message();
-    defer mruby.alloc.gpa.free(before_message);
+    const before_message = try iso.lastError().?.message(std.testing.allocator);
+    defer std.testing.allocator.free(before_message);
     try std.testing.expectEqualStrings("artifact sentinel", before_message);
 
     var second = try iso.exportValue(std.testing.allocator, root, .{});
@@ -1693,8 +1993,8 @@ test "sandbox: StateCapsule control operations preserve execution state and last
     try std.testing.expectEqual(before.gas.?.generation, after.gas.?.generation);
     try std.testing.expectEqual(before.gas.?.used, after.gas.?.used);
     try std.testing.expect(!iso.pendingTermination());
-    const after_message = iso.lastError().?.message();
-    defer mruby.alloc.gpa.free(after_message);
+    const after_message = try iso.lastError().?.message(std.testing.allocator);
+    defer std.testing.allocator.free(after_message);
     try std.testing.expectEqualStrings("artifact sentinel", after_message);
 }
 
@@ -2248,8 +2548,8 @@ test "sandbox: frozen object model blocks def on core classes" {
     defer iso.deinit();
     try std.testing.expectError(error.RubyException, iso.run("class String; def boom; end; end"));
     const exc = iso.lastError().?;
-    const cls = exc.className();
-    defer mruby.alloc.gpa.free(cls);
+    const cls = try exc.className(std.testing.allocator);
+    defer std.testing.allocator.free(cls);
     try std.testing.expectEqualStrings("FrozenError", cls);
 }
 
@@ -2507,8 +2807,8 @@ test "sandbox: script cannot forge a policy termination" {
     // an ordinary RubyException, never the host-trusted error.GasExhausted
     // (no real limit was hit, so the authoritative gas bit stays clear).
     try std.testing.expectError(error.RubyException, iso.run("raise MRubyZigSandbox::GasExhausted, 'fake'"));
-    const class_name = iso.lastError().?.className();
-    defer mruby.alloc.gpa.free(class_name);
+    const class_name = try iso.lastError().?.className(std.testing.allocator);
+    defer std.testing.allocator.free(class_name);
     try std.testing.expectEqualStrings("MRubyZigSandbox::GasExhausted", class_name);
     const next = try iso.run("21 * 2");
     try std.testing.expectEqual(@as(i64, 42), try next.asInt());
@@ -2578,27 +2878,30 @@ test "sandbox: lastError uses inert exception metadata" {
     }
 
     const ruby_error = iso.lastError().?;
-    const failed_copy = blk: {
-        const previous_allocator = mruby.alloc.gpa;
-        mruby.alloc.gpa = std.testing.failing_allocator;
-        defer mruby.alloc.gpa = previous_allocator;
-        break :blk ruby_error.message();
-    };
-    try std.testing.expectEqualStrings("", failed_copy);
+    const failed_copy = ruby_error.message(std.testing.failing_allocator);
+    try std.testing.expectError(error.OutOfMemory, failed_copy);
 
-    const message = ruby_error.message();
-    defer mruby.alloc.gpa.free(message);
-    const class_name = ruby_error.className();
-    defer mruby.alloc.gpa.free(class_name);
-    const repeated_message = ruby_error.message();
-    defer mruby.alloc.gpa.free(repeated_message);
-    const repeated_class = ruby_error.className();
-    defer mruby.alloc.gpa.free(repeated_class);
+    const message = try ruby_error.message(std.testing.allocator);
+    defer std.testing.allocator.free(message);
+    const class_name = try ruby_error.className(std.testing.allocator);
+    defer std.testing.allocator.free(class_name);
+    const repeated_message = try ruby_error.message(std.testing.allocator);
+    defer std.testing.allocator.free(repeated_message);
+    const repeated_class = try ruby_error.className(std.testing.allocator);
+    defer std.testing.allocator.free(repeated_class);
+    var details = try ruby_error.details(std.testing.allocator, .{
+        .max_backtrace_frames = 1,
+    });
+    defer details.deinit();
 
     try std.testing.expectEqualStrings("stored\x00 snowman: ☃", message);
     try std.testing.expectEqualStrings("DiagnosticOuter::HostileError", class_name);
     try std.testing.expectEqualStrings(message, repeated_message);
     try std.testing.expectEqualStrings(class_name, repeated_class);
+    try std.testing.expectEqualStrings(message, details.message);
+    try std.testing.expectEqualStrings(class_name, details.class_name);
+    try std.testing.expectEqual(@as(usize, 0), details.backtrace.len);
+    try std.testing.expect(!details.backtrace_truncated);
     const after = iso.stats();
     try std.testing.expectEqual(before.instructions, after.instructions);
     try std.testing.expectEqual(before.gas.?.observed_instructions, after.gas.?.observed_instructions);
@@ -2623,10 +2926,10 @@ test "sandbox: inert diagnostics use a fixed anonymous class fallback" {
         \\raise anonymous, "anonymous message"
     ));
     const ruby_error = iso.lastError().?;
-    const message = ruby_error.message();
-    defer mruby.alloc.gpa.free(message);
-    const class_name = ruby_error.className();
-    defer mruby.alloc.gpa.free(class_name);
+    const message = try ruby_error.message(std.testing.allocator);
+    defer std.testing.allocator.free(message);
+    const class_name = try ruby_error.className(std.testing.allocator);
+    defer std.testing.allocator.free(class_name);
     try std.testing.expectEqualStrings("anonymous message", message);
     try std.testing.expectEqualStrings("<anonymous exception>", class_name);
 }
@@ -2666,8 +2969,8 @@ test "sandbox: private diagnostic and policy roots are hidden from ObjectSpace" 
         \\end
         \\raise "root survives"
     ));
-    const message = iso.lastError().?.message();
-    defer mruby.alloc.gpa.free(message);
+    const message = try iso.lastError().?.message(std.testing.allocator);
+    defer std.testing.allocator.free(message);
     try std.testing.expectEqualStrings("root survives", message);
 
     try std.testing.expectError(error.GasExhausted, iso.run("while true; end"));
@@ -2747,8 +3050,8 @@ test "vm: value-construction OOM is contained as a Ruby exception" {
     try std.testing.expectError(error.RubyException, result);
     try std.testing.expect(failing.has_induced_failure);
     const exception = vm.lastError() orelse return error.MissingRubyException;
-    const class_name = exception.className();
-    defer mruby.alloc.gpa.free(class_name);
+    const class_name = try exception.className(std.testing.allocator);
+    defer std.testing.allocator.free(class_name);
     try std.testing.expectEqualStrings("NoMemoryError", class_name);
 
     vm.clearError();
@@ -2861,8 +3164,8 @@ test "sandbox: runImage surfaces an uncaught exception without poisoning the iso
     // Pre-fix, runImage returned the RuntimeError as a successful Value and
     // left mrb->exc pending. It must now report the raise as an error.
     try std.testing.expectError(error.RubyException, iso.runImage(image));
-    const msg = iso.lastError().?.message();
-    defer mruby.alloc.gpa.free(msg);
+    const msg = try iso.lastError().?.message(std.testing.allocator);
+    defer std.testing.allocator.free(msg);
     try std.testing.expectEqualStrings("boom", msg);
     // And the stale exception must not leak into the next run.
     const ok = try iso.run("1 + 2");

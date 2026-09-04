@@ -13,11 +13,13 @@
 //!
 //! The allocator is process-global (an upstream 4.0 constraint: the function
 //! has no user-data parameter). Call `setAllocator` before creating the first
-//! `Vm`; afterwards it must not change. The default is `std.heap.c_allocator`
-//! (thread-safe). If you supply another allocator, it must be safe to call
-//! from whatever threads host `Vm` instances.
+//! `Vm`; afterwards it must not change. The build defaults to
+//! `std.heap.c_allocator` and can select a process-lifetime arena instead. If
+//! you supply another allocator, it must be safe to call from whatever threads
+//! host `Vm` instances.
 
 const std = @import("std");
+const allocator_config = @import("allocator_config");
 
 const header_align = 16;
 const AllocationHeader = extern struct {
@@ -28,13 +30,35 @@ const AllocationHeader = extern struct {
 };
 const header_bytes = std.mem.alignForward(usize, @sizeOf(AllocationHeader), header_align);
 
-pub var gpa: std.mem.Allocator = std.heap.c_allocator;
+pub const DefaultAllocator = enum {
+    libc,
+    arena,
+};
+
+/// Allocator selected by the package build. `setAllocator` may replace it
+/// before the first mruby allocation.
+pub const configured_default: DefaultAllocator =
+    if (allocator_config.use_arena) .arena else .libc;
+
+// The arena profile deliberately shares the process lifetime of mruby's global
+// allocator hook. Its child is thread-safe, as required for separate VMs on
+// separate threads; individual frees may be retained until process exit.
+var process_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+
+fn configuredAllocator() std.mem.Allocator {
+    return switch (configured_default) {
+        .libc => std.heap.c_allocator,
+        .arena => process_arena.allocator(),
+    };
+}
+
+pub var gpa: std.mem.Allocator = configuredAllocator();
 var any_allocation = std.atomic.Value(bool).init(false);
 var live_bytes = std.atomic.Value(usize).init(0);
 var live_allocs = std.atomic.Value(usize).init(0);
 
-/// Replace the allocator backing all mruby heaps. Must be called before the
-/// first `Vm` is initialized (i.e. before any mruby allocation happens).
+/// Replace the configured allocator backing all mruby heaps. Must be called
+/// before the first `Vm` is initialized (i.e. before any mruby allocation).
 pub fn setAllocator(a: std.mem.Allocator) void {
     if (any_allocation.load(.acquire)) {
         @panic("mruby.alloc.setAllocator called after the first allocation; choose the allocator up front");
@@ -290,6 +314,12 @@ fn projectedLive(ic: *IsolateCell, owner: *OwnerToken, old: ?AllocationHeader, s
         if (header.owner == owner) base -|= header.size;
     }
     return base +| size;
+}
+
+test "build-selected allocator initializes the runtime default" {
+    const expected = configuredAllocator();
+    try std.testing.expect(gpa.ptr == expected.ptr);
+    try std.testing.expect(gpa.vtable == expected.vtable);
 }
 
 test "an unowned realloc cannot subtract another cell's charged bytes" {

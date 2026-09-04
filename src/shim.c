@@ -84,8 +84,39 @@ mrz_protect_result(mrb_state *mrb, mrb_protect_error_func *body, void *data,
   return mrb->exc == NULL;
 }
 
+struct mrz_gc_register_context {
+  mrb_value value;
+};
+
+static mrb_value
+mrz_gc_register_body(mrb_state *mrb, void *data)
+{
+  struct mrz_gc_register_context *context =
+    (struct mrz_gc_register_context*)data;
+  mrb_gc_register(mrb, context->value);
+  return mrb_nil_value();
+}
+
+mrb_bool
+mrz_protected_gc_register(mrb_state *mrb, mrb_value value)
+{
+  struct mrz_gc_register_context context = { value };
+  return mrz_protect_result(mrb, mrz_gc_register_body, &context, NULL);
+}
+
+void
+mrz_gc_unregister(mrb_state *mrb, mrb_value value)
+{
+  mrb_gc_unregister(mrb, value);
+}
+
 struct mrz_load_string_context {
   const char *source;
+  size_t source_length;
+  const char *source_name;
+  size_t source_name_length;
+  char *owned_source_name;
+  mrb_ccontext *compiler_context;
 };
 
 static mrb_value
@@ -93,14 +124,45 @@ mrz_load_string_body(mrb_state *mrb, void *data)
 {
   struct mrz_load_string_context *context =
     (struct mrz_load_string_context*)data;
-  return mrb_load_string(mrb, context->source);
+  if (context->source_name != NULL) {
+    if (context->source_name_length == SIZE_MAX) {
+      mrb_raise(mrb, E_RANGE_ERROR, "source name is too long");
+    }
+    context->owned_source_name =
+      (char*)mrb_malloc(mrb, context->source_name_length + 1);
+    memcpy(context->owned_source_name, context->source_name,
+           context->source_name_length);
+    context->owned_source_name[context->source_name_length] = '\0';
+
+    context->compiler_context = mrb_ccontext_new(mrb);
+    if (context->compiler_context == NULL ||
+        mrb_ccontext_filename(
+          mrb, context->compiler_context, context->owned_source_name) == NULL) {
+      mrb_exc_raise(mrb, mrb_obj_value(mrb->nomem_err));
+    }
+  }
+  return mrb_load_nstring_cxt(
+    mrb, context->source, context->source_length, context->compiler_context);
 }
 
 mrb_bool
-mrz_protected_load_string(mrb_state *mrb, const char *source, mrb_value *out)
+mrz_protected_load_string(mrb_state *mrb,
+                          const char *source, size_t source_length,
+                          const char *source_name, size_t source_name_length,
+                          mrb_value *out)
 {
-  struct mrz_load_string_context context = { source };
-  return mrz_protect_result(mrb, mrz_load_string_body, &context, out);
+  struct mrz_load_string_context context = {
+    source, source_length, source_name, source_name_length, NULL, NULL
+  };
+  mrb_bool success =
+    mrz_protect_result(mrb, mrz_load_string_body, &context, out);
+  if (context.compiler_context != NULL) {
+    mrb_ccontext_free(mrb, context.compiler_context);
+  }
+  if (context.owned_source_name != NULL) {
+    mrb_free(mrb, context.owned_source_name);
+  }
+  return success;
 }
 
 struct mrz_load_irep_context {
@@ -130,6 +192,7 @@ struct mrz_funcall_context {
   size_t name_length;
   mrb_int argc;
   const mrb_value *argv;
+  mrb_value block;
 };
 
 static mrb_value
@@ -137,8 +200,9 @@ mrz_funcall_body(mrb_state *mrb, void *data)
 {
   struct mrz_funcall_context *context = (struct mrz_funcall_context*)data;
   mrb_sym method = mrb_intern(mrb, context->name, context->name_length);
-  return mrb_funcall_argv(mrb, context->receiver, method, context->argc,
-                          context->argv);
+  return mrb_funcall_with_block(
+    mrb, context->receiver, method, context->argc, context->argv,
+    context->block);
 }
 
 mrb_bool
@@ -147,7 +211,19 @@ mrz_protected_funcall(mrb_state *mrb, mrb_value receiver,
                       mrb_int argc, const mrb_value *argv, mrb_value *out)
 {
   struct mrz_funcall_context context = {
-    receiver, name, name_length, argc, argv
+    receiver, name, name_length, argc, argv, mrb_nil_value()
+  };
+  return mrz_protect_result(mrb, mrz_funcall_body, &context, out);
+}
+
+mrb_bool
+mrz_protected_funcall_with_block(mrb_state *mrb, mrb_value receiver,
+                                 const char *name, size_t name_length,
+                                 mrb_int argc, const mrb_value *argv,
+                                 mrb_value block, mrb_value *out)
+{
+  struct mrz_funcall_context context = {
+    receiver, name, name_length, argc, argv, block
   };
   return mrz_protect_result(mrb, mrz_funcall_body, &context, out);
 }
@@ -159,7 +235,7 @@ mrz_protected_funcall_preserve_error(mrb_state *mrb, mrb_value receiver,
 {
   struct RObject *pending = mrb->exc;
   struct mrz_funcall_context context = {
-    receiver, name, name_length, 0, NULL
+    receiver, name, name_length, 0, NULL, mrb_nil_value()
   };
   mrb_bool success =
     mrz_protect_result(mrb, mrz_funcall_body, &context, out);
@@ -249,6 +325,178 @@ mrz_protected_float(mrb_state *mrb, mrb_float floating, mrb_value *out)
   return mrz_protect_result(mrb, mrz_float_body, &context, out);
 }
 
+struct mrz_array_context {
+  mrb_value array;
+  const mrb_value *values;
+  size_t length;
+  mrb_int index;
+  mrb_value value;
+};
+
+static mrb_value
+mrz_array_new_body(mrb_state *mrb, void *data)
+{
+  struct mrz_array_context *context = (struct mrz_array_context*)data;
+  if (context->length > MRB_INT_MAX) {
+    mrb_raise(mrb, E_RANGE_ERROR, "array is too long");
+  }
+  return mrb_ary_new_from_values(
+    mrb, (mrb_int)context->length, context->values);
+}
+
+static mrb_value
+mrz_array_get_body(mrb_state *mrb, void *data)
+{
+  (void)mrb;
+  struct mrz_array_context *context = (struct mrz_array_context*)data;
+  return mrb_ary_entry(context->array, context->index);
+}
+
+static mrb_value
+mrz_array_set_body(mrb_state *mrb, void *data)
+{
+  struct mrz_array_context *context = (struct mrz_array_context*)data;
+  mrb_ary_set(mrb, context->array, context->index, context->value);
+  return mrb_nil_value();
+}
+
+static mrb_value
+mrz_array_push_body(mrb_state *mrb, void *data)
+{
+  struct mrz_array_context *context = (struct mrz_array_context*)data;
+  mrb_ary_push(mrb, context->array, context->value);
+  return mrb_nil_value();
+}
+
+mrb_bool
+mrz_protected_array_new(mrb_state *mrb, const mrb_value *values,
+                        size_t length, mrb_value *out)
+{
+  struct mrz_array_context context = {
+    mrb_nil_value(), values, length, 0, mrb_nil_value()
+  };
+  return mrz_protect_result(mrb, mrz_array_new_body, &context, out);
+}
+
+mrb_bool
+mrz_protected_array_get(mrb_state *mrb, mrb_value array, mrb_int index,
+                        mrb_value *out)
+{
+  struct mrz_array_context context = {
+    array, NULL, 0, index, mrb_nil_value()
+  };
+  return mrz_protect_result(mrb, mrz_array_get_body, &context, out);
+}
+
+mrb_bool
+mrz_protected_array_set(mrb_state *mrb, mrb_value array, mrb_int index,
+                        mrb_value value)
+{
+  struct mrz_array_context context = { array, NULL, 0, index, value };
+  return mrz_protect_result(mrb, mrz_array_set_body, &context, NULL);
+}
+
+mrb_bool
+mrz_protected_array_push(mrb_state *mrb, mrb_value array, mrb_value value)
+{
+  struct mrz_array_context context = { array, NULL, 0, 0, value };
+  return mrz_protect_result(mrb, mrz_array_push_body, &context, NULL);
+}
+
+struct mrz_hash_entry {
+  mrb_value key;
+  mrb_value value;
+};
+
+struct mrz_hash_context {
+  mrb_value hash;
+  const struct mrz_hash_entry *entries;
+  size_t length;
+  mrb_value key;
+  mrb_value value;
+  mrb_bool found;
+};
+
+static mrb_value
+mrz_hash_new_body(mrb_state *mrb, void *data)
+{
+  struct mrz_hash_context *context = (struct mrz_hash_context*)data;
+  if (context->length > MRB_INT_MAX) {
+    mrb_raise(mrb, E_RANGE_ERROR, "hash is too large");
+  }
+  mrb_value hash = mrb_hash_new_capa(mrb, (mrb_int)context->length);
+  for (size_t i = 0; i < context->length; i++) {
+    mrb_hash_set(
+      mrb, hash, context->entries[i].key, context->entries[i].value);
+  }
+  return hash;
+}
+
+static mrb_value
+mrz_hash_get_body(mrb_state *mrb, void *data)
+{
+  struct mrz_hash_context *context = (struct mrz_hash_context*)data;
+  mrb_value result =
+    mrb_hash_fetch(mrb, context->hash, context->key, mrb_undef_value());
+  context->found = !mrb_undef_p(result);
+  return context->found ? result : mrb_nil_value();
+}
+
+static mrb_value
+mrz_hash_set_body(mrb_state *mrb, void *data)
+{
+  struct mrz_hash_context *context = (struct mrz_hash_context*)data;
+  mrb_hash_set(mrb, context->hash, context->key, context->value);
+  return mrb_nil_value();
+}
+
+static mrb_value
+mrz_hash_keys_body(mrb_state *mrb, void *data)
+{
+  struct mrz_hash_context *context = (struct mrz_hash_context*)data;
+  return mrb_hash_keys(mrb, context->hash);
+}
+
+mrb_bool
+mrz_protected_hash_new(mrb_state *mrb,
+                       const struct mrz_hash_entry *entries,
+                       size_t length, mrb_value *out)
+{
+  struct mrz_hash_context context = {
+    mrb_nil_value(), entries, length, mrb_nil_value(), mrb_nil_value(), FALSE
+  };
+  return mrz_protect_result(mrb, mrz_hash_new_body, &context, out);
+}
+
+mrb_bool
+mrz_protected_hash_get(mrb_state *mrb, mrb_value hash, mrb_value key,
+                       mrb_bool *found, mrb_value *out)
+{
+  struct mrz_hash_context context = {
+    hash, NULL, 0, key, mrb_nil_value(), FALSE
+  };
+  if (!mrz_protect_result(mrb, mrz_hash_get_body, &context, out)) return FALSE;
+  if (found != NULL) *found = context.found;
+  return TRUE;
+}
+
+mrb_bool
+mrz_protected_hash_set(mrb_state *mrb, mrb_value hash, mrb_value key,
+                       mrb_value value)
+{
+  struct mrz_hash_context context = { hash, NULL, 0, key, value, FALSE };
+  return mrz_protect_result(mrb, mrz_hash_set_body, &context, NULL);
+}
+
+mrb_bool
+mrz_protected_hash_keys(mrb_state *mrb, mrb_value hash, mrb_value *out)
+{
+  struct mrz_hash_context context = {
+    hash, NULL, 0, mrb_nil_value(), mrb_nil_value(), FALSE
+  };
+  return mrz_protect_result(mrb, mrz_hash_keys_body, &context, out);
+}
+
 struct mrz_intern_context {
   const char *name;
   size_t length;
@@ -279,6 +527,7 @@ enum mrz_define_kind {
 };
 
 struct mrz_define_context {
+  struct RClass *outer;
   const char *name;
   size_t name_length;
   struct RClass *super;
@@ -292,12 +541,16 @@ mrz_define_body(mrb_state *mrb, void *data)
   mrb_sym name = mrb_intern(mrb, context->name, context->name_length);
   struct RClass *klass;
   if (context->kind == MRZ_DEFINE_MODULE) {
-    klass = mrb_define_module_id(mrb, name);
+    klass = context->outer == NULL
+      ? mrb_define_module_id(mrb, name)
+      : mrb_define_module_under_id(mrb, context->outer, name);
   }
   else {
     struct RClass *super =
       context->super == NULL ? mrb->object_class : context->super;
-    klass = mrb_define_class_id(mrb, name, super);
+    klass = context->outer == NULL
+      ? mrb_define_class_id(mrb, name, super)
+      : mrb_define_class_under_id(mrb, context->outer, name, super);
   }
   return mrb_obj_value(klass);
 }
@@ -306,7 +559,21 @@ mrb_bool
 mrz_protected_define(mrb_state *mrb, const char *name, size_t name_length,
                      struct RClass *super, uint8_t kind, mrb_value *out)
 {
-  struct mrz_define_context context = { name, name_length, super, kind };
+  struct mrz_define_context context = {
+    NULL, name, name_length, super, kind
+  };
+  return mrz_protect_result(mrb, mrz_define_body, &context, out);
+}
+
+mrb_bool
+mrz_protected_define_under(mrb_state *mrb, struct RClass *outer,
+                           const char *name, size_t name_length,
+                           struct RClass *super, uint8_t kind,
+                           mrb_value *out)
+{
+  struct mrz_define_context context = {
+    outer, name, name_length, super, kind
+  };
   return mrz_protect_result(mrb, mrz_define_body, &context, out);
 }
 
@@ -360,6 +627,38 @@ mrz_protected_lookup(mrb_state *mrb, const char *name, size_t length,
 {
   struct mrz_lookup_context context = { name, length };
   return mrz_protect_result(mrb, mrz_lookup_body, &context, out);
+}
+
+struct mrz_const_get_context {
+  struct RClass *outer;
+  const char *name;
+  size_t length;
+  mrb_bool found;
+};
+
+static mrb_value
+mrz_const_get_body(mrb_state *mrb, void *data)
+{
+  struct mrz_const_get_context *context =
+    (struct mrz_const_get_context*)data;
+  mrb_value outer = mrb_obj_value(context->outer);
+  mrb_sym name = mrb_intern(mrb, context->name, context->length);
+  context->found = mrb_const_defined_at(mrb, outer, name);
+  if (!context->found) return mrb_nil_value();
+  return mrb_const_get(mrb, outer, name);
+}
+
+mrb_bool
+mrz_protected_const_get(mrb_state *mrb, struct RClass *outer,
+                        const char *name, size_t length,
+                        mrb_bool *found, mrb_value *out)
+{
+  struct mrz_const_get_context context = {
+    outer, name, length, FALSE
+  };
+  if (!mrz_protect_result(mrb, mrz_const_get_body, &context, out)) return FALSE;
+  if (found != NULL) *found = context.found;
+  return TRUE;
 }
 
 struct mrz_named_value_context {

@@ -50,10 +50,10 @@ pub fn main(init: std.process.Init) !u8 {
 
     const result = vm.loadString(src.items) catch {
         const exc = vm.lastError().?;
-        const cls = exc.className();
-        defer mruby.alloc.gpa.free(cls);
-        const msg = exc.message();
-        defer mruby.alloc.gpa.free(msg);
+        const cls = try exc.className(std.heap.page_allocator);
+        defer std.heap.page_allocator.free(cls);
+        const msg = try exc.message(std.heap.page_allocator);
+        defer std.heap.page_allocator.free(msg);
         try out.print("{s}: {s}\n", .{ cls, msg });
         try out.flush();
         vm.printError();

@@ -114,7 +114,70 @@ pub const Class = struct {
             val.v,
         )) return error.RubyException;
     }
+
+    /// Define a class directly beneath this class/module.
+    pub fn defineClass(self: Class, name: []const u8, super: ?Class) !Class {
+        if (super) |parent| try parent.ensureOwnedBy(self.mrb);
+        var result: c.mrb_value = undefined;
+        if (!c.mrz_protected_define_under(
+            self.mrb,
+            self.class,
+            name.ptr,
+            name.len,
+            if (super) |parent| parent.class else null,
+            c.MRZ_DEFINE_CLASS,
+            &result,
+        )) return error.RubyException;
+        return classFromRaw(self.mrb, result);
+    }
+
+    /// Define a module directly beneath this class/module.
+    pub fn defineModule(self: Class, name: []const u8) !Class {
+        var result: c.mrb_value = undefined;
+        if (!c.mrz_protected_define_under(
+            self.mrb,
+            self.class,
+            name.ptr,
+            name.len,
+            null,
+            c.MRZ_DEFINE_MODULE,
+            &result,
+        )) return error.RubyException;
+        return classFromRaw(self.mrb, result);
+    }
+
+    /// Fetch a constant defined directly beneath this class/module.
+    pub fn getConst(self: Class, name: []const u8) !Value {
+        var found = false;
+        var result: c.mrb_value = undefined;
+        if (!c.mrz_protected_const_get(
+            self.mrb,
+            self.class,
+            name.ptr,
+            name.len,
+            &found,
+            &result,
+        )) return error.RubyException;
+        if (!found) return error.UnknownConstant;
+        return .{ .mrb = self.mrb, .v = result };
+    }
+
+    /// Fetch a class/module defined directly beneath this class/module.
+    pub fn getClass(self: Class, name: []const u8) !Class {
+        const value = self.getConst(name) catch |err| switch (err) {
+            error.UnknownConstant => return error.UnknownClass,
+            else => return err,
+        };
+        return classFromRaw(self.mrb, value.v);
+    }
 };
+
+fn classFromRaw(mrb: *c.mrb_state, value: c.mrb_value) !Class {
+    if (!c.mrz_class_p(value) and !c.mrz_module_p(value))
+        return error.UnknownClass;
+    const ptr = c.mrz_ptr(value) orelse return error.UnknownClass;
+    return .{ .mrb = mrb, .class = @ptrCast(@alignCast(ptr)) };
+}
 
 fn aspec(comptime fmt: []const u8) c.mrb_aspec {
     var req: u32 = 0;

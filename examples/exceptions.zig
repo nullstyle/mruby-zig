@@ -37,10 +37,10 @@ pub fn main(init: std.process.Init) !void {
     // 2. A Ruby exception, caught in Zig.
     _ = vm.loadString("raise ArgumentError, 'from ruby'") catch {
         const exc = vm.lastError().?;
-        const class_name = exc.className();
-        defer mruby.alloc.gpa.free(class_name);
-        const msg = exc.message();
-        defer mruby.alloc.gpa.free(msg);
+        const class_name = try exc.className(std.heap.page_allocator);
+        defer std.heap.page_allocator.free(class_name);
+        const msg = try exc.message(std.heap.page_allocator);
+        defer std.heap.page_allocator.free(msg);
         try buffer.writer.print("caught: {s}: {s}\n", .{ class_name, msg });
     };
 
