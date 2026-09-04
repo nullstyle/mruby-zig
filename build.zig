@@ -779,6 +779,60 @@ pub fn build(b: *std.Build) !void {
         run_step.dependOn(&run_cmd.step);
     }
 
+    // CodeDB phase 1: compile application Ruby at build time with the host
+    // mrbc (two passes; rite_envelope gates determinism), wrap into typed
+    // envelopes, and emit an embeddable manifest module.
+    const codedb_sources = [_][]const u8{ "accumulate", "dispatch" };
+    const artifact_lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/artifact.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const rite_envelope = hostTool(b, "tools/rite_envelope.zig");
+    rite_envelope.root_module.addImport("artifact", artifact_lib_mod);
+    rite_envelope.root_module.addImport("artifact_config", artifact_config);
+    const envelope_run = b.addRunArtifact(rite_envelope);
+    const codedb_dir = envelope_run.addOutputDirectoryArg("codedb");
+    for (codedb_sources) |name| {
+        const rb = b.path(b.fmt("examples/codedb/{s}.rb", .{name}));
+        const mrbc_a = b.addRunArtifact(mrbc);
+        mrbc_a.addArg("-g");
+        mrbc_a.addArg("-o");
+        const pass_a = mrbc_a.addOutputFileArg(b.fmt("{s}_a.mrb", .{name}));
+        mrbc_a.addFileArg(rb);
+        const mrbc_b = b.addRunArtifact(mrbc);
+        mrbc_b.addArg("-g");
+        mrbc_b.addArg("-o");
+        const pass_b = mrbc_b.addOutputFileArg(b.fmt("{s}_b.mrb", .{name}));
+        mrbc_b.addFileArg(rb);
+        envelope_run.addArg(name);
+        envelope_run.addFileArg(pass_a);
+        envelope_run.addFileArg(pass_b);
+    }
+    const codedb_manifest_mod = b.createModule(.{
+        .root_source_file = codedb_dir.path(b, "manifest.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const codedb_demo_mod = b.createModule(.{
+        .root_source_file = b.path("examples/codedb_demo.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+    });
+    codedb_demo_mod.addImport("mruby", mruby_mod);
+    codedb_demo_mod.addAnonymousImport("codedb_manifest", .{
+        .root_source_file = codedb_dir.path(b, "manifest.zig"),
+    });
+    const codedb_demo = b.addExecutable(.{ .name = "codedb-demo", .root_module = codedb_demo_mod });
+    check_step.dependOn(&codedb_demo.step);
+    b.installArtifact(codedb_demo);
+    const run_codedb_demo = b.addRunArtifact(codedb_demo);
+    run_codedb_demo.step.dependOn(b.getInstallStep());
+    const codedb_step = b.step("run-codedb-demo", "run the CodeDB build-time compilation demo");
+    codedb_step.dependOn(&run_codedb_demo.step);
+    _ = codedb_manifest_mod;
+
     // Benchmarks.
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("tools/bench.zig"),

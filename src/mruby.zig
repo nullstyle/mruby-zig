@@ -36,6 +36,7 @@ pub const artifact = @import("artifact.zig");
 pub const sandbox = @import("sandbox.zig");
 pub const worker = @import("worker.zig");
 pub const features = @import("features.zig");
+pub const codedb = @import("codedb.zig");
 
 // libmruby's C objects call this Zig export even when a consumer only reads
 // compile-time metadata from this module. Force the allocator namespace to be

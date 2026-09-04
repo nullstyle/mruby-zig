@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+CodeDB phase 1 (tracer bullet, see docs/plans/codedb.md):
+
+- Application Ruby is now a build-time input: the host mrbc from the
+  bootstrap pipeline compiles each source twice (identical bytes
+  required — the determinism gate), tools/rite_envelope.zig wraps the
+  RITE into typed envelopes carrying the build compatibility
+  fingerprint, and a generated manifest module embeds the artifacts.
+  `mruby.codedb.run(iso, manifest, name)` executes entries through the
+  normal policy path with no runtime parsing. `zig build
+  run-codedb-demo` demonstrates the flow over examples/codedb/*.rb.
+
 Security review follow-up:
 
 - Added `zig build fuzz-state-materialize`: a coverage-guided fuzz target
