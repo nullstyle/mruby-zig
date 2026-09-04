@@ -278,6 +278,10 @@ host. A determined adversary with the full language surface — including bugs
 in mruby, its gems, or host callbacks — can corrupt the process. Do not run
 genuinely hostile input in-process.
 
+When using the worker tier, the helper binary is part of the trusted
+computing base: a swapped helper bypasses every policy, so ship and verify
+it exactly like the application binary.
+
 `mruby.worker.runRite` provides the first out-of-process tier for one-shot
 jobs. It starts a fresh helper, transfers only typed RITE and StateCapsule
 bytes, applies a hard parent deadline and CPU limit, optionally caps the Linux

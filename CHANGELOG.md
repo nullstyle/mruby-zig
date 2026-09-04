@@ -2,6 +2,16 @@
 
 ## 0.4.0 (2026-09-04)
 
+Security review:
+
+- Added the v0.4.0 security review (docs/security-review-2026-09.md):
+  manual review of the worker boundary, artifact attack surface, sandbox
+  enforcement, and capability manifest. No critical or high findings;
+  one medium follow-up (a fuzz target through the C materialization
+  boundary), one trusted-computing-base clarification for the worker
+  helper, and accepted, documented risks (macOS address-space ceilings,
+  in-process tier scope).
+
 Cross-version artifact fixtures:
 
 - Checked-in byte fixtures produced by the v0.3.0 tag

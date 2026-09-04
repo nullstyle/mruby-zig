@@ -61,6 +61,7 @@ deploy the matching `mruby-worker` executable produced by the build.
 | [platforms.md](docs/platforms.md) | support matrix and CI coverage |
 | [maintenance.md](docs/maintenance.md) | the Zig build of mruby, the audited hash patch, upgrade and release procedures |
 | [benchmarks.md](docs/benchmarks.md) | the `run-bench` suite, reference numbers, and binary-size baselines |
+| [security-review-2026-09.md](docs/security-review-2026-09.md) | v0.4.0 boundary review: verified-strong areas, findings, accepted risks |
 
 Runnable examples (built and executed in CI):
 [quickstart](examples/quickstart.zig) — embed and evaluate;
