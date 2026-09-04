@@ -27,6 +27,7 @@ jobs:
           ./zig-out/bin/quickstart
           ./zig-out/bin/host_functions
           ./zig-out/bin/exceptions
+          ./zig-out/bin/sandbox
           ./zig-out/bin/mruby-repl -e '[1,2,3].sum'
           if ./zig-out/bin/mruby-repl -e "raise 'expected failure'"; then
             exit 1

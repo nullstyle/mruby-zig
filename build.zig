@@ -473,7 +473,7 @@ pub fn build(b: *std.Build) !void {
     process_fixture_step.dependOn(&run_capsule_consumer.step);
 
     // Examples.
-    const ex_names = [_][]const u8{ "quickstart", "host_functions", "exceptions" };
+    const ex_names = [_][]const u8{ "quickstart", "host_functions", "exceptions", "sandbox" };
     for (ex_names) |ex_name| {
         const ex_mod = b.createModule(.{
             .root_source_file = b.path(b.fmt("examples/{s}.zig", .{ex_name})),

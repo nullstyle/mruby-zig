@@ -554,6 +554,33 @@ test "derived class methods and module functions" {
     );
 }
 
+test "Class.fromValue resolves class objects without global storage" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    const cls = try vm.defineClass("FromValue", null);
+    const resolved = try mruby.Class.fromValue(cls.asValue());
+    try std.testing.expectEqual(cls.class, resolved.class);
+
+    // A class method's self is the defining class; fromValue reaches it
+    // without a process-global slot.
+    try cls.defineClassMethod("identity", struct {
+        fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
+            _ = m;
+            const me = try mruby.Class.fromValue(self);
+            return me.asValue();
+        }
+    }.call);
+    const same = try vm.loadString("FromValue.identity == FromValue");
+    try std.testing.expect(same.isTruthy());
+
+    // Non-class values are rejected.
+    try std.testing.expectError(
+        error.UnknownClass,
+        mruby.Class.fromValue(try vm.intValue(1)),
+    );
+}
+
 test "zig errors surface as runtime errors" {
     const vm = try mruby.Vm.init();
     defer vm.deinit();

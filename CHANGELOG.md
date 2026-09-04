@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+Documentation reorganization:
+
+- The README is now a lean overview plus quickstart; the detailed guides
+  live in `docs/`: getting-started (build options, gems, allocator,
+  feature manifest), safe-api (embedding, lifetimes, threading),
+  sandboxing (policy, limits, threat model), artifacts (RITE and state
+  capsules, compatibility policy), platforms (support matrix and CI
+  coverage), and maintenance (the Zig build of mruby, the audited hash
+  patch, upgrade and release procedures). `docs/` ships with the package.
+- Added a runnable sandbox example (`zig build run-sandbox`) covering a
+  restricted policy, host bootstrap + seal, gas exhaustion with recovery,
+  and host access between runs; CI builds and executes it like the other
+  examples.
+- Added `Class.fromValue`, the supported way for a `defineClassMethod`
+  callback to reach its defining class (`self`) without process-global
+  storage; the host_functions example no longer uses a static class slot.
+
 Isolate host operations between executions:
 
 - Added `Isolate.getGlobal`, `setGlobal`, and `clearError`: the locked,

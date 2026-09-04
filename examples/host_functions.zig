@@ -23,15 +23,14 @@ const MixerData = mruby.data.DataType(Mixer, "Audio::Mixer", struct {
 }.destroy);
 
 const MixerMethods = struct {
-    var class: ?mruby.Class = null;
-
     fn init_(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
-        _ = self;
+        _ = m;
+        // `self` of a class method is the class itself, so no process-global
+        // class storage is needed (safe with any number of VMs).
+        const cls = try mruby.Class.fromValue(self);
         const p = try mruby.alloc.gpa.create(Mixer);
         errdefer mruby.alloc.gpa.destroy(p);
         p.* = .{};
-        const cls = class orelse return error.MissingClass;
-        try cls.ensureOwnedBy(m.mrb);
         return MixerData.wrap(cls, p);
     }
 
@@ -61,7 +60,6 @@ const MixerMethods = struct {
 };
 
 fn registerMixer(cls: mruby.Class) !void {
-    MixerMethods.class = cls;
     try cls.defineClassMethod("new", MixerMethods.init_);
     try cls.defineMethod("set_volume", MixerMethods.setVolume);
     try cls.defineMethod("mix", MixerMethods.mix);

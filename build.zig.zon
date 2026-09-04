@@ -9,6 +9,7 @@
         "src",
         "examples",
         "tools",
+        "docs",
         "LICENSE",
         "README.md",
         "CHANGELOG.md",

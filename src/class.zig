@@ -81,6 +81,14 @@ pub const Class = struct {
         return .{ .mrb = self.mrb, .v = c.mrz_obj_value(@ptrCast(self.class)) };
     }
 
+    /// View a class/module object `Value` as a `Class`. In a
+    /// `defineClassMethod` callback, `self` is the class, so this is the
+    /// supported way to reach the defining class without process-global
+    /// storage.
+    pub fn fromValue(value: Value) !Class {
+        return classFromRaw(value.mrb, value.v);
+    }
+
     pub fn ensureOwnedBy(self: Class, mrb: *c.mrb_state) error{ForeignValue}!void {
         if (self.mrb != mrb) return error.ForeignValue;
     }
