@@ -195,6 +195,21 @@ declare that option and forward it as
   `error.WorkerFailed`. CPU and address-space ceilings apply to each process,
   not to aggregate usage across a descendant tree; descendants inherit the
   ceilings but receive their own accounting.
+- Controller death is demonstrated end-to-end by
+  `zig build test-worker-orphan` (part of `zig build test` and
+  `test-runtime-only`, so it runs in both compiler profiles on Linux and
+  macOS). A test-only supervisor spawns the real worker under a separate
+  controller it owns, waits for a readiness marker emitted at a real worker
+  boundary — request-body read, execution, or response write — then SIGKILLs
+  only that controller and observes the worker's complete lifetime through a
+  worker-owned pipe, since PID existence alone cannot distinguish a running
+  orphan from a zombie. Demonstrated: a worker blocked reading an incomplete
+  request body exits on pipe EOF (exit 1); a CPU-bound Ruby loop is
+  terminated by its inherited `RLIMIT_CPU` (SIGXCPU); a worker whose only
+  response reader has died exits on broken pipe (exit 1). Killing the
+  controller removes parent-side wall supervision, and `RLIMIT_CPU` does not
+  bound work blocked in native code, so these fixtures claim pipe-closure and
+  CPU-ceiling exits — not general orphan wall-time containment.
 - `process_peak_rss_bytes` is the operating system's direct-child `wait4`
   statistic. It is not a guaranteed measurement of an entire descendant
   tree.

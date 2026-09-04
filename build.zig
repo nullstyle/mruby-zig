@@ -1004,6 +1004,62 @@ pub fn build(b: *std.Build) !void {
     codedb_test_step.dependOn(&run_codedb_demo.step);
     test_step.dependOn(codedb_test_step);
 
+    // A test-only observer gates the same worker execution path while an
+    // independent supervisor kills its controller and observes worker exit.
+    // The installed helper keeps the no-op observer and no fixture C code.
+    if (worker_mod_for_tests) |worker_mod| {
+        const orphan_fixture_mod = b.createModule(.{
+            .root_source_file = b.path("tools/worker_orphan_fixture.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        orphan_fixture_mod.addImport("worker_entry", worker_mod);
+        orphan_fixture_mod.addCSourceFile(.{
+            .file = b.path("tools/worker_orphan_fixture.c"),
+            .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
+        });
+        const orphan_fixture = b.addExecutable(.{
+            .name = "worker-orphan-fixture",
+            .root_module = orphan_fixture_mod,
+        });
+        check_step.dependOn(&orphan_fixture.step);
+        const orphan_config = b.addOptions();
+        orphan_config.addOptionPath("fixture_executable", orphan_fixture.getEmittedBin());
+        const orphan_bundle = try CodeDB.add(b, codedb_tools, .{
+            .tier = .trusted,
+            .sources = &.{
+                .{ .name = "loop", .source = b.path("tools/worker_orphan_fixture_loop.rb") },
+                .{ .name = "response", .source = b.path("tools/worker_orphan_fixture_response.rb") },
+            },
+        });
+        const orphan_tests_mod = b.createModule(.{
+            .root_source_file = b.path("src/worker_orphan_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        orphan_tests_mod.addImport("mruby", mruby_mod);
+        orphan_tests_mod.addImport("worker_protocol", worker_protocol_mod);
+        orphan_tests_mod.addImport("codedb_orphan_manifest", orphan_bundle.manifest);
+        orphan_tests_mod.addOptions("worker_orphan_config", orphan_config);
+        orphan_tests_mod.addCSourceFile(.{
+            .file = b.path("tools/worker_orphan_fixture.c"),
+            .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
+        });
+        const orphan_tests = b.addTest(.{ .root_module = orphan_tests_mod });
+        check_step.dependOn(&orphan_tests.step);
+        const run_orphan_tests = b.addRunArtifact(orphan_tests);
+        const orphan_step = b.step("test-worker-orphan", "test worker exit after its controller is killed");
+        orphan_step.dependOn(&run_orphan_tests.step);
+        test_step.dependOn(orphan_step);
+        runtime_test_step.dependOn(orphan_step);
+    }
+
     const envelope_tests_mod = b.createModule(.{
         .root_source_file = b.path("tools/rite_envelope.zig"),
         .target = b.graph.host,

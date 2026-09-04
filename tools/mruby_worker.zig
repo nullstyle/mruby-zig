@@ -23,10 +23,22 @@ const empty_body: protocol.ResponseBody = .{
 };
 
 pub fn main(init: std.process.Init) !u8 {
-    return run(init) catch 1;
+    return mainObserved(init, NoObserver);
 }
 
-fn run(init: std.process.Init) !u8 {
+// The standalone process regression fixture instantiates this same worker
+// with boundary synchronization. The installed helper uses NoObserver, so
+// there are no inherited fixture descriptors or runtime observation hooks.
+pub const Observation = enum { request_body, execution, response };
+const NoObserver = struct {
+    pub fn reached(comptime _: Observation) !void {}
+};
+
+pub fn mainObserved(init: std.process.Init, comptime Observer: type) !u8 {
+    return run(init, Observer) catch 1;
+}
+
+fn run(init: std.process.Init, comptime Observer: type) !u8 {
     var stdin_buffer: [4096]u8 = undefined;
     var stdin_file = std.Io.File.stdin().reader(init.io, &stdin_buffer);
     const reader = &stdin_file.interface;
@@ -81,6 +93,7 @@ fn run(init: std.process.Init) !u8 {
     };
     defer init.gpa.free(encoded_body);
 
+    try Observer.reached(.request_body);
     reader.readSliceAll(encoded_body) catch {
         return sendSimple(writer, .worker_error, .none, .invalid_request, null);
     };
@@ -92,6 +105,7 @@ fn run(init: std.process.Init) !u8 {
             encoded_body,
             address_space_limited,
             allocation_failures_before,
+            Observer,
         ),
         error.ReadFailed => return sendSimple(writer, .worker_error, .none, .internal_error, null),
     };
@@ -137,6 +151,7 @@ fn execute(
     encoded_body: []const u8,
     address_space_limited: bool,
     allocation_failures_before: usize,
+    comptime Observer: type,
 ) !u8 {
     const body = protocol.splitRequestBody(request, encoded_body) catch {
         return sendSimple(writer, .worker_error, .none, .invalid_request, null);
@@ -216,6 +231,7 @@ fn execute(
         }
     }
 
+    try Observer.reached(.execution);
     const value = isolate.runRite(.{ .bytes = body.image }) catch |err| {
         return sendIsolateError(
             writer,
@@ -266,6 +282,7 @@ fn execute(
             statsToWire(isolate.stats()),
         );
     }
+    try Observer.reached(.response);
     return sendResponse(writer, .{
         .outcome = .value,
         .phase = .none,
