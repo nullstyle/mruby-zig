@@ -15,10 +15,15 @@ Findings from diffing `4.1.0-rc` against our pinned `4.0.0`:
   if the literal context drifts, so application is verified at build time.
   Notably, 4.1 fixes *related* word-boxing wide-Integer compare/sort bugs
   upstream (#7480/#7481) but not the Hash identity fallback itself.
-- **`mrbgems/mruby-compiler` was restructured** (`core/` is gone; an
-  `include/` directory appeared). `build/sources.zig`'s compiler source
-  paths and the presym scan inputs must be re-derived — this is the main
-  mechanical work of the upgrade.
+- **The bison parser is replaced by Prism.** A clean-build attempt
+  (integration branch `mruby-4.1-integration`) shows `y.tab.c` is gone;
+  the compiler gem gained `prism.h`, `mrc_presym.c`, `ccontext.c`,
+  `diagnostic.c`, and `mruby_compat.c` under `src/` with a new
+  `include/` tree. `mruby-bin-mrbc` is also restructured (`mrc_irep.h`,
+  moved bootstrap stubs) and core files (`cdump.c`, `fmt_fp.c`) moved.
+  The presym pipeline, host-`mrbc` bootstrap, source lists, and likely
+  `src/shim.c` all need rework — see `MIGRATION.md` on the integration
+  branch for the full findings and work order.
 - `src/hash.c`, `src/vm.c`, and `include/mruby/value.h` differ (notably
   new NaN-boxing equality notes in `value.h`); `src/shim.c` should be
   reviewed against any macro-inline API changes.
