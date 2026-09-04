@@ -21,6 +21,7 @@ jobs:
       - run: mise install
       - run: mise x -- zig fmt --check .
       - run: mise x -- zig build test
+      - run: mise x -- zig build test -Doptimize=ReleaseSafe
       - run: mise x -- zig build
       - run: |
           ./zig-out/bin/quickstart

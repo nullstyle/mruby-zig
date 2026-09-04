@@ -318,8 +318,13 @@ fn projectedLive(ic: *IsolateCell, owner: *OwnerToken, old: ?AllocationHeader, s
 
 test "build-selected allocator initializes the runtime default" {
     const expected = configuredAllocator();
-    try std.testing.expect(gpa.ptr == expected.ptr);
+    // `c_allocator`'s context pointer is `undefined` by contract and must
+    // not be read; the vtable identifies the allocator. The arena profile's
+    // context is the live arena pointer and must match exactly.
     try std.testing.expect(gpa.vtable == expected.vtable);
+    if (configured_default == .arena) {
+        try std.testing.expect(gpa.ptr == expected.ptr);
+    }
 }
 
 test "an unowned realloc cannot subtract another cell's charged bytes" {

@@ -1808,7 +1808,8 @@ test "sandbox: StateCapsule policy and per-call limits can only tighten" {
 }
 
 test "sandbox: StateCapsule rejects unsupported values and container state with paths" {
-    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    // The ivar branch of the suite exercises instance_variable_set.
+    const iso = try mruby.sandbox.Isolate.spawn(mruby.sandbox.Policy.trusted(.{}));
     defer iso.deinit();
 
     const subclass = try iso.run("class ArtifactArray < Array; end; ArtifactArray.new");
@@ -2232,10 +2233,8 @@ test "sandbox: gas configuration is validated and cached at spawn" {
     } });
     defer iso.deinit();
 
-    // Policy is retained for source compatibility and inspection, but the
-    // authoritative scope and allowance were resolved once at spawn.
-    iso.policy.limits.gas = .unlimited;
-    iso.policy.limits.instructions = 1_000_000;
+    // The Isolate retains no mutable policy: gas scope and allowance were
+    // resolved once at spawn and cannot be reconfigured afterwards.
     try std.testing.expectError(error.GasExhausted, iso.run("while true; end"));
     const gas = iso.stats().gas.?;
     try std.testing.expectEqual(sandbox.GasScope.execution, gas.scope);
@@ -2541,6 +2540,172 @@ test "sandbox: capabilities strip eval, send, introspection, ObjectSpace" {
     );
     const gone_sym = try iso.call(gone, "to_s", .{});
     try std.testing.expectEqualStrings("gone", try gone_sym.asString());
+}
+
+test "sandbox: zero-value policy is the deny-by-default floor" {
+    // A Policy constructed without a preset strips every language
+    // capability, so plain compute scripts run but ambient authority does
+    // not silently accrue.
+    const iso = try sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+
+    const plain = try iso.run("6 * 7");
+    try std.testing.expectEqual(@as(i64, 42), try plain.asInt());
+    try std.testing.expectError(error.RubyException, iso.run("eval('1 + 1')"));
+    iso.vm.clearError();
+    try std.testing.expectError(error.RubyException, iso.run("[1, 2].send(:size)"));
+    iso.vm.clearError();
+    try std.testing.expectError(error.RubyException, iso.run("@x = 1; instance_variable_get(:@x)"));
+    iso.vm.clearError();
+    const gone = try iso.run(
+        \\begin
+        \\  ObjectSpace
+        \\  :reachable
+        \\rescue NameError
+        \\  :gone
+        \\end
+    );
+    const gone_sym = try iso.call(gone, "to_s", .{});
+    try std.testing.expectEqualStrings("gone", try gone_sym.asString());
+}
+
+test "sandbox: trusted preset grants ambient language capabilities" {
+    if (!test_config.has_core_language_suite) return error.SkipZigTest;
+
+    const iso = try sandbox.Isolate.spawn(sandbox.Policy.trusted(.{ .limits = .{
+        .gas = .{ .per_isolate = 1_000_000 },
+    } }));
+    defer iso.deinit();
+
+    const ev = try iso.run("eval('40 + 2')");
+    try std.testing.expectEqual(@as(i64, 42), try ev.asInt());
+    const sd = try iso.run("[1, 2].send(:size)");
+    try std.testing.expectEqual(@as(i64, 2), try sd.asInt());
+    const iv = try iso.run("@x = 5; instance_variable_get(:@x)");
+    try std.testing.expectEqual(@as(i64, 5), try iv.asInt());
+    const reachable = try iso.run(
+        \\begin
+        \\  ObjectSpace
+        \\  :reachable
+        \\rescue NameError
+        \\  :gone
+        \\end
+    );
+    const reachable_sym = try iso.call(reachable, "to_s", .{});
+    try std.testing.expectEqualStrings(
+        if (test_config.has_object_space) "reachable" else "gone",
+        try reachable_sym.asString(),
+    );
+}
+
+test "sandbox: restricted preset strips language grants and freezes the model" {
+    const iso = try sandbox.Isolate.spawn(sandbox.Policy.restricted(.{}));
+    defer iso.deinit();
+
+    try std.testing.expectError(error.RubyException, iso.run("eval('1')"));
+    iso.vm.clearError();
+    try std.testing.expectError(error.RubyException, iso.run("class String; def boom; end; end"));
+    const exc = iso.lastError().?;
+    const cls = try exc.className(std.testing.allocator);
+    defer std.testing.allocator.free(cls);
+    try std.testing.expectEqualStrings("FrozenError", cls);
+
+    // Restricted discards language grants from the base policy rather than
+    // merging them, so composition cannot re-open a stripped surface.
+    const composed = try sandbox.Isolate.spawn(
+        sandbox.Policy.restricted(sandbox.Policy.trusted(.{})),
+    );
+    defer composed.deinit();
+    try std.testing.expectError(error.RubyException, composed.run("eval('1')"));
+    composed.vm.clearError();
+    try std.testing.expectError(error.RubyException, composed.run("class String; def boom; end; end"));
+}
+
+test "sandbox: policy is resolved at spawn; host-side edits afterwards are ignored" {
+    if (!test_config.has_core_language_suite) return error.SkipZigTest;
+
+    var policy = sandbox.Policy{};
+    policy.capabilities.eval = true;
+    const iso = try sandbox.Isolate.spawn(policy);
+    defer iso.deinit();
+    const ev = try iso.run("eval('41 + 1')");
+    try std.testing.expectEqual(@as(i64, 42), try ev.asInt());
+
+    // The isolate resolved its capability snapshot at spawn; editing the
+    // host-held policy value afterwards cannot reconfigure it.
+    policy.capabilities.eval = false;
+    policy.limits.call_depth = 1;
+    const still = try iso.run("eval('40 + 2')");
+    try std.testing.expectEqual(@as(i64, 42), try still.asInt());
+}
+
+test "sandbox: seal applies capabilities at an explicit bootstrap boundary" {
+    const iso = try sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+
+    // Bootstrap window: raw-vm evaluation has not been masked yet, so the
+    // host can define helpers that themselves rely on ambient methods.
+    if (test_config.has_core_language_suite) {
+        const pre = try iso.vm.loadString("eval('40 + 2')");
+        try std.testing.expectEqual(@as(i64, 42), try pre.asInt());
+    }
+
+    try iso.seal();
+
+    // The masks are installed even though no run has happened.
+    if (test_config.has_core_language_suite) {
+        try std.testing.expectError(error.RubyException, iso.run("eval('1')"));
+        iso.vm.clearError();
+    }
+    // A sealed isolate keeps executing compute-only scripts.
+    const plain = try iso.run("21 * 2");
+    try std.testing.expectEqual(@as(i64, 42), try plain.asInt());
+    // Sealing is idempotent.
+    try iso.seal();
+}
+
+test "sandbox: seal under per-execution gas keeps generation accounting" {
+    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+        .gas = .{ .per_execution = 20_000 },
+    } });
+    defer iso.deinit();
+
+    try iso.seal();
+    const r = try iso.run("40 + 1");
+    try std.testing.expectEqual(@as(i64, 41), try r.asInt());
+    const stats = iso.stats();
+    try std.testing.expectEqual(@as(u64, 1), stats.gas.?.generation);
+    try std.testing.expect(!stats.gas.?.exhausted);
+}
+
+test "sandbox: seal rejects re-entrant use from inside a host callback" {
+    const iso = try sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+
+    const Reenter = struct {
+        var target: ?*sandbox.Isolate = null;
+
+        fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
+            _ = self;
+            try target.?.seal();
+            return m.intValue(1);
+        }
+    };
+    Reenter.target = iso;
+
+    const cls = try iso.vm.defineClass("SealReenter", null);
+    try cls.defineMethod("attempt", "", Reenter.call);
+    try std.testing.expectError(error.RubyException, iso.run("SealReenter.new.attempt"));
+    const message = try iso.lastError().?.message(std.testing.allocator);
+    defer std.testing.allocator.free(message);
+    // The seal was rejected as out-of-contract re-entrancy and surfaced as
+    // an ordinary callback error, not a policy termination.
+    try std.testing.expectEqualStrings("zig error: IsolateThreadBusy", message);
+    // Capabilities were not applied by the rejected seal.
+    const plain = try iso.run("21 * 2");
+    try std.testing.expectEqual(@as(i64, 42), try plain.asInt());
+    try iso.seal();
+    try std.testing.expectError(error.RubyException, iso.run("eval('1')"));
 }
 
 test "sandbox: frozen object model blocks def on core classes" {
@@ -2953,9 +3118,9 @@ test "sandbox: rejected outer entry invalidates the previous lastError" {
 test "sandbox: private diagnostic and policy roots are hidden from ObjectSpace" {
     if (!test_config.has_object_space) return error.SkipZigTest;
 
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try sandbox.Isolate.spawn(sandbox.Policy.trusted(.{ .limits = .{
         .gas = .{ .per_execution = 100_000 },
-    } });
+    } }));
     defer iso.deinit();
 
     // Freeze every guest-visible Array. The fixed diagnostic and policy root

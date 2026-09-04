@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+Deny-by-default sandbox policy with explicit trust presets:
+
+- `Policy.capabilities` is now deny-by-default: the zero value strips `eval`,
+  `send`, introspection, and `ObjectSpace`, so a policy constructed without a
+  preset is the fail-closed floor and capabilities added in future releases
+  default to denied. Plain compute scripts run unchanged.
+- Added `Policy.trusted(base)` (grants the ambient language capabilities on
+  top of `base`'s limits/artifacts) and `Policy.restricted(base)` (the
+  deny-by-default floor plus `freeze_object_model`; discards language grants
+  from `base`).
+- The policy is resolved completely at spawn — gas scope and limit, memory
+  caps, wall budget, call-depth ceiling, capability snapshot, and artifact
+  acceptance — and `Isolate` no longer retains a mutable `policy` field.
+  Post-spawn edits to a host-held `Policy` value have no effect (previously
+  `limits.wall_time_ns`, `limits.call_depth`, and `capabilities` were still
+  read live after spawn while gas and memory were not).
+- Added `Isolate.seal()`: applies the policy's capabilities through the same
+  preflight bracket as an execution (admission, deadline start, pending
+  termination; setup gas is charged to the current generation exactly as lazy
+  first-run setup would be), making the bootstrap window explicit. Idempotent,
+  and rejected with `error.IsolateThreadBusy` from inside a host callback.
+  The first `run`/`call` still seals lazily for compatibility.
+- Fixed a test-only undefined-behavior regression: the allocator default test
+  compared `c_allocator`'s `undefined` context pointer, which failed
+  nondeterministically under `ReleaseSafe`. CI now runs the test suite under
+  `-Doptimize=ReleaseSafe` in addition to `Debug`.
+
 Production-safe Zig API:
 
 - Potentially allocating or raising safe-layer operations are now explicitly
@@ -50,6 +77,16 @@ Production-safe Zig API:
 
 Migration:
 
+- Sandbox policies that relied on the old capability defaults must grant them
+  explicitly: wrap the policy in `Policy.trusted(...)` (ambient language
+  capabilities on) or set individual `capabilities` fields. Scripts that only
+  compute need no change. `Isolate.spawn(.{})` now yields the stripped floor
+  rather than full ambient authority.
+- Remove any post-spawn writes to `iso.policy`; resolution happens entirely
+  at spawn and the field no longer exists.
+- Call `Isolate.seal()` after registering host methods when you want the
+  capability masks (including `freeze_object_model`) applied at an explicit
+  boundary instead of lazily at the first execution.
 - Add `try`/`catch` around `Vm.intValue`, `floatValue`, and `stringValue`;
   `Class.defineMethod`, `defineClassMethod`, `defineModuleFunction`, and
   `defineConst`; `data.DataType.wrap`; and `Isolate.sealModel`.

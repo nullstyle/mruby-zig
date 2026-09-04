@@ -306,10 +306,19 @@ values up to ±2^63 work fine.
 ## Sandboxing
 
 `mruby.sandbox.Isolate` wraps a private `Vm` (its own heap, symbols, and
-globals — nothing is shared between isolates) with an enforced policy:
+globals — nothing is shared between isolates) with an enforced policy.
+
+Capability grants are **deny-by-default**: a `Policy` built without a preset
+strips `eval`, `send`, introspection, and `ObjectSpace`, so plain compute
+scripts run while ambient language authority must be granted explicitly —
+including anything a future release might add. The presets compose with your
+limits and artifact acceptance:
 
 ```zig
-const iso = try mruby.sandbox.Isolate.spawn(.{
+// Semi-trusted scripts: deny-by-default capabilities plus a frozen object
+// model and resource ceilings. Host classes/methods go on iso.vm first,
+// then seal, then run.
+const iso = try mruby.sandbox.Isolate.spawn(mruby.sandbox.Policy.restricted(.{
     .limits = .{
         .gas = .{ .per_isolate = 10_000_000 }, // cumulative gas budget
         .wall_time_ns = 250 * std.time.ns_per_ms,
@@ -317,16 +326,15 @@ const iso = try mruby.sandbox.Isolate.spawn(.{
         .call_depth = 64,
     },
     .capabilities = .{
-        .eval = false,             // no eval/instance_eval/binding
-        .send = false,             // no send/__send__/public_send
-        .introspection = false,    // no instance_variable_*/methods
-        .object_space = false,     // ObjectSpace removed
-        .freeze_object_model = true, // def/include on core classes -> FrozenError
-        .random_seed = 42,         // reproducible rand sequences
+        .random_seed = 42,             // reproducible rand sequences
         .clock_epoch_s = 1_700_000_000, // frozen Time.now
     },
-});
+}));
 defer iso.deinit();
+
+// Trusted embedding (scripts the host authored or fully controls) grants
+// the ambient language capabilities instead:
+//   mruby.sandbox.Policy.trusted(.{ .limits = ... })
 
 const result = iso.run(script) catch |err| switch (err) {
     error.ScriptTerminated,   // iso.terminate() from any thread
@@ -485,9 +493,11 @@ report prospective generation 0; actual requests start at generation 1.
 
 `Limits.instructions` is deprecated but remains source-compatible. It maps
 exactly to `.gas = .{ .per_isolate = N }`, preserving cumulative sticky
-behavior. Setting both fields returns `error.ConflictingGasPolicy`. Gas scope
-and limit are resolved at `spawn`; mutating `iso.policy` afterward does not
-reconfigure the meter. Dynamic per-request amounts are not currently
+behavior. Setting both fields returns `error.ConflictingGasPolicy`. The whole
+policy — gas scope and limit, memory caps, wall budget, call-depth ceiling,
+capability snapshot, and artifact acceptance — is resolved once at `spawn`;
+the Isolate retains no mutable policy, so later edits to a host-held `Policy`
+value have no effect. Dynamic per-request amounts are not currently
 supported.
 
 - **Termination** (`iso.terminate()`) is thread-safe and is observed at the
@@ -526,9 +536,13 @@ supported.
   so `ensure` can unwind. Gas does not charge parsing/code generation or work
   inside one C-native opcode.
 - **Lifecycle**: lazy capability setup joins `.per_isolate` gas, but completes
-  before generation 1 for `.per_execution`. Route untrusted work through
-  `Isolate.run`, `runImage`, `runRite`, or `call`; executing directly through
-  `iso.vm` bypasses the generation lifecycle and is for trusted bootstrap only.
+  before generation 1 for `.per_execution`. `Isolate.seal()` ends the
+  bootstrap window explicitly: it applies the policy's capabilities through
+  the same preflight bracket as an execution (so setup gas and deadlines are
+  accounted identically) and is idempotent; the first `run`/`call` seals
+  lazily otherwise. Route untrusted work through `Isolate.run`, `runImage`,
+  `runRite`, or `call`; executing directly through `iso.vm` bypasses the
+  generation lifecycle and is for trusted bootstrap before `seal()` only.
   One non-blocking operation lock covers guest execution and value artifact
   operations; simultaneous same-Isolate access returns `IsolateThreadBusy`.
   Nested guest execution from a callback retains its existing behavior, but a
@@ -537,8 +551,8 @@ supported.
   `terminate()` and `pendingTermination()` remain the cross-thread-safe
   lock-free controls; serialize stats, diagnostics, direct VM access, and
   destruction. `wall_time_ns` starts when the first outer entry begins
-  preflight, continues across idle time, and is never renewed by a new gas
-  generation.
+  preflight (`seal()` counts if it comes first), continues across idle time,
+  and is never renewed by a new gas generation.
 
 **Not covered by the in-process tier** (by design, same as v8 isolates):
 no address-space separation from the host. The planned out-of-process

@@ -11,7 +11,8 @@
 //!     with soft (rescuable NoMemoryError) → hard (un-rescuable
 //!     termination) escalation,
 //!   - `call_depth`: tighter than mruby's fixed 512,
-//!   - `Capabilities`: strip `eval`/`send`/introspection/ObjectSpace,
+//!   - `Capabilities`: deny-by-default grants of `eval`/`send`/
+//!     introspection/ObjectSpace (see `Policy.trusted` / `Policy.restricted`),
 //!     freeze the core object model (`def` → FrozenError), pin the RNG
 //!     seed and the clock for reproducible runs.
 //!
@@ -149,17 +150,24 @@ pub const Limits = struct {
 /// What Ruby-level authority the script gets. The default gem set is
 /// already compute-only (no io/socket/dir/process); these strip
 /// language-level escape hatches and ambient introspection.
+///
+/// Capability grants are **deny-by-default**: the zero value strips every
+/// language capability, so a `Policy` constructed without a preset is the
+/// fail-closed floor. Grant ambient language authority explicitly through
+/// `Policy.trusted` (or individual fields), never by relying on defaults —
+/// a capability added in a future release defaults to denied.
 pub const Capabilities = struct {
-    /// Strip the string-eval and metaprogramming-eval entry points:
+    /// String-eval and metaprogramming-eval entry points:
     /// Kernel#eval / #binding, BasicObject#instance_eval / #instance_exec,
-    /// and Module#class_eval / #module_eval.
-    eval: bool = true,
-    /// send / __send__ / public_send.
-    send: bool = true,
+    /// and Module#class_eval / #module_eval. Denied by default.
+    eval: bool = false,
+    /// send / __send__ / public_send. Denied by default.
+    send: bool = false,
     /// instance_variable_* / methods / method / singleton_methods.
-    introspection: bool = true,
-    /// The ObjectSpace module.
-    object_space: bool = true,
+    /// Denied by default.
+    introspection: bool = false,
+    /// The ObjectSpace module. Denied by default.
+    object_space: bool = false,
     /// Freeze core classes: later `def`/`include` on them raises
     /// FrozenError. Apply after registering host methods.
     freeze_object_model: bool = false,
@@ -173,6 +181,33 @@ pub const Policy = struct {
     limits: Limits = .{},
     capabilities: Capabilities = .{},
     artifacts: artifact_mod.Acceptance = .{},
+
+    /// Trusted-embedding preset: grants the ambient language capabilities
+    /// (`eval`, `send`, `introspection`, `object_space`) on top of `base`.
+    /// Use for Ruby the host authored or fully controls; combine with
+    /// `limits` for resource ceilings.
+    pub fn trusted(base: Policy) Policy {
+        var p = base;
+        p.capabilities.eval = true;
+        p.capabilities.send = true;
+        p.capabilities.introspection = true;
+        p.capabilities.object_space = true;
+        return p;
+    }
+
+    /// Semi-trusted preset: the deny-by-default capability floor plus
+    /// `freeze_object_model`, so scripts neither eval nor reopen core
+    /// classes. `base` contributes limits, artifact acceptance, seeding,
+    /// and clock pinning; its language-capability grants are discarded.
+    pub fn restricted(base: Policy) Policy {
+        var p = base;
+        p.capabilities.eval = false;
+        p.capabilities.send = false;
+        p.capabilities.introspection = false;
+        p.capabilities.object_space = false;
+        p.capabilities.freeze_object_model = true;
+        return p;
+    }
 };
 
 pub const Stats = struct {
@@ -249,8 +284,17 @@ pub fn sleepNs(ns: u64) void {
 }
 
 pub const Isolate = struct {
+    /// Trusted-bootstrap escape hatch: direct access to the underlying `Vm`
+    /// bypasses admission, gas, deadlines, and capability state. Intended for
+    /// the bootstrap window — defining host classes and methods — which ends
+    /// at `seal()` (explicitly or at the first execution).
     vm: *Vm,
-    policy: Policy,
+    /// Spawn-time resolution of `Policy`. The Isolate never consults a
+    /// mutable policy after spawn: everything below was resolved once and
+    /// later mutation of a host-held `Policy` value has no effect.
+    resolved_caps: Capabilities,
+    wall_budget_ns: ?u64,
+    call_depth_limit: ?u32,
     artifact_acceptance: artifact_mod.Acceptance,
     resolved_gas: GasPolicy,
     gas_meter: ?gas_mod.Meter,
@@ -315,9 +359,12 @@ pub const Isolate = struct {
     artifact_diagnostic: ?ArtifactDiagnostic = null,
     artifact_path: ?[]u8 = null,
 
-    /// Spawn an isolate with a policy. The underlying `Vm` is fully
-    /// initialized; capabilities apply lazily on the first `run`/`call`
-    /// (register host methods on `iso.vm` before then when freezing).
+    /// Spawn an isolate with a policy. The policy is resolved completely at
+    /// spawn (gas scope, memory caps, wall budget, call-depth ceiling,
+    /// capability snapshot, artifact acceptance); the Isolate retains no
+    /// mutable policy. Capabilities apply lazily on the first
+    /// `run`/`call`, or eagerly via `seal` — register host methods on
+    /// `iso.vm` before then when freezing.
     pub fn spawn(policy: Policy) !*Isolate {
         const resolved_gas = try resolveGas(policy.limits);
         const initial_meter = gas_mod.Meter.init(resolved_gas);
@@ -344,7 +391,9 @@ pub const Isolate = struct {
 
         iso.* = .{
             .vm = vm,
-            .policy = policy,
+            .resolved_caps = policy.capabilities,
+            .wall_budget_ns = policy.limits.wall_time_ns,
+            .call_depth_limit = policy.limits.call_depth,
             .artifact_acceptance = policy.artifacts,
             .resolved_gas = resolved_gas,
             .gas_meter = initial_meter,
@@ -454,6 +503,39 @@ pub const Isolate = struct {
                 return iso_.vm.call(ctx.recv, ctx.name, ctx.args);
             }
         }.body, .{ .recv = recv, .name = name, .args = args });
+    }
+
+    /// End the bootstrap window explicitly: apply the policy's capabilities
+    /// now instead of lazily at the first `run`/`call`. This is the
+    /// recommended boundary for raw-`vm` work — define host classes and
+    /// methods first, then `seal`, then execute. The preflight bracket
+    /// matches an outer execution (admission, deadline start, pending
+    /// termination), so capability setup is accounted exactly as it would
+    /// be inside a first run: its gas is charged to the current
+    /// `.per_execution` generation, which the next run still renews.
+    /// Idempotent: sealing an already-sealed isolate does nothing. Cannot
+    /// be called from inside a host callback.
+    pub fn seal(iso: *Isolate) !void {
+        const admission = try iso.admitExecution();
+        // A nested admission means guest frames are live; applying
+        // capability masks mid-execution is out of contract.
+        if (admission == .nested) return error.IsolateThreadBusy;
+        defer iso.operation_lock.unlock();
+
+        iso.clearErrorView();
+        iso.startTiming();
+        defer iso.updateElapsed();
+
+        const renewable = switch (iso.resolved_gas) {
+            .per_execution => true,
+            .unlimited, .per_isolate => false,
+        };
+        try iso.rejectPending(renewable);
+        try iso.prepareCapabilities();
+        try iso.rejectPending(renewable);
+
+        iso.pollDeadline();
+        if (currentTermination(iso)) |kind| return terminationError(kind);
     }
 
     /// Export a bounded, inert Ruby value graph. The returned bytes are owned
@@ -759,14 +841,7 @@ pub const Isolate = struct {
         try iso.prepareCapabilities();
         try iso.rejectPending(renewable);
 
-        if (renewable) {
-            const candidate = iso.gas_meter.?.nextGeneration();
-            _ = iso.termination_bits.fetchAnd(~term_gas, .acq_rel);
-            try iso.rejectPending(true);
-            iso.gas_meter = candidate;
-            iso.gas_remaining = candidate.remaining;
-            iso.clearGasDelivery();
-        }
+        if (renewable) try iso.renewExecutionGas();
 
         iso.phase = .running;
         defer iso.finishExecution();
@@ -795,7 +870,7 @@ pub const Isolate = struct {
     fn startTiming(iso: *Isolate) void {
         if (iso.start_ns != 0) return;
         iso.start_ns = monotonicNs();
-        if (iso.policy.limits.wall_time_ns) |budget| {
+        if (iso.wall_budget_ns) |budget| {
             iso.deadline_ns = iso.start_ns + @as(i128, @intCast(budget));
         }
     }
@@ -854,6 +929,18 @@ pub const Isolate = struct {
             }
         }
         iso.phase = .idle;
+    }
+
+    /// Commit the next `.per_execution` allowance: forgive a sticky
+    /// exhaustion from the finished generation, then install the fresh
+    /// meter state.
+    fn renewExecutionGas(iso: *Isolate) !void {
+        const candidate = iso.gas_meter.?.nextGeneration();
+        _ = iso.termination_bits.fetchAnd(~term_gas, .acq_rel);
+        try iso.rejectPending(true);
+        iso.gas_meter = candidate;
+        iso.gas_remaining = candidate.remaining;
+        iso.clearGasDelivery();
     }
 
     fn clearGasDelivery(iso: *Isolate) void {
@@ -940,7 +1027,7 @@ pub const Isolate = struct {
     }
 
     fn applyCapabilities(iso: *Isolate) !void {
-        const caps = iso.policy.capabilities;
+        const caps = iso.resolved_caps;
         const m = iso.vm.mrb;
 
         if (!caps.eval) {
@@ -1134,7 +1221,7 @@ pub const Isolate = struct {
         if (iso.gas_meter) |*meter| {
             if (meter.observeFetch()) noteTerm(iso, .gas);
         }
-        if (iso.policy.limits.call_depth) |maxd| {
+        if (iso.call_depth_limit) |maxd| {
             const depth = c.mrz_ci_depth(m);
             if (depth > 0) {
                 const d: u32 = @intCast(depth);
