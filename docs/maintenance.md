@@ -63,6 +63,32 @@ patch semantics rejects previously produced artifacts.
 
 ## Release and versioning
 
+Before cutting a release, rehearse package consumption and deployment:
+
+```sh
+mise x -- bash tools/test_codedb_package.sh standard ReleaseSafe
+mise x -- bash tools/test_codedb_package.sh minimal ReleaseSafe
+```
+
+The test archives tracked and new nonignored files from the current checkout,
+so it also validates an uncommitted candidate. Zig fetches that archive into a
+fresh external consumer, applying the package's `.paths` allowlist. The consumer
+uses a hash-pinned archive dependency and builds application Ruby with the
+configured host compiler while excluding the target compiler.
+
+The test audits the installed application's and worker's symbols, moves their
+installation to a path containing spaces, deletes the temporary consumer,
+downloaded packages, archive, and build caches, then launches from an empty
+working directory. The application checks initialization, repeated artifact
+execution, stable source filenames, and a worker capsule roundtrip. Its worker
+path is resolved from the deployed executable's location.
+
+Both presets run in the `packaged-consumer` CI job on Linux and macOS. Set
+`CODEDB_PACKAGE_KEEP_TMP=1` to retain a failing test's files for
+inspection, or `CODEDB_PACKAGE_JOBS` to adjust the default four build jobs.
+Run through `mise x` so the same pinned Zig executable is used after leaving
+the repository directory.
+
 - Semantic versioning; during `0.x` breaking changes are allowed and must
   ship with migration notes in `CHANGELOG.md`.
 - A release updates `CHANGELOG.md` (dated section), the `.version` field

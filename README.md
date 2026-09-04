@@ -56,7 +56,7 @@ deploy the matching `mruby-worker` executable produced by the build.
 | [getting-started.md](docs/getting-started.md) | dependency setup, build options (gems, allocator), feature manifest, dev commands, running CI locally |
 | [safe-api.md](docs/safe-api.md) | embedding API: evaluation, exceptions, host functions, data wrapping, collections, lifetimes and roots, threading |
 | [sandboxing.md](docs/sandboxing.md) | policies and presets, gas/deadline/memory limits, termination, lifecycle and sealing, threat model |
-| [artifacts.md](docs/artifacts.md) | typed RITE images, state capsules, compatibility policy |
+| [artifacts.md](docs/artifacts.md) | typed RITE images, CodeDB build-time Ruby, state capsules, compatibility policy |
 | [workers.md](docs/workers.md) | one-shot process execution, typed outcomes, OS limits, deployment and security boundary |
 | [platforms.md](docs/platforms.md) | support matrix and CI coverage |
 | [maintenance.md](docs/maintenance.md) | the Zig build of mruby, the audited hash patch, upgrade and release procedures |
@@ -69,6 +69,10 @@ Runnable examples (built and executed in CI):
 arguments, blocks, and wrapped state; [exceptions](examples/exceptions.zig)
 — raise/rescue across the boundary; [sandbox](examples/sandbox.zig) —
 restricted policy, bootstrap + seal, limits, host access.
+[codedb_demo](examples/codedb_demo.zig) — build-compiled dependency loading,
+repeated invoice jobs, source metadata, restricted execution, and capsule output.
+It also runs with `-Dno-compiler`, which removes the target parser/code generator
+while preserving build-time compilation and sandbox limits.
 
 ## Highlights
 

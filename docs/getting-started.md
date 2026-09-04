@@ -62,7 +62,7 @@ must deploy that separate helper and pass its explicit path to
 
 ## Gem configuration
 
-The default **standard** gem set (28 gems) covers metaprogramming
+The default **standard** gem set covers metaprogramming
 (`mruby-metaprog`, `mruby-method`, `mruby-eval`, `mruby-binding`), the
 stdlib extension gems (`string/array/hash/enum/range/numeric/class/object/
 symbol/proc/kernel/toplevel/compar`), `struct`, `set`, `fiber`,
@@ -120,6 +120,47 @@ const dep = b.dependency("mruby", .{
 This option only overrides the build gate; it does not remove, restrict, or
 OS-sandbox that authority. See [workers.md](workers.md).
 
+## Runtime-only profile
+
+`-Dno-compiler` removes the target parser/code generator and compiler-dependent
+`mruby-eval`. The host `mrbc` remains available for core/gem bytecode and
+[CodeDB application artifacts](artifacts.md). The standard preset retains its
+other gems; minimal becomes core-only because eval's binding dependency is no
+longer needed. Explicitly adding a compiler-dependent gem with `-Dwith-gems`
+fails during configuration.
+
+```sh
+mise x -- zig build -Dno-compiler -Doptimize=ReleaseSafe
+mise x -- zig build test check -Dno-compiler
+mise x -- zig build run-codedb-demo -Dno-compiler -Dgem-set=minimal
+```
+
+For a downstream application, forward the option to the same dependency used
+by the application, its CodeDB helper, and its worker:
+
+```zig
+const dep = b.dependency("mruby", .{
+    .target = target,
+    .optimize = optimize,
+    .@"no-compiler" = true,
+});
+```
+
+`Vm.loadString`, `Vm.loadStringWithOptions`, `Isolate.run`, `sandbox.compile`,
+and `sandbox.compileRite` return `error.CompilerUnavailable` in this profile.
+Use CodeDB or typed `runRite`, with a manifest generated for this exact target
+profile. The compiler choice participates in compatibility identity, so images
+compiled for a compiler-enabled target cannot be substituted.
+
+`features.has_compiler` is false; `features.has_debug_hook` remains true. Gas,
+deadlines, termination, and native deterministic RNG setup remain available.
+The runtime-only profile installs the CodeDB demo and, on supported eligible
+platforms, `mruby-worker`. The source-driven REPL, ordinary examples, benchmark,
+and capsule-process source fixture are omitted; invoking their run steps reports
+that a compiler is required. `test` and `check` use the artifact execution
+suite plus compiler-independent tests. `test-runtime-only` runs that same
+artifact suite under either compiler profile.
+
 ## Allocator profile
 
 All mruby allocations flow through `mruby.alloc`, a Zig-side
@@ -161,15 +202,15 @@ if (mruby.features.hasGem("mruby-time")) {
 
 | Member | Meaning |
 | --- | --- |
-| `gems`, `hasGem(name)` | The dependency-ordered gem selection; core mruby and the compiler are always present and not listed as gems |
+| `gems`, `hasGem(name)` | The dependency-ordered gem selection; core mruby and the optional target compiler are not listed as gems |
 | `gem_set`, `custom_selection` | Requested preset (`"standard"`/`"minimal"`) and whether `-Dwith-gems`/`-Dwithout-gems` customized it |
 | `AuthorityKind`, `AuthoritySet`, `AuthoritySource`, `AuthorityManifest` | Types for inspecting the build's conservative authority vocabulary and source attribution |
-| `authority` | Aggregate linked authority plus entries for `mruby-core`, `mruby-compiler`, and every selected gem |
+| `authority` | Aggregate linked authority plus entries for `mruby-core`, the compiler when linked, and every selected gem |
 | `authorityForGem(name)` | Authority for a selected gem, or `null` when that gem is not linked; use `authority.find` for core/compiler |
 | `mruby_version` | Version of the vendored mruby |
 | `rite_compatibility_fingerprint` (`_hex`, `epoch`, `rite_binary_version`, `rite_vm_version`) | The artifact compatibility identity this build admits |
 | `pointer_bits`, `endian` | Target constraints (the package requires 64-bit targets) |
-| `has_compiler`, `has_debug_hook` | Always true today: codegen and the sandbox's instruction hook are linked into every build; a future runtime-only profile would flip them |
+| `has_compiler`, `has_debug_hook` | The compiler is absent with `-Dno-compiler`; the instruction hook stays enabled in every profile |
 | `sandbox_supported` | Debug hook compiled in and the target satisfies the ABI constraint |
 | `worker_target_supported` | The target alone can host the worker (currently 64-bit Linux and macOS) |
 | `worker_profile_eligible` | The linked authority avoids filesystem, network, process, environment, and arbitrary native-host access |
@@ -194,6 +235,10 @@ even if Ruby rescues the immediate `NoMemoryError`.
 mise x -- zig build check             # compile tests, tools, and examples
 mise x -- zig build test              # unit + Ruby integration suites
 mise x -- zig build test-state-capsule-process
+mise x -- zig build test-codedb        # build-time Ruby and artifact admission
+mise x -- zig build test-runtime-only -Dno-compiler
+mise x -- bash tools/test_codedb_package.sh # fetched package + relocated worker
+mise x -- zig build run-codedb-demo    # compiled invoice job under policy
 mise x -- zig build fuzz-state-capsule --fuzz=100K
 mise x -- zig build run-host-functions
 mise x -- zig build run-repl -- -e 'RUBY_VERSION'

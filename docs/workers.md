@@ -39,6 +39,13 @@ const worker_executable = try std.fs.path.join(
 defer allocator.free(worker_executable);
 ```
 
+With `.@"no-compiler" = true`, the worker omits the parser/code generator and
+compiler-backed eval while preserving gas, deadlines, termination, and seeded
+RNG policies. Produce its images through `addCodeDB` using that same configured
+dependency, then pass `mruby.codedb.find(manifest, name).?` as the request image.
+The compiler profile participates in the compatibility fingerprint. The
+runtime source-compilation example below applies to compiler-enabled builds.
+
 `worker.getEmittedBin()` is useful for build-time run steps and tests, but it
 names a build-cache artifact and must not be baked into a deployed program.
 The runtime API requires an explicit absolute path, or an explicit relative

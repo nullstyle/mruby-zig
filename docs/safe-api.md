@@ -15,6 +15,11 @@ ownership:
 
 ## Evaluating Ruby
 
+Source evaluation requires `mruby.features.has_compiler`. With `-Dno-compiler`,
+source-loading and compilation calls return `error.CompilerUnavailable`; use
+[CodeDB artifacts](artifacts.md) for application Ruby. Native host bindings,
+values, and calls into already-loaded Ruby remain available.
+
 ```zig
 const v = try vm.loadString("'hello'.upcase");
 try std.testing.expectEqualStrings("HELLO", try v.asString());

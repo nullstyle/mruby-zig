@@ -104,7 +104,10 @@ in-process embedding can route them to a host writer. The generic worker
 admits this authority only because it redirects process stdout before starting
 the VM; the manifest still reports the linked surface.
 
-When `random_seed` is set, sealing seeds the default RNG once and then masks
+When `random_seed` is set, sealing seeds the default RNG through a protected
+native operation captured before the host bootstrap window. It compiles no
+Ruby source, executes no Ruby instructions, and also works with `-Dno-compiler`.
+Sealing then masks
 the reseeding methods and fresh `Random` construction. Guest code therefore
 cannot replace the pinned sequence, including by calling no-argument `srand`
 or `Random.new` to restore time/address-derived state. mruby consumes the low

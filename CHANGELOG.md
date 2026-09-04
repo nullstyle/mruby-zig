@@ -2,16 +2,44 @@
 
 ## Unreleased
 
-CodeDB phase 1 (tracer bullet, see docs/plans/codedb.md):
+CodeDB phases 1–5 (see docs/artifacts.md and docs/plans/codedb.md):
 
 - Application Ruby is now a build-time input: the host mrbc from the
   bootstrap pipeline compiles each source twice (identical bytes
   required — the determinism gate), tools/rite_envelope.zig wraps the
   RITE into typed envelopes carrying the build compatibility
   fingerprint, and a generated manifest module embeds the artifacts.
-  `mruby.codedb.run(iso, manifest, name)` executes entries through the
-  normal policy path with no runtime parsing. `zig build
-  run-codedb-demo` demonstrates the flow over examples/codedb/*.rb.
+  The reusable `addCodeDB` build helper stages stable source names and
+  generates SHA-256-addressed envelopes with a versioned sidecar recording
+  source/content hashes, the feature profile, and optional application
+  identity. `Isolate.runArtifact(manifest, name)` executes through the
+  normal policy path; `mruby.codedb.run` remains available. Generated
+  schema/build mismatches fail during compilation. `zig build
+  run-codedb-demo` demonstrates a restricted invoice job; `test-codedb`
+  covers generation, metadata, policy rejection, and older artifact bytes.
+- Declared module dependencies and entrypoints are validated and emitted in
+  deterministic dependency order. `Isolate.loadArtifact` initializes a closure
+  once per isolate under one execution budget; initialization failure poisons
+  that loader and requires a fresh isolate. Manifest schema 1.1 adds graph
+  metadata without changing the artifact envelope or compatibility epoch.
+
+- A conservative authority gate defaults application bundles to the worker
+  allow-list. It includes the entire linked profile, all declared host bindings,
+  and transitive artifact requirements; unknown bits and missing binding
+  references fail. Trusted/custom tiers are explicit. Schema 1.2 records source
+  attribution and effective masks, rechecked against the consuming build at
+  compile time. Host catalogue completeness remains a trusted bootstrap
+  contract; runtime policy and the artifact envelope are unchanged.
+
+- `-Dno-compiler` removes target parser/codegen and compiler-dependent eval
+  gems while retaining the host compiler for CodeDB. Source APIs explicitly
+  return `CompilerUnavailable`; features and compatibility identity record the
+  profile. RNG seeding uses a protected captured native operation in both
+  profiles, with no setup bytecode. The debug hook, artifact-only demo, worker,
+  and resource-policy checks remain available. CI audits real runtime symbols.
+- A packaged-consumer smoke test fetches a release snapshot into a fresh
+  external project, then runs its relocated application and matching worker
+  after deleting build inputs and caches. Linux/macOS CI covers both presets.
 
 Security review follow-up:
 
