@@ -35,7 +35,7 @@ pub fn main(init: std.process.Init) !void {
     const restored = try isolate.importValue(.{ .bytes = encoded.items }, .{
         .accepted_schema = fixture.schema,
     });
-    try isolate.vm.setGlobal("restored_graph", restored);
+    try isolate.setGlobal("restored_graph", restored);
     if (!(try isolate.run(fixture.consumer_assertion)).isTruthy()) {
         return error.RestoredGraphMismatch;
     }

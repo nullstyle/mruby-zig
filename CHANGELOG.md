@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+Isolate host operations between executions:
+
+- Added `Isolate.getGlobal`, `setGlobal`, and `clearError`: the locked,
+  ownership-checked surface for seeding and observing interpreter state
+  between runs. They serialize with guest execution and artifact operations
+  (re-entrant use from a callback returns `IsolateThreadBusy`), `setGlobal`
+  rejects foreign-VM values, and `clearError` drops both the pending Ruby
+  exception and the retained `lastError` view. Ordinary host introspection
+  no longer requires raw `iso.vm` access; the raw field remains the
+  bootstrap-window escape hatch ending at `seal()`.
+
 Comptime-derived method signatures:
 
 - `Class.defineMethod`, `defineClassMethod`, and `defineModuleFunction` now

@@ -764,6 +764,28 @@ pub const Isolate = struct {
     }
 
     fn beginArtifactOperation(iso: *Isolate) !void {
+        try iso.lockIdlePhase();
+        iso.clearArtifactDiagnostic();
+    }
+
+    fn endArtifactOperation(iso: *Isolate) void {
+        iso.unlockIdlePhase();
+    }
+
+    /// Serialize a host-side (non-guest, non-artifact) operation against
+    /// this Isolate's state: mutual exclusion with guest execution and
+    /// artifact operations, nested callback use rejected. Unlike artifact
+    /// admission it does not discard a pending artifact diagnostic the
+    /// host may not have observed yet.
+    fn beginHostOperation(iso: *Isolate) !void {
+        try iso.lockIdlePhase();
+    }
+
+    fn endHostOperation(iso: *Isolate) void {
+        iso.unlockIdlePhase();
+    }
+
+    fn lockIdlePhase(iso: *Isolate) !void {
         if (alloc_mod.currentIsolateCell()) |cell| {
             if (cell != &iso.cell) return error.IsolateThreadBusy;
             return switch (iso.phase) {
@@ -784,10 +806,9 @@ pub const Isolate = struct {
             },
         }
         iso.phase = .preparing;
-        iso.clearArtifactDiagnostic();
     }
 
-    fn endArtifactOperation(iso: *Isolate) void {
+    fn unlockIdlePhase(iso: *Isolate) void {
         std.debug.assert(iso.phase == .preparing);
         iso.phase = .idle;
         iso.operation_lock.unlock();
@@ -963,6 +984,34 @@ pub const Isolate = struct {
             iso.error_message,
             iso.error_class,
         );
+    }
+
+    /// Read a global variable between executions (`name` excludes the `$`),
+    /// under the same operation lock as guest execution. The returned
+    /// `Value` follows ordinary rooting rules: consume it inside an arena
+    /// `Scope` or `Vm.root` it if it must outlive further execution.
+    pub fn getGlobal(iso: *Isolate, name: []const u8) !Value {
+        try iso.beginHostOperation();
+        defer iso.endHostOperation();
+        return iso.vm.getGlobal(name);
+    }
+
+    /// Set a global variable between executions; values from another
+    /// interpreter are rejected as `error.ForeignValue`.
+    pub fn setGlobal(iso: *Isolate, name: []const u8, val: Value) !void {
+        try iso.beginHostOperation();
+        defer iso.endHostOperation();
+        return iso.vm.setGlobal(name, val);
+    }
+
+    /// Discard the pending Ruby exception and the retained `lastError`
+    /// view. Ordinary flows do not need this — the next outer entry resets
+    /// both — but it lets a host drop a diagnostic it has already read.
+    pub fn clearError(iso: *Isolate) !void {
+        try iso.beginHostOperation();
+        defer iso.endHostOperation();
+        iso.clearErrorView();
+        iso.vm.clearError();
     }
 
     fn clearErrorView(iso: *Isolate) void {

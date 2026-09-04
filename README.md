@@ -614,6 +614,12 @@ supported.
   destruction. `wall_time_ns` starts when the first outer entry begins
   preflight (`seal()` counts if it comes first), continues across idle time,
   and is never renewed by a new gas generation.
+- **Host access between executions**: `Isolate.getGlobal` / `setGlobal` /
+  `clearError` are the locked, ownership-checked surface for seeding and
+  observing interpreter state between runs — no raw `vm` access needed for
+  ordinary host introspection. They serialize like every other operation
+  (re-entrant use from a callback returns `IsolateThreadBusy`) and
+  `setGlobal` rejects foreign-VM values with `error.ForeignValue`.
 
 **Not covered by the in-process tier** (by design, same as v8 isolates):
 no address-space separation from the host. The planned out-of-process

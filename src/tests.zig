@@ -1570,7 +1570,7 @@ test "sandbox: StateCapsule transfers supported scalar values between isolates" 
     const consumer = try mruby.sandbox.Isolate.spawn(.{});
     defer consumer.deinit();
     const restored = try consumer.importValue(capsule.view(), .{});
-    try consumer.vm.setGlobal("restored", restored);
+    try consumer.setGlobal("restored", restored);
     const matches = try consumer.run(
         "$restored == [nil, false, true, -9, 1.5, :ready, \"a\\x00b\"]",
     );
@@ -1616,15 +1616,15 @@ test "sandbox: StateCapsule copies distinct inline symbol names during export" {
     const consumer = try mruby.sandbox.Isolate.spawn(.{});
     defer consumer.deinit();
     const restored = try consumer.importValue(capsule.view(), .{});
-    try consumer.vm.setGlobal("inline_symbols", restored);
+    try consumer.setGlobal("inline_symbols", restored);
     try std.testing.expect((try consumer.run("$inline_symbols == [:a, :b, :c, :zzzz]")).isTruthy());
 }
 
 test "sandbox: StateCapsule full-i64 Hash keys survive hash-table materialization" {
     const producer = try mruby.sandbox.Isolate.spawn(.{});
     defer producer.deinit();
-    try producer.vm.setGlobal("maximum_key", try producer.vm.intValue(std.math.maxInt(i64)));
-    try producer.vm.setGlobal("minimum_key", try producer.vm.intValue(std.math.minInt(i64)));
+    try producer.setGlobal("maximum_key", try producer.vm.intValue(std.math.maxInt(i64)));
+    try producer.setGlobal("minimum_key", try producer.vm.intValue(std.math.minInt(i64)));
     const root = try producer.run(
         \\mapping = {}
         \\index = 0
@@ -1642,9 +1642,9 @@ test "sandbox: StateCapsule full-i64 Hash keys survive hash-table materializatio
     const consumer = try mruby.sandbox.Isolate.spawn(.{});
     defer consumer.deinit();
     const restored = try consumer.importValue(capsule.view(), .{});
-    try consumer.vm.setGlobal("wide_integer_keys", restored);
-    try consumer.vm.setGlobal("maximum_key", try consumer.vm.intValue(std.math.maxInt(i64)));
-    try consumer.vm.setGlobal("minimum_key", try consumer.vm.intValue(std.math.minInt(i64)));
+    try consumer.setGlobal("wide_integer_keys", restored);
+    try consumer.setGlobal("maximum_key", try consumer.vm.intValue(std.math.maxInt(i64)));
+    try consumer.setGlobal("minimum_key", try consumer.vm.intValue(std.math.minInt(i64)));
     const matches = try consumer.run(
         \\$wide_integer_keys.size == 22 &&
         \\  $wide_integer_keys[$maximum_key] == :maximum &&
@@ -1661,7 +1661,7 @@ test "sandbox: StateCapsule export enforces Hash insertion work admission" {
     defer iso.deinit();
     // Seed through the C ABI because this pinned parser rejects some decimal
     // literals outside its immediate-integer range even though mrb_int is i64.
-    try iso.vm.setGlobal("hash_collision_stride", try iso.vm.intValue(0x1_0000_0000));
+    try iso.setGlobal("hash_collision_stride", try iso.vm.intValue(0x1_0000_0000));
     const collision_hash = try iso.run(
         \\mapping = {}
         \\index = 0
@@ -1704,7 +1704,7 @@ test "sandbox: StateCapsule Symbol-heavy Hash uses inert name hashing" {
     const consumer = try mruby.sandbox.Isolate.spawn(.{});
     defer consumer.deinit();
     const restored = try consumer.importValue(capsule.view(), .{});
-    try consumer.vm.setGlobal("symbol_hash", restored);
+    try consumer.setGlobal("symbol_hash", restored);
     try std.testing.expect((try consumer.run(
         "$symbol_hash.size == 64 && $symbol_hash[:symbol0] == 0 && $symbol_hash[:symbol63] == 63",
     )).isTruthy());
@@ -1888,7 +1888,7 @@ test "sandbox: StateCapsule preserves cycles aliases defaults order and frozen s
     mruby.alloc.enterIsolate(&consumer.cell);
     mruby.c.mrb_full_gc(consumer.vm.mrb);
     mruby.alloc.exitIsolate();
-    try consumer.vm.setGlobal("restored_graph", restored);
+    try consumer.setGlobal("restored_graph", restored);
     const matches = try consumer.run(
         \\mapping = $restored_graph[0]
         \\$restored_graph.frozen? &&
@@ -1960,7 +1960,7 @@ test "sandbox: StateCapsule schema admission is explicit and minor-compatible" {
         .accepted_schema = .{ .id = id, .major = 3, .minor = 7 },
     });
     try std.testing.expect(consumer.lastArtifactError() == null);
-    try consumer.vm.setGlobal("schema_value", restored);
+    try consumer.setGlobal("schema_value", restored);
     try std.testing.expect((try consumer.run("$schema_value == [:schema, 42]")).isTruthy());
 }
 
@@ -2393,7 +2393,7 @@ test "sandbox: termination latched before entry starts no gas generation" {
     const rejected = iso.stats();
     try std.testing.expectEqual(@as(u64, 0), rejected.instructions);
     try std.testing.expectEqual(@as(u64, 0), rejected.gas.?.generation);
-    try std.testing.expect((try iso.vm.getGlobal("must_not_run")).isNil());
+    try std.testing.expect((try iso.getGlobal("must_not_run")).isNil());
 
     try std.testing.expectError(error.ScriptTerminated, iso.run("1"));
     try std.testing.expectEqual(@as(u64, 0), iso.stats().gas.?.generation);
@@ -2628,7 +2628,7 @@ test "sandbox: un-rescuable termination still runs ensure" {
         \\  $ensured = true
         \\end
     ));
-    const ensured = try iso.vm.getGlobal("ensured");
+    const ensured = try iso.getGlobal("ensured");
     try std.testing.expect(ensured.isTruthy());
 }
 
@@ -2721,11 +2721,11 @@ test "sandbox: capabilities strip eval, send, introspection, ObjectSpace" {
     defer iso.deinit();
 
     try std.testing.expectError(error.RubyException, iso.run("eval('1 + 1')"));
-    iso.vm.clearError();
+    try iso.clearError();
     try std.testing.expectError(error.RubyException, iso.run("[1, 2].send(:size)"));
-    iso.vm.clearError();
+    try iso.clearError();
     try std.testing.expectError(error.RubyException, iso.run("@x = 1; instance_variable_get(:@x)"));
-    iso.vm.clearError();
+    try iso.clearError();
     // mruby's `defined?` on a removed constant raises NameError (not nil);
     // either way, the constant is unreachable from scripts.
     const gone = try iso.run(
@@ -2750,11 +2750,11 @@ test "sandbox: zero-value policy is the deny-by-default floor" {
     const plain = try iso.run("6 * 7");
     try std.testing.expectEqual(@as(i64, 42), try plain.asInt());
     try std.testing.expectError(error.RubyException, iso.run("eval('1 + 1')"));
-    iso.vm.clearError();
+    try iso.clearError();
     try std.testing.expectError(error.RubyException, iso.run("[1, 2].send(:size)"));
-    iso.vm.clearError();
+    try iso.clearError();
     try std.testing.expectError(error.RubyException, iso.run("@x = 1; instance_variable_get(:@x)"));
-    iso.vm.clearError();
+    try iso.clearError();
     const gone = try iso.run(
         \\begin
         \\  ObjectSpace
@@ -2801,7 +2801,7 @@ test "sandbox: restricted preset strips language grants and freezes the model" {
     defer iso.deinit();
 
     try std.testing.expectError(error.RubyException, iso.run("eval('1')"));
-    iso.vm.clearError();
+    try iso.clearError();
     try std.testing.expectError(error.RubyException, iso.run("class String; def boom; end; end"));
     const exc = iso.lastError().?;
     const cls = try exc.className(std.testing.allocator);
@@ -2815,7 +2815,7 @@ test "sandbox: restricted preset strips language grants and freezes the model" {
     );
     defer composed.deinit();
     try std.testing.expectError(error.RubyException, composed.run("eval('1')"));
-    composed.vm.clearError();
+    try composed.clearError();
     try std.testing.expectError(error.RubyException, composed.run("class String; def boom; end; end"));
 }
 
@@ -2853,7 +2853,7 @@ test "sandbox: seal applies capabilities at an explicit bootstrap boundary" {
     // The masks are installed even though no run has happened.
     if (test_config.has_core_language_suite) {
         try std.testing.expectError(error.RubyException, iso.run("eval('1')"));
-        iso.vm.clearError();
+        try iso.clearError();
     }
     // A sealed isolate keeps executing compute-only scripts.
     const plain = try iso.run("21 * 2");
@@ -2904,6 +2904,68 @@ test "sandbox: seal rejects re-entrant use from inside a host callback" {
     try std.testing.expectEqual(@as(i64, 42), try plain.asInt());
     try iso.seal();
     try std.testing.expectError(error.RubyException, iso.run("eval('1')"));
+}
+
+test "sandbox: host globals read and write between executions" {
+    const iso = try sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+
+    _ = try iso.run("$host_value = 11");
+    try std.testing.expectEqual(@as(i64, 11), try (try iso.getGlobal("host_value")).asInt());
+
+    // Host-authored values move through the same surface.
+    const read = try iso.getGlobal("host_value");
+    try iso.setGlobal("host_value", read);
+    _ = try iso.run("$host_value += 1");
+    try std.testing.expectEqual(@as(i64, 12), try (try iso.getGlobal("host_value")).asInt());
+
+    // Values from another interpreter are rejected.
+    const other = try sandbox.Isolate.spawn(.{});
+    defer other.deinit();
+    const foreign = try other.getGlobal("host_value");
+    try std.testing.expectError(error.ForeignValue, iso.setGlobal("host_value", foreign));
+}
+
+test "sandbox: clearError drops the retained diagnostic" {
+    const iso = try sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+
+    try std.testing.expectError(error.RubyException, iso.run("raise 'boom'"));
+    try std.testing.expect(iso.lastError() != null);
+    try iso.clearError();
+    try std.testing.expect(iso.lastError() == null);
+    // The isolate keeps executing afterwards.
+    try std.testing.expectEqual(@as(i64, 42), try (try iso.run("6 * 7")).asInt());
+}
+
+test "sandbox: host operations reject re-entrant use from callbacks" {
+    const iso = try sandbox.Isolate.spawn(.{});
+    defer iso.deinit();
+
+    const Probe = struct {
+        var target: ?*sandbox.Isolate = null;
+        var rejected = false;
+
+        fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
+            _ = self;
+            _ = target.?.getGlobal("x") catch |err| {
+                if (err == error.IsolateThreadBusy) {
+                    rejected = true;
+                    return m.intValue(1);
+                }
+                return err;
+            };
+            return m.intValue(0);
+        }
+    };
+    Probe.target = iso;
+
+    const cls = try iso.vm.defineClass("HostProbe", null);
+    try cls.defineMethod("attempt", Probe.call);
+    _ = try iso.run("HostProbe.new.attempt");
+    try std.testing.expect(Probe.rejected);
+    // Between executions the same operation succeeds.
+    try std.testing.expect((try iso.getGlobal("x")).isNil());
 }
 
 test "sandbox: frozen object model blocks def on core classes" {
@@ -2988,7 +3050,7 @@ test "sandbox: failed capability preparation is terminal before generation one" 
     const repeated = iso.stats();
     try std.testing.expectEqual(failed.instructions, repeated.instructions);
     try std.testing.expectEqual(@as(u64, 0), repeated.gas.?.generation);
-    try std.testing.expect((try iso.vm.getGlobal("must_not_run")).isNil());
+    try std.testing.expect((try iso.getGlobal("must_not_run")).isNil());
 }
 
 test "sandbox: nested run from a method callback" {
@@ -3140,9 +3202,9 @@ test "sandbox: eval strip closes class_eval and BasicObject#instance_eval" {
     // Module#class_eval / #module_eval take a source string and were a full
     // eval escape the old Kernel-only strip missed.
     try std.testing.expectError(error.RubyException, iso.run("Integer.class_eval(\"1 + 1\")"));
-    iso.vm.clearError();
+    try iso.clearError();
     try std.testing.expectError(error.RubyException, iso.run("Integer.module_eval(\"1 + 1\")"));
-    iso.vm.clearError();
+    try iso.clearError();
     // instance_eval is defined on BasicObject; a BasicObject receiver bypassed
     // a Kernel-only strip.
     try std.testing.expectError(error.RubyException, iso.run("BasicObject.new.instance_eval(\"1\")"));
@@ -3156,7 +3218,7 @@ test "sandbox: frozen clock pin cannot be reassigned by a script" {
     // The hidden module is frozen: repointing FROZEN_TIME must raise, not
     // silently defeat the determinism pin.
     try std.testing.expectError(error.RubyException, iso.run("MRubyZigSandbox::FROZEN_TIME = Time.at(0)"));
-    iso.vm.clearError();
+    try iso.clearError();
     const t = try iso.run("Time.now.to_i");
     try std.testing.expectEqual(@as(i64, 1_700_000_000), try t.asInt());
 }
@@ -3270,9 +3332,9 @@ test "sandbox: lastError uses inert exception metadata" {
     try std.testing.expectEqual(before.gas.?.observed_instructions, after.gas.?.observed_instructions);
     try std.testing.expectEqual(before.gas.?.generation, after.gas.?.generation);
     try std.testing.expect(!iso.pendingTermination());
-    try std.testing.expect((try iso.vm.getGlobal("hostile_to_s_ran")).isNil());
-    try std.testing.expect((try iso.vm.getGlobal("hostile_class_ran")).isNil());
-    try std.testing.expect((try iso.vm.getGlobal("hostile_class_to_s_ran")).isNil());
+    try std.testing.expect((try iso.getGlobal("hostile_to_s_ran")).isNil());
+    try std.testing.expect((try iso.getGlobal("hostile_class_ran")).isNil());
+    try std.testing.expect((try iso.getGlobal("hostile_class_to_s_ran")).isNil());
 
     _ = try iso.run("1");
     try std.testing.expect(iso.lastError() == null);
@@ -3344,7 +3406,7 @@ test "sandbox: frozen object model also freezes the immediate-value singletons" 
     const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .freeze_object_model = true } });
     defer iso.deinit();
     try std.testing.expectError(error.RubyException, iso.run("class NilClass; def boom; end; end"));
-    iso.vm.clearError();
+    try iso.clearError();
     try std.testing.expectError(error.RubyException, iso.run("class FalseClass; def boom; end; end"));
 }
 
@@ -3361,9 +3423,9 @@ test "sandbox: sealModel is the two-phase freeze_object_model" {
     // survive and stay callable.
     try iso.sealModel();
     try std.testing.expectError(error.RubyException, iso.run("class String; def later; end; end"));
-    iso.vm.clearError();
+    try iso.clearError();
     try std.testing.expectError(error.RubyException, iso.run("class NilClass; def boom; end; end"));
-    iso.vm.clearError();
+    try iso.clearError();
     const got = try iso.run("'x'.load_time_helper");
     try std.testing.expectEqual(@as(i64, 7), try got.asInt());
     _ = try iso.run("LoadTime.new");
@@ -3469,7 +3531,7 @@ test "sandbox: reallocating a pre-run buffer does not underflow accounting" {
     defer std.testing.allocator.free(bytes);
     @memset(bytes, 'x');
     const buf = try iso.vm.stringValue(bytes);
-    try iso.vm.setGlobal("buf", buf);
+    try iso.setGlobal("buf", buf);
 
     // Growing it under the isolate cell reallocs a block whose `old` exceeds
     // the cell's tracked bytes; the pre-fix `live_bytes - old` underflowed
