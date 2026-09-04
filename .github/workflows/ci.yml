@@ -26,6 +26,23 @@ jobs:
       - run: mise x -- zig fmt --check .
       - run: mise x -- zig build test
       - run: mise x -- zig build test -Doptimize=ReleaseSafe
+      - name: Bounded live materialization fuzzing
+        id: materialize_fuzz
+        run: |
+          uname -sm
+          mise x -- zig version
+          mise x -- zig build fuzz-state-materialize --fuzz=25000
+      - name: Retain failing fuzz inputs
+        if: failure() && steps.materialize_fuzz.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: materialize-fuzz-${{ matrix.os }}-compiler
+          include-hidden-files: true
+          retention-days: 14
+          path: |
+            .zig-cache/f/
+            .zig-cache/v/
+            .zig-cache/tmp/libfuzzer.log
       - name: CodeDB downstream consumer
         run: >-
           mise x -- zig build --build-file tools/codedb_consumer/build.zig test
@@ -155,6 +172,25 @@ jobs:
           test -n "$full_identity"
           test -n "$runtime_identity"
           test "$full_identity" != "$runtime_identity"
+      - name: Bounded compiler-free materialization fuzzing
+        id: materialize_fuzz
+        if: matrix.gem_set == 'minimal' && matrix.optimize == 'ReleaseSafe'
+        run: |
+          uname -sm
+          mise x -- zig version
+          mise x -- zig build fuzz-state-materialize --fuzz=25000 \
+            -Dno-compiler=true -Dgem-set=minimal -Doptimize=ReleaseSafe
+      - name: Retain failing compiler-free fuzz inputs
+        if: failure() && steps.materialize_fuzz.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: materialize-fuzz-${{ matrix.os }}-${{ matrix.gem_set }}-${{ matrix.optimize }}-runtime
+          include-hidden-files: true
+          retention-days: 14
+          path: |
+            .zig-cache/f/
+            .zig-cache/v/
+            .zig-cache/tmp/libfuzzer.log
 
   packaged-consumer:
     name: packaged consumer (${{ matrix.os }}, ${{ matrix.gem_set }})
@@ -252,6 +288,18 @@ jobs:
       - run: mise install
       - run: mise x -- zig build fuzz-state-capsule --fuzz=2000000
       - run: mise x -- zig build fuzz-state-materialize --fuzz=500000
+      - run: mise x -- zig build fuzz-state-materialize -Dno-compiler=true --fuzz=500000
+      - name: Retain failing sustained fuzz inputs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sustained-fuzz-inputs
+          include-hidden-files: true
+          retention-days: 14
+          path: |
+            .zig-cache/f/
+            .zig-cache/v/
+            .zig-cache/tmp/libfuzzer.log
 
   gem-sets:
     name: gem set (${{ matrix.gem_set }})

@@ -319,9 +319,16 @@ Binding, Fiber, or continuation snapshot. A StateCapsule describes values
 only: the destination's policy, classes, and host environment are supplied by
 the importing isolate.
 
-A coverage-guided fuzz target (`zig build fuzz-state-capsule`) exercises the
-pure parser, and a golden producer/consumer subprocess fixture verifies byte
-stability and restoration into a separate OS process.
+`zig build fuzz-state-capsule` exercises the pure parser;
+`zig build fuzz-state-materialize` also constructs live objects under explicit
+capsule and isolate memory limits. The latter checks schema-bearing seeds,
+recovery after memory exhaustion, cleanup of discarded roots, and zero guest
+instructions. Both targets receive Zig-side coverage guidance; mruby's C
+coverage counters are disabled for compatibility with the pinned fuzzer.
+A golden producer/consumer subprocess fixture verifies byte stability and
+restoration into a separate OS process. See the
+[fuzzing commands](getting-started.md#development-commands) for bounded runs
+and preservation of failing inputs.
 
 Cross-version fixtures in `src/tests_artifacts/` pin admission behavior
 against bytes produced by the **v0.3.0** tag (see its `MANIFEST.md` for
