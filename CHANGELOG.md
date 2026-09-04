@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+Comptime-derived method signatures:
+
+- `Class.defineMethod`, `defineClassMethod`, and `defineModuleFunction` now
+  derive the Ruby-facing argument protocol from the Zig callback's parameter
+  types, so the marshalling and the mruby arity can never disagree. The
+  callback shape `(vm: *Vm, self: Value, ...)` is validated at compile time,
+  as is parameter ordering (required, then optional, then `Rest`, then
+  `Block`).
+- Optional arguments are declared as Zig optionals (`?i64`, `?[]const u8`,
+  ...): they map to the `mrb_get_args` optional section and receive `null`
+  when the caller omitted them — absence is now distinguishable from a
+  passed default.
+- Added the `Block` parameter marker (`.value` + `isPresent`) replacing the
+  bare `&`-spec `Value` in derived signatures.
+- The explicit-format variants are renamed `defineMethodRaw`,
+  `defineClassMethodRaw`, and `defineModuleFunctionRaw` for protocols the
+  derived form does not model (the `S` String-value spec) and for
+  zero-value-default optionals.
+
 Generated comptime feature manifest:
 
 - Added `mruby.features`, generated per build from the resolved gem
@@ -90,6 +109,14 @@ Production-safe Zig API:
 
 Migration:
 
+- Rename `defineMethod`/`defineClassMethod`/`defineModuleFunction` calls
+  that pass an explicit format string to the `...Raw` spellings. Where the
+  format is derivable (`i`, `f`, `b`, `n`, `o`, `z`, `s`, `*`), drop the
+  format argument instead and let the parameter types drive it; block
+  callbacks change their parameter from `Value` to `Block` (use `.value`
+  and `.isPresent`). Code that relied on zero-value defaults for omitted
+  optional specs must stay on the `Raw` form or switch to `?T` parameters
+  and handle `null` explicitly.
 - Sandbox policies that relied on the old capability defaults must grant them
   explicitly: wrap the policy in `Policy.trusted(...)` (ambient language
   capabilities on) or set individual `capabilities` fields. Scripts that only

@@ -131,20 +131,22 @@ details never dispatches guest methods.
 
 ### Calling Zig from Ruby
 
-`defineMethod` bridges a Zig function into a Ruby method with typed
-arguments. The format string follows mruby's `mrb_get_args`:
+`defineMethod` derives the Ruby-facing argument protocol from the Zig
+callback's parameter types, so marshalling and arity can never disagree.
+The callback starts with `(vm: *Vm, self: Value, ...)`; each further
+parameter is one Ruby argument:
 
-| spec | Zig type      | spec | Zig type       |
-|------|---------------|------|----------------|
-| `i`  | `i64`         | `o`  | `Value`        |
-| `f`  | `f64`         | `z`  | `[:0]const u8` |
-| `b`  | `bool`        | `S`/`s` | `[]const u8` |
-| `n`  | `u32` (sym)   | `&`  | `Value` (block) |
-| `*`  | `Rest`        | `\|` | optional separator |
+| Zig type         | Ruby argument      | Zig type          | Ruby argument |
+|------------------|--------------------|-------------------|---------------|
+| `i64`            | Integer            | `[]const u8`      | String (borrowed) |
+| `f64`            | Float              | `[:0]const u8`    | String (borrowed) |
+| `bool`           | Boolean            | `Rest`            | splat (`*`) |
+| `u32`            | Symbol id          | `Block`           | block (`&`) |
+| `Value`          | any object         | `?T` (any above)  | optional argument |
 
 ```zig
 const math = try vm.defineClass("ZigMath", null);
-try math.defineMethod("add", "ii", struct {
+try math.defineMethod("add", struct {
     fn call(vm: *mruby.Vm, self: mruby.Value, a: i64, b: i64) anyerror!mruby.Value {
         _ = self;
         return vm.intValue(a + b);
@@ -153,6 +155,33 @@ try math.defineMethod("add", "ii", struct {
 
 _ = try vm.loadString("ZigMath.new.add(20, 22)");  // => 42
 ```
+
+Optional parameters are Zig optionals: `?i64` maps to the `mrb_get_args`
+optional section and receives `null` when the caller omits it, so absence
+is distinguishable from a passed default. Optional parameters must follow
+the required ones; `Rest` and `Block` come last:
+
+```zig
+try math.defineMethod("scale", struct {
+    fn call(vm: *mruby.Vm, self: mruby.Value, v: i64, factor: ?i64) anyerror!mruby.Value {
+        _ = self;
+        return vm.intValue(v * (factor orelse 1));
+    }
+}.call);
+```
+
+`defineMethodRaw` (plus `defineClassMethodRaw` / `defineModuleFunctionRaw`)
+takes an explicit `mrb_get_args` format string for protocols the derived
+form does not model — for example the `S` (String value) spec, or optional
+arguments that should default to zero values instead of `null`:
+
+| spec | Zig type      | spec | Zig type       |
+|------|---------------|------|----------------|
+| `i`  | `i64`         | `o`  | `Value`        |
+| `f`  | `f64`         | `z`  | `[:0]const u8` |
+| `b`  | `bool`        | `S`/`s` | `[]const u8` |
+| `n`  | `u32` (sym)   | `&`  | `Value` (block) |
+| `*`  | `Rest`        | `\|` | optional separator |
 
 A Zig `error` returned from a callback becomes a Ruby `RuntimeError`
 (`"zig error: Kaboom"`); `vm.raise("ArgumentError", "msg")` raises a specific

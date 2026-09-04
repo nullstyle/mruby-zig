@@ -23,6 +23,7 @@ pub const ExceptionDetails = @import("error.zig").Details;
 pub const ExceptionDetailOptions = @import("error.zig").DetailOptions;
 pub const Class = @import("class.zig").Class;
 pub const Rest = @import("class.zig").Rest;
+pub const Block = @import("class.zig").Block;
 pub const Scope = @import("arena.zig").Scope;
 pub const RootedValue = @import("arena.zig").RootedValue;
 pub const LoadOptions = @import("vm.zig").LoadOptions;

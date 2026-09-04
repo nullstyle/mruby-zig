@@ -34,9 +34,9 @@ pub fn setOutputWriter(vm: *Vm, writer: *std.Io.Writer) !void {
     if (vm.output_installed) return;
 
     const kernel = try vm.getClass("Kernel");
-    try kernel.defineMethod("print", "*", printFn);
-    try kernel.defineMethod("puts", "*", putsFn);
-    try kernel.defineMethod("p", "*", inspectFn);
+    try kernel.defineMethod("print", printFn);
+    try kernel.defineMethod("puts", putsFn);
+    try kernel.defineMethod("p", inspectFn);
     vm.output_installed = true;
 }
 

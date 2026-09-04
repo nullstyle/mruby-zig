@@ -50,11 +50,11 @@ const MixerMethods = struct {
         return m.intValue(total);
     }
 
-    fn eachSlot(m: *mruby.Vm, self: mruby.Value, blk: mruby.Value) anyerror!mruby.Value {
+    fn eachSlot(m: *mruby.Vm, self: mruby.Value, blk: mruby.Block) anyerror!mruby.Value {
         const p = MixerData.unwrap(self) orelse return m.raise("TypeError", "expected a Mixer");
-        if (blk.isNil()) return m.raise("ArgumentError", "no block given");
+        if (!blk.isPresent()) return m.raise("ArgumentError", "no block given");
         for (p.slots) |s| {
-            if (s != 0) _ = try m.call(blk, "call", .{try m.intValue(s)});
+            if (s != 0) _ = try m.call(blk.value, "call", .{try m.intValue(s)});
         }
         return m.nilValue();
     }
@@ -62,10 +62,10 @@ const MixerMethods = struct {
 
 fn registerMixer(cls: mruby.Class) !void {
     MixerMethods.class = cls;
-    try cls.defineClassMethod("new", "", MixerMethods.init_);
-    try cls.defineMethod("set_volume", "f", MixerMethods.setVolume);
-    try cls.defineMethod("mix", "*", MixerMethods.mix);
-    try cls.defineMethod("each_slot", "&", MixerMethods.eachSlot);
+    try cls.defineClassMethod("new", MixerMethods.init_);
+    try cls.defineMethod("set_volume", MixerMethods.setVolume);
+    try cls.defineMethod("mix", MixerMethods.mix);
+    try cls.defineMethod("each_slot", MixerMethods.eachSlot);
 }
 
 pub fn main() !void {
