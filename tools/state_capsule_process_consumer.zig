@@ -30,7 +30,9 @@ pub fn main(init: std.process.Init) !void {
         return error.UnstableFixtureEncoding;
     }
 
-    const isolate = try mruby.sandbox.Isolate.spawn(.{});
+    var boot = try mruby.sandbox.BootstrapIsolate.spawn(.{});
+    defer boot.deinit();
+    const isolate = try boot.seal();
     defer isolate.deinit();
     const restored = try isolate.importValue(.{ .bytes = encoded.items }, .{
         .accepted_schema = fixture.schema,

@@ -8,6 +8,14 @@ test {
     _ = mruby;
 }
 
+/// Spawn and immediately seal: the no-bootstrap form used by most tests.
+/// Sites that define host classes use `BootstrapIsolate` directly.
+fn spawnSealed(policy: sandbox.Policy) !sandbox.Isolate {
+    var boot = try sandbox.BootstrapIsolate.spawn(policy);
+    defer boot.deinit();
+    return boot.seal();
+}
+
 test "features: generated manifest matches the build" {
     const features = mruby.features;
 
@@ -139,16 +147,15 @@ test "evaluates arithmetic" {
 }
 
 test "nested isolate lifecycle restores outer allocator attribution" {
-    const outer = try mruby.sandbox.Isolate.spawn(.{});
-    defer outer.deinit();
-
-    const cls = try outer.vm.defineClass("NestedLifecycle", null);
+    var outer_boot = try sandbox.BootstrapIsolate.spawn(.{});
+    defer outer_boot.deinit();
+    const cls = try outer_boot.vm().defineClass("NestedLifecycle", null);
     try cls.defineClassMethod("check", struct {
         fn call(m: *mruby.Vm, self: mruby.Value) !mruby.Value {
             _ = self;
             const expected = mruby.alloc.currentIsolateCell() orelse return error.MissingOuterAttribution;
 
-            const child = try mruby.sandbox.Isolate.spawn(.{});
+            var child = try sandbox.BootstrapIsolate.spawn(.{});
             const after_spawn = mruby.alloc.currentIsolateCell() == expected;
             child.deinit();
             const after_deinit = mruby.alloc.currentIsolateCell() == expected;
@@ -157,6 +164,8 @@ test "nested isolate lifecycle restores outer allocator attribution" {
                 (@as(i64, @intFromBool(after_deinit)) << 1));
         }
     }.call);
+    const outer = try outer_boot.seal();
+    defer outer.deinit();
 
     const flags = try (try outer.run("NestedLifecycle.check")).asInt();
     try std.testing.expectEqual(@as(i64, 3), flags);
@@ -174,11 +183,13 @@ test "plain Vm retained from callback outlives its allocator Isolate" {
     };
     Retained.vm = null;
 
-    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    var boot = try sandbox.BootstrapIsolate.spawn(.{});
+    defer boot.deinit();
+    const cls = try boot.vm().defineClass("RetainPlainVm", null);
+    try cls.defineClassMethod("create", Retained.create);
+    const iso = try boot.seal();
     var iso_live = true;
     defer if (iso_live) iso.deinit();
-    const cls = try iso.vm.defineClass("RetainPlainVm", null);
-    try cls.defineClassMethod("create", Retained.create);
     _ = try iso.run("RetainPlainVm.create");
 
     iso.deinit();
@@ -1290,11 +1301,11 @@ test "init failure diagnostics are queryable" {
 const sandbox = mruby.sandbox;
 
 test "sandbox: external terminate stops an infinite loop" {
-    const iso = try sandbox.Isolate.spawn(.{});
+    const iso = try spawnSealed(.{});
     defer iso.deinit();
 
     const Stopper = struct {
-        fn run(target: *sandbox.Isolate) void {
+        fn run(target: sandbox.Isolate) void {
             mruby.sandbox.sleepNs(80 * std.time.ns_per_ms);
             target.terminate();
         }
@@ -1306,10 +1317,10 @@ test "sandbox: external terminate stops an infinite loop" {
 }
 
 test "sandbox: gas cleanup cannot erase an in-flight terminate" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    var boot = try sandbox.BootstrapIsolate.spawn(.{ .limits = .{
         .gas = .{ .per_execution = 2_000 },
     } });
-    defer iso.deinit();
+    defer boot.deinit();
 
     const Race = struct {
         var entered = std.atomic.Value(bool).init(false);
@@ -1322,7 +1333,7 @@ test "sandbox: gas cleanup cannot erase an in-flight terminate" {
             return m.nilValue();
         }
 
-        fn terminate(target: *sandbox.Isolate) void {
+        fn terminate(target: sandbox.Isolate) void {
             while (!entered.load(.acquire)) std.atomic.spinLoopHint();
             target.terminate();
             released.store(true, .release);
@@ -1331,8 +1342,10 @@ test "sandbox: gas cleanup cannot erase an in-flight terminate" {
     Race.entered.store(false, .release);
     Race.released.store(false, .release);
 
-    const cls = try iso.vm.defineClass("GasCleanupRace", null);
+    const cls = try boot.vm().defineClass("GasCleanupRace", null);
     try cls.defineMethod("pause", Race.pause);
+    const iso = try boot.seal();
+    defer iso.deinit();
 
     var stopper = try std.Thread.spawn(.{}, Race.terminate, .{iso});
     const outcome = iso.run(
@@ -1360,7 +1373,7 @@ test "sandbox: gas cleanup cannot erase an in-flight terminate" {
 }
 
 test "sandbox: wall-clock deadline" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = std.math.maxInt(u64) },
         .wall_time_ns = 60 * std.time.ns_per_ms,
     } });
@@ -1376,13 +1389,12 @@ test "sandbox: wall-clock deadline" {
 }
 
 test "sandbox: deadline is arbitrated after final native work" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    var boot = try sandbox.BootstrapIsolate.spawn(.{ .limits = .{
         .gas = .{ .per_execution = 10_000 },
         .wall_time_ns = 1 * std.time.ns_per_ms,
     } });
-    defer iso.deinit();
-
-    const cls = try iso.vm.defineClass("DeadlineNative", null);
+    defer boot.deinit();
+    const cls = try boot.vm().defineClass("DeadlineNative", null);
     try cls.defineMethod("wait", struct {
         fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
             _ = self;
@@ -1390,26 +1402,28 @@ test "sandbox: deadline is arbitrated after final native work" {
             return m.intValue(1);
         }
     }.call);
+    const iso = try boot.seal();
+    defer iso.deinit();
     // Trusted bootstrap outside an execution generation gives call() a
     // receiver without starting the isolate lifetime deadline first.
-    const receiver = try iso.vm.loadString("DeadlineNative.new");
+    const receiver = try sandbox.internalVm(iso).loadString("DeadlineNative.new");
 
     try std.testing.expectError(error.DeadlineExceeded, iso.call(receiver, "wait", .{}));
 }
 
 test "sandbox: instruction gas exhausts and is deterministic" {
     const script = "x = 0\nwhile x < 500\n  x += 1\nend\nx";
-    const iso1 = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 100_000 } });
+    const iso1 = try spawnSealed(.{ .limits = .{ .instructions = 100_000 } });
     defer iso1.deinit();
     const r = try iso1.run(script);
     try std.testing.expectEqual(@as(i64, 500), try r.asInt());
 
-    const iso2 = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 100_000 } });
+    const iso2 = try spawnSealed(.{ .limits = .{ .instructions = 100_000 } });
     defer iso2.deinit();
     _ = try iso2.run(script);
-    try std.testing.expectEqual(iso1.instr_count, iso2.instr_count);
+    try std.testing.expectEqual(iso1.internal.instr_count, iso2.internal.instr_count);
 
-    const iso3 = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 200 } });
+    const iso3 = try spawnSealed(.{ .limits = .{ .instructions = 200 } });
     defer iso3.deinit();
     try std.testing.expectError(error.GasExhausted, iso3.run(script));
 }
@@ -1422,7 +1436,7 @@ test "sandbox: typed RITE compiles and runs through the artifact interface" {
     );
     defer image.deinit(std.testing.allocator);
 
-    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    const iso = try spawnSealed(.{});
     defer iso.deinit();
 
     const result = try iso.runRite(image.view());
@@ -1444,7 +1458,7 @@ test "sandbox: typed RITE source name is stable across debug modes" {
         const has_debug = std.mem.indexOf(u8, image.encoded, "DBG\x00") != null;
         try std.testing.expectEqual(include_debug, has_debug);
 
-        const iso = try mruby.sandbox.Isolate.spawn(.{});
+        const iso = try spawnSealed(.{});
         defer iso.deinit();
         const result = try iso.runRite(image.view());
         try std.testing.expectEqualStrings("worker.rb", try result.asString());
@@ -1480,7 +1494,7 @@ test "sandbox: RITE compilers reject embedded NUL in source" {
 test "sandbox: legacy raw RITE retains its null source-name semantics" {
     const image = try mruby.sandbox.compile("__FILE__");
     defer mruby.alloc.gpa.free(image);
-    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    const iso = try spawnSealed(.{});
     defer iso.deinit();
     try std.testing.expectEqualStrings("(null)", try (try iso.runImage(image)).asString());
 }
@@ -1492,17 +1506,18 @@ test "sandbox: invalid typed RITE leaves execution lifecycle untouched" {
         .{},
     );
     defer image.deinit(std.testing.allocator);
-    const iso = try mruby.sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 10_000 },
     } });
     defer iso.deinit();
 
+    const before_rejection = iso.stats();
     image.encoded[image.encoded.len - 1] ^= 1;
     try std.testing.expectError(error.ChecksumMismatch, iso.runRite(image.view()));
     const rejected = iso.stats();
-    try std.testing.expectEqual(@as(u64, 0), rejected.instructions);
-    try std.testing.expectEqual(@as(u64, 0), rejected.wall_time_ns);
-    try std.testing.expectEqual(@as(u64, 0), rejected.gas.?.generation);
+    try std.testing.expectEqual(before_rejection.instructions, rejected.instructions);
+    try std.testing.expectEqual(before_rejection.wall_time_ns, rejected.wall_time_ns);
+    try std.testing.expectEqual(before_rejection.gas.?.generation, rejected.gas.?.generation);
     try std.testing.expect(iso.lastError() == null);
 
     image.encoded[image.encoded.len - 1] ^= 1;
@@ -1513,7 +1528,7 @@ test "sandbox: invalid typed RITE leaves execution lifecycle untouched" {
 test "sandbox: invalid typed RITE preserves a prior Ruby error" {
     var image = try mruby.sandbox.compileRite(std.testing.allocator, "42", .{});
     defer image.deinit(std.testing.allocator);
-    const iso = try mruby.sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 10_000 },
     } });
     defer iso.deinit();
@@ -1545,7 +1560,7 @@ test "sandbox: concurrent operations on one isolate fail instead of racing" {
         }
     };
     const Runner = struct {
-        iso: *mruby.sandbox.Isolate,
+        iso: mruby.sandbox.Isolate,
         failure: ?anyerror = null,
 
         fn run(runner: *@This()) void {
@@ -1558,10 +1573,12 @@ test "sandbox: concurrent operations on one isolate fail instead of racing" {
 
     Gate.entered.store(false, .release);
     Gate.release.store(false, .release);
-    const iso = try mruby.sandbox.Isolate.spawn(.{});
-    defer iso.deinit();
-    const class = try iso.vm.defineClass("ConcurrentGate", null);
+    var boot = try sandbox.BootstrapIsolate.spawn(.{});
+    defer boot.deinit();
+    const class = try boot.vm().defineClass("ConcurrentGate", null);
     try class.defineClassMethod("block", Gate.block);
+    const iso = try boot.seal();
+    defer iso.deinit();
 
     var runner = Runner{ .iso = iso };
     const thread = try std.Thread.spawn(.{}, Runner.run, .{&runner});
@@ -1581,7 +1598,7 @@ test "sandbox: concurrent operations on one isolate fail instead of racing" {
 }
 
 test "sandbox: StateCapsule transfers supported scalar values between isolates" {
-    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    const producer = try spawnSealed(.{});
     defer producer.deinit();
     const root = try producer.run(
         "[nil, false, true, -9, 1.5, :ready, \"a\\x00b\"]",
@@ -1594,7 +1611,7 @@ test "sandbox: StateCapsule transfers supported scalar values between isolates" 
     );
     defer capsule.deinit(std.testing.allocator);
 
-    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    const consumer = try spawnSealed(.{});
     defer consumer.deinit();
     const restored = try consumer.importValue(capsule.view(), .{});
     try consumer.setGlobal("restored", restored);
@@ -1605,7 +1622,7 @@ test "sandbox: StateCapsule transfers supported scalar values between isolates" 
 }
 
 test "sandbox: StateCapsule export cleans up every caller allocation failure" {
-    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    const producer = try spawnSealed(.{});
     defer producer.deinit();
     const root = try producer.run(
         \\key = "key".freeze
@@ -1616,7 +1633,7 @@ test "sandbox: StateCapsule export cleans up every caller allocation failure" {
     const Harness = struct {
         fn run(
             allocator: std.mem.Allocator,
-            iso: *mruby.sandbox.Isolate,
+            iso: mruby.sandbox.Isolate,
             value: mruby.Value,
         ) !void {
             var capsule = try iso.exportValue(allocator, value, .{});
@@ -1631,7 +1648,7 @@ test "sandbox: StateCapsule export cleans up every caller allocation failure" {
 }
 
 test "sandbox: StateCapsule copies distinct inline symbol names during export" {
-    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    const producer = try spawnSealed(.{});
     defer producer.deinit();
     // Names of four bytes or fewer use mruby's shared mutable symbol scratch
     // buffer. Retaining the borrowed pointers would turn every entry into the
@@ -1640,7 +1657,7 @@ test "sandbox: StateCapsule copies distinct inline symbol names during export" {
     var capsule = try producer.exportValue(std.testing.allocator, root, .{});
     defer capsule.deinit(std.testing.allocator);
 
-    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    const consumer = try spawnSealed(.{});
     defer consumer.deinit();
     const restored = try consumer.importValue(capsule.view(), .{});
     try consumer.setGlobal("inline_symbols", restored);
@@ -1648,10 +1665,10 @@ test "sandbox: StateCapsule copies distinct inline symbol names during export" {
 }
 
 test "sandbox: StateCapsule full-i64 Hash keys survive hash-table materialization" {
-    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    const producer = try spawnSealed(.{});
     defer producer.deinit();
-    try producer.setGlobal("maximum_key", try producer.vm.intValue(std.math.maxInt(i64)));
-    try producer.setGlobal("minimum_key", try producer.vm.intValue(std.math.minInt(i64)));
+    try producer.setGlobal("maximum_key", try producer.intValue(std.math.maxInt(i64)));
+    try producer.setGlobal("minimum_key", try producer.intValue(std.math.minInt(i64)));
     const root = try producer.run(
         \\mapping = {}
         \\index = 0
@@ -1666,12 +1683,12 @@ test "sandbox: StateCapsule full-i64 Hash keys survive hash-table materializatio
     var capsule = try producer.exportValue(std.testing.allocator, root, .{});
     defer capsule.deinit(std.testing.allocator);
 
-    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    const consumer = try spawnSealed(.{});
     defer consumer.deinit();
     const restored = try consumer.importValue(capsule.view(), .{});
     try consumer.setGlobal("wide_integer_keys", restored);
-    try consumer.setGlobal("maximum_key", try consumer.vm.intValue(std.math.maxInt(i64)));
-    try consumer.setGlobal("minimum_key", try consumer.vm.intValue(std.math.minInt(i64)));
+    try consumer.setGlobal("maximum_key", try consumer.intValue(std.math.maxInt(i64)));
+    try consumer.setGlobal("minimum_key", try consumer.intValue(std.math.minInt(i64)));
     const matches = try consumer.run(
         \\$wide_integer_keys.size == 22 &&
         \\  $wide_integer_keys[$maximum_key] == :maximum &&
@@ -1684,11 +1701,11 @@ test "sandbox: StateCapsule full-i64 Hash keys survive hash-table materializatio
 }
 
 test "sandbox: StateCapsule export enforces Hash insertion work admission" {
-    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    const iso = try spawnSealed(.{});
     defer iso.deinit();
     // Seed through the C ABI because this pinned parser rejects some decimal
     // literals outside its immediate-integer range even though mrb_int is i64.
-    try iso.setGlobal("hash_collision_stride", try iso.vm.intValue(0x1_0000_0000));
+    try iso.setGlobal("hash_collision_stride", try iso.intValue(0x1_0000_0000));
     const collision_hash = try iso.run(
         \\mapping = {}
         \\index = 0
@@ -1714,7 +1731,7 @@ test "sandbox: StateCapsule export enforces Hash insertion work admission" {
 
 test "sandbox: StateCapsule Symbol-heavy Hash uses inert name hashing" {
     if (!test_config.has_core_language_suite) return error.SkipZigTest;
-    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    const producer = try spawnSealed(.{});
     defer producer.deinit();
     const mapping = try producer.run(
         \\mapping = {}
@@ -1728,7 +1745,7 @@ test "sandbox: StateCapsule Symbol-heavy Hash uses inert name hashing" {
     var capsule = try producer.exportValue(std.testing.allocator, mapping, .{});
     defer capsule.deinit(std.testing.allocator);
 
-    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    const consumer = try spawnSealed(.{});
     defer consumer.deinit();
     const restored = try consumer.importValue(capsule.view(), .{});
     try consumer.setGlobal("symbol_hash", restored);
@@ -1742,7 +1759,7 @@ test "sandbox: StateCapsule catches OOM while protecting a materialized result" 
         extern fn mrz_artifact_test_fill_arena(mrb: *mruby.c.mrb_state) c_int;
     };
 
-    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    const producer = try spawnSealed(.{});
     defer producer.deinit();
     var capsule = try producer.exportValue(
         std.testing.allocator,
@@ -1751,54 +1768,56 @@ test "sandbox: StateCapsule catches OOM while protecting a materialized result" 
     );
     defer capsule.deinit(std.testing.allocator);
 
-    // Bootstrap happens before policy caps are installed, so the first
-    // attributed arena growth is deterministically refused by this cap.
-    const consumer = try mruby.sandbox.Isolate.spawn(.{ .limits = .{
+    // The consumer never runs guest code; trusted avoids capability-mask
+    // allocations at seal so the first attributed arena growth is
+    // deterministically refused by this cap.
+    const consumer = try spawnSealed(sandbox.Policy.trusted(.{ .limits = .{
         .hard_memory_bytes = 1,
-    } });
+    } }));
     defer consumer.deinit();
-    const entry_arena = test_c.mrz_artifact_test_fill_arena(consumer.vm.mrb);
-    defer mruby.c.mrz_gc_arena_restore(consumer.vm.mrb, entry_arena);
+    const entry_arena = test_c.mrz_artifact_test_fill_arena(sandbox.internalVm(consumer).mrb);
+    defer mruby.c.mrz_gc_arena_restore(sandbox.internalVm(consumer).mrb, entry_arena);
 
     try std.testing.expectError(error.MemoryLimitExceeded, consumer.importValue(
         capsule.view(),
         .{},
     ));
-    try std.testing.expect(consumer.cell.hardOom());
-    try std.testing.expect(mruby.c.mrz_nil_p(mruby.c.mrz_exc_value(consumer.vm.mrb)));
+    try std.testing.expect(consumer.internal.cell.hardOom());
+    try std.testing.expect(mruby.c.mrz_nil_p(mruby.c.mrz_exc_value(sandbox.internalVm(consumer).mrb)));
 }
 
 test "sandbox: StateCapsule import distinguishes soft policy refusal" {
-    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    const producer = try spawnSealed(.{});
     defer producer.deinit();
     const source_bytes = try std.testing.allocator.alloc(u8, 256 * 1024);
     defer std.testing.allocator.free(source_bytes);
     @memset(source_bytes, 's');
     var capsule = try producer.exportValue(
         std.testing.allocator,
-        try producer.vm.stringValue(source_bytes),
+        try producer.stringValue(source_bytes),
         .{},
     );
     defer capsule.deinit(std.testing.allocator);
 
-    // Bootstrap precedes cap installation, so a one-byte soft ceiling makes
-    // the first graph-construction allocation deterministically fail without
-    // setting the separate hard-limit bit.
-    const consumer = try mruby.sandbox.Isolate.spawn(.{ .limits = .{
+    // The consumer never runs guest code; trusted avoids capability-mask
+    // allocations at seal, so a one-byte soft ceiling makes the first
+    // graph-construction allocation deterministically fail without setting
+    // the separate hard-limit bit.
+    const consumer = try spawnSealed(sandbox.Policy.trusted(.{ .limits = .{
         .memory_bytes = 1,
-    } });
+    } }));
     defer consumer.deinit();
     try std.testing.expectError(error.MemoryLimitExceeded, consumer.importValue(
         capsule.view(),
         .{},
     ));
-    try std.testing.expect(consumer.cell.softOom());
-    try std.testing.expect(!consumer.cell.hardOom());
-    try std.testing.expect(mruby.c.mrz_nil_p(mruby.c.mrz_exc_value(consumer.vm.mrb)));
+    try std.testing.expect(consumer.internal.cell.softOom());
+    try std.testing.expect(!consumer.internal.cell.hardOom());
+    try std.testing.expect(mruby.c.mrz_nil_p(mruby.c.mrz_exc_value(sandbox.internalVm(consumer).mrb)));
 }
 
 test "sandbox: StateCapsule process allocation failures stay contained" {
-    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    const producer = try spawnSealed(.{});
     defer producer.deinit();
     const root = try producer.run(
         \\key = "key".freeze
@@ -1813,7 +1832,7 @@ test "sandbox: StateCapsule process allocation failures stay contained" {
     const previous_allocator = mruby.alloc.gpa;
     var measurement = std.testing.FailingAllocator.init(previous_allocator, .{});
     {
-        const consumer = try mruby.sandbox.Isolate.spawn(.{});
+        const consumer = try spawnSealed(.{});
         defer consumer.deinit();
         const result = blk: {
             mruby.alloc.gpa = measurement.allocator();
@@ -1826,7 +1845,7 @@ test "sandbox: StateCapsule process allocation failures stay contained" {
     try std.testing.expect(allocation_count > 0);
 
     for (0..allocation_count) |fail_index| {
-        const consumer = try mruby.sandbox.Isolate.spawn(.{});
+        const consumer = try spawnSealed(.{});
         defer consumer.deinit();
         var failing = std.testing.FailingAllocator.init(previous_allocator, .{
             .fail_index = fail_index,
@@ -1838,7 +1857,7 @@ test "sandbox: StateCapsule process allocation failures stay contained" {
         };
         try std.testing.expectError(error.OutOfMemory, result);
         try std.testing.expect(failing.has_induced_failure);
-        try std.testing.expect(mruby.c.mrz_nil_p(mruby.c.mrz_exc_value(consumer.vm.mrb)));
+        try std.testing.expect(mruby.c.mrz_nil_p(mruby.c.mrz_exc_value(sandbox.internalVm(consumer).mrb)));
     }
 }
 
@@ -1886,7 +1905,7 @@ fn immediateFloatCapsule(
 }
 
 test "sandbox: StateCapsule preserves cycles aliases defaults order and frozen state" {
-    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    const producer = try spawnSealed(.{});
     defer producer.deinit();
     const root = try producer.run(
         \\shared = "a\\x00b".freeze
@@ -1906,14 +1925,14 @@ test "sandbox: StateCapsule preserves cycles aliases defaults order and frozen s
     var capsule = try producer.exportValue(std.testing.allocator, root, .{});
     defer capsule.deinit(std.testing.allocator);
 
-    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    const consumer = try spawnSealed(.{});
     defer consumer.deinit();
     const restored = try consumer.importValue(capsule.view(), .{});
     // A successful heap import deliberately leaves one ordinary arena root.
     // Prove the graph survives a full collection before the host publishes it
     // into a longer-lived Ruby root such as a global.
-    mruby.alloc.enterIsolate(&consumer.cell);
-    mruby.c.mrb_full_gc(consumer.vm.mrb);
+    mruby.alloc.enterIsolate(&consumer.internal.cell);
+    mruby.c.mrb_full_gc(sandbox.internalVm(consumer).mrb);
     mruby.alloc.exitIsolate();
     try consumer.setGlobal("restored_graph", restored);
     const matches = try consumer.run(
@@ -1933,9 +1952,9 @@ test "sandbox: StateCapsule preserves cycles aliases defaults order and frozen s
 }
 
 test "sandbox: StateCapsule preserves binary64 NaN payloads and signed zero" {
-    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    const producer = try spawnSealed(.{});
     defer producer.deinit();
-    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    const consumer = try spawnSealed(.{});
     defer consumer.deinit();
 
     const cases = [_]u64{
@@ -1963,7 +1982,7 @@ test "sandbox: StateCapsule schema admission is explicit and minor-compatible" {
     const id = [_]u8{ 0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f };
     const produced: mruby.artifact.Schema = .{ .id = id, .major = 3, .minor = 2 };
 
-    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    const producer = try spawnSealed(.{});
     defer producer.deinit();
     var capsule = try producer.exportValue(
         std.testing.allocator,
@@ -1972,7 +1991,7 @@ test "sandbox: StateCapsule schema admission is explicit and minor-compatible" {
     );
     defer capsule.deinit(std.testing.allocator);
 
-    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    const consumer = try spawnSealed(.{});
     defer consumer.deinit();
     try std.testing.expectError(error.SchemaMismatch, consumer.importValue(capsule.view(), .{}));
     try std.testing.expectEqual(
@@ -1992,7 +2011,7 @@ test "sandbox: StateCapsule schema admission is explicit and minor-compatible" {
 }
 
 test "sandbox: StateCapsule policy and per-call limits can only tighten" {
-    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    const producer = try spawnSealed(.{});
     defer producer.deinit();
     const root = try producer.run("[1, 2]");
 
@@ -2011,7 +2030,7 @@ test "sandbox: StateCapsule policy and per-call limits can only tighten" {
         producer.lastArtifactError().?.kind,
     );
 
-    const constrained = try mruby.sandbox.Isolate.spawn(.{ .artifacts = .{
+    const constrained = try spawnSealed(.{ .artifacts = .{
         .limits = .{ .capsule = .{ .max_total_edges = 1 } },
     } });
     defer constrained.deinit();
@@ -2020,7 +2039,7 @@ test "sandbox: StateCapsule policy and per-call limits can only tighten" {
         .{ .limits = .{ .max_total_edges = 100 } },
     ));
 
-    const per_call = try mruby.sandbox.Isolate.spawn(.{});
+    const per_call = try spawnSealed(.{});
     defer per_call.deinit();
     try std.testing.expectError(error.CapsuleLimitExceeded, per_call.importValue(
         boundary.view(),
@@ -2034,7 +2053,7 @@ test "sandbox: StateCapsule policy and per-call limits can only tighten" {
 
 test "sandbox: StateCapsule rejects unsupported values and container state with paths" {
     // The ivar branch of the suite exercises instance_variable_set.
-    const iso = try mruby.sandbox.Isolate.spawn(mruby.sandbox.Policy.trusted(.{}));
+    const iso = try spawnSealed(mruby.sandbox.Policy.trusted(.{}));
     defer iso.deinit();
 
     const subclass = try iso.run("class ArtifactArray < Array; end; ArtifactArray.new");
@@ -2127,9 +2146,9 @@ test "sandbox: StateCapsule rejects unsupported values and container state with 
 }
 
 test "sandbox: StateCapsule rejects foreign values without inspecting their graph" {
-    const owner = try mruby.sandbox.Isolate.spawn(.{});
+    const owner = try spawnSealed(.{});
     defer owner.deinit();
-    const other = try mruby.sandbox.Isolate.spawn(.{});
+    const other = try spawnSealed(.{});
     defer other.deinit();
 
     try std.testing.expectError(error.ForeignValue, other.exportValue(
@@ -2145,7 +2164,7 @@ test "sandbox: StateCapsule rejects foreign values without inspecting their grap
 test "sandbox: StateCapsule reports semantic duplicate encoded Hash keys" {
     var capsule = try duplicateZeroHashKeyCapsule(std.testing.allocator);
     defer capsule.deinit(std.testing.allocator);
-    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    const iso = try spawnSealed(.{});
     defer iso.deinit();
 
     try std.testing.expectError(error.InvalidArtifact, iso.importValue(capsule.view(), .{}));
@@ -2159,7 +2178,7 @@ test "sandbox: StateCapsule reports semantic duplicate encoded Hash keys" {
 }
 
 test "sandbox: StateCapsule distinguishes framing and checksum failures" {
-    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    const producer = try spawnSealed(.{});
     defer producer.deinit();
     var capsule = try producer.exportValue(
         std.testing.allocator,
@@ -2168,7 +2187,7 @@ test "sandbox: StateCapsule distinguishes framing and checksum failures" {
     );
     defer capsule.deinit(std.testing.allocator);
 
-    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    const consumer = try spawnSealed(.{});
     defer consumer.deinit();
     for (0..capsule.encoded.len) |cut| {
         try std.testing.expectError(error.InvalidArtifact, consumer.importValue(.{
@@ -2193,7 +2212,7 @@ test "sandbox: StateCapsule distinguishes framing and checksum failures" {
 }
 
 test "sandbox: StateCapsule control operations preserve execution state and last error" {
-    const iso = try mruby.sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 100_000 },
     } });
     defer iso.deinit();
@@ -2225,7 +2244,7 @@ test "sandbox: StateCapsule control operations preserve execution state and last
 }
 
 test "sandbox: StateCapsule construction does not dispatch guest overrides" {
-    const producer = try mruby.sandbox.Isolate.spawn(.{});
+    const producer = try spawnSealed(.{});
     defer producer.deinit();
     const root = try producer.run(
         \\key = "safe".freeze
@@ -2240,7 +2259,7 @@ test "sandbox: StateCapsule construction does not dispatch guest overrides" {
     var capsule = try producer.exportValue(std.testing.allocator, root, .{});
     defer capsule.deinit(std.testing.allocator);
 
-    const consumer = try mruby.sandbox.Isolate.spawn(.{});
+    const consumer = try spawnSealed(.{});
     defer consumer.deinit();
     _ = try consumer.run(
         \\class String
@@ -2275,7 +2294,7 @@ test "sandbox: StateCapsule operations reject a concurrently running Isolate" {
         }
     };
     const Runner = struct {
-        iso: *mruby.sandbox.Isolate,
+        iso: mruby.sandbox.Isolate,
         failure: ?anyerror = null,
 
         fn run(runner: *@This()) void {
@@ -2288,10 +2307,12 @@ test "sandbox: StateCapsule operations reject a concurrently running Isolate" {
 
     Gate.entered.store(false, .release);
     Gate.release.store(false, .release);
-    const iso = try mruby.sandbox.Isolate.spawn(.{});
-    defer iso.deinit();
-    const class = try iso.vm.defineClass("ArtifactConcurrentGate", null);
+    var boot = try sandbox.BootstrapIsolate.spawn(.{});
+    defer boot.deinit();
+    const class = try boot.vm().defineClass("ArtifactConcurrentGate", null);
     try class.defineClassMethod("block", Gate.block);
+    const iso = try boot.seal();
+    defer iso.deinit();
     const root = try iso.run("[1, 2]");
     var capsule = try iso.exportValue(std.testing.allocator, root, .{});
     defer capsule.deinit(std.testing.allocator);
@@ -2321,7 +2342,7 @@ test "sandbox: StateCapsule operations reject a concurrently running Isolate" {
 
 test "sandbox: StateCapsule operations from same-Isolate callbacks are busy" {
     const Callback = struct {
-        var isolate: ?*mruby.sandbox.Isolate = null;
+        var isolate: ?mruby.sandbox.Isolate = null;
         var root: ?mruby.Value = null;
         var capsule_view: ?mruby.artifact.StateCapsuleView = null;
 
@@ -2349,8 +2370,14 @@ test "sandbox: StateCapsule operations from same-Isolate callbacks are busy" {
         }
     };
 
-    const iso = try mruby.sandbox.Isolate.spawn(.{});
+    var boot = try sandbox.BootstrapIsolate.spawn(.{});
+    defer boot.deinit();
+    const class = try boot.vm().defineClass("ArtifactCallback", null);
+    try class.defineClassMethod("export_busy", Callback.exportBusy);
+    try class.defineClassMethod("import_busy", Callback.importBusy);
+    const iso = try boot.seal();
     defer iso.deinit();
+
     const root = try iso.run("[1, 2]");
     var capsule = try iso.exportValue(std.testing.allocator, root, .{});
     defer capsule.deinit(std.testing.allocator);
@@ -2363,15 +2390,12 @@ test "sandbox: StateCapsule operations from same-Isolate callbacks are busy" {
         Callback.capsule_view = null;
     }
 
-    const class = try iso.vm.defineClass("ArtifactCallback", null);
-    try class.defineClassMethod("export_busy", Callback.exportBusy);
-    try class.defineClassMethod("import_busy", Callback.importBusy);
     try std.testing.expect((try iso.run("ArtifactCallback.export_busy")).isTruthy());
     try std.testing.expect((try iso.run("ArtifactCallback.import_busy")).isTruthy());
 }
 
 test "sandbox: explicit per-isolate gas preserves sticky legacy behavior" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_isolate = 2_000 },
     } });
     defer iso.deinit();
@@ -2383,7 +2407,7 @@ test "sandbox: explicit per-isolate gas preserves sticky legacy behavior" {
 }
 
 test "sandbox: per-execution gas publishes generation zero before first run" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 7 },
     } });
     defer iso.deinit();
@@ -2401,7 +2425,7 @@ test "sandbox: per-execution gas publishes generation zero before first run" {
 }
 
 test "sandbox: explicit unlimited policy publishes no gas stats" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .gas = .unlimited } });
+    const iso = try spawnSealed(.{ .limits = .{ .gas = .unlimited } });
     defer iso.deinit();
     try std.testing.expect(iso.stats().gas == null);
     _ = try iso.run("1 + 1");
@@ -2409,7 +2433,7 @@ test "sandbox: explicit unlimited policy publishes no gas stats" {
 }
 
 test "sandbox: termination latched before entry starts no gas generation" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 1_000 },
     } });
     defer iso.deinit();
@@ -2427,16 +2451,16 @@ test "sandbox: termination latched before entry starts no gas generation" {
 }
 
 test "sandbox: idle entry preserves an existing allocator attribution" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 1_000 },
     } });
     defer iso.deinit();
 
     {
-        mruby.alloc.enterIsolate(&iso.cell);
+        mruby.alloc.enterIsolate(&iso.internal.cell);
         defer mruby.alloc.exitIsolate();
         try std.testing.expectError(error.IsolateThreadBusy, iso.run("$must_not_run = true"));
-        try std.testing.expect(mruby.alloc.currentIsolateCell() == &iso.cell);
+        try std.testing.expect(mruby.alloc.currentIsolateCell() == &iso.internal.cell);
     }
 
     try std.testing.expectEqual(@as(u64, 0), iso.stats().gas.?.generation);
@@ -2446,14 +2470,14 @@ test "sandbox: idle entry preserves an existing allocator attribution" {
 
 test "sandbox: gas configuration is validated and cached at spawn" {
     const allocations_before = mruby.alloc.liveAllocs();
-    try std.testing.expectError(error.ConflictingGasPolicy, sandbox.Isolate.spawn(.{ .limits = .{
+    try std.testing.expectError(error.ConflictingGasPolicy, spawnSealed(.{ .limits = .{
         .instructions = 10,
         .gas = .{ .per_execution = 10 },
     } }));
     // Conflict validation happens before the mruby heap is allocated.
     try std.testing.expectEqual(allocations_before, mruby.alloc.liveAllocs());
 
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 100 },
     } });
     defer iso.deinit();
@@ -2468,7 +2492,7 @@ test "sandbox: gas configuration is validated and cached at spawn" {
 
 test "sandbox: exact and zero gas boundaries are observable" {
     // Calibrate the deterministic opcode count on the same public entry path.
-    const calibration = try sandbox.Isolate.spawn(.{ .limits = .{
+    const calibration = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_isolate = 10_000 },
     } });
     defer calibration.deinit();
@@ -2476,7 +2500,7 @@ test "sandbox: exact and zero gas boundaries are observable" {
     const exact_limit = calibration.stats().gas.?.used;
     try std.testing.expect(exact_limit > 0);
 
-    const exact = try sandbox.Isolate.spawn(.{ .limits = .{
+    const exact = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_isolate = exact_limit },
     } });
     defer exact.deinit();
@@ -2490,7 +2514,7 @@ test "sandbox: exact and zero gas boundaries are observable" {
     try std.testing.expectError(error.GasExhausted, exact.run("1"));
     try std.testing.expect(exact.stats().gas.?.exhausted);
 
-    const zero = try sandbox.Isolate.spawn(.{ .limits = .{
+    const zero = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 0 },
     } });
     defer zero.deinit();
@@ -2503,7 +2527,7 @@ test "sandbox: exact and zero gas boundaries are observable" {
 }
 
 test "sandbox: per-execution gas renews at each outer run" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 1_000 },
     } });
     defer iso.deinit();
@@ -2527,14 +2551,14 @@ test "sandbox: per-execution gas renews at each outer run" {
 
 test "sandbox: sequential executions each receive the full fixed allowance" {
     const script = "i = 0; while i < 50; i += 1; end; i";
-    const calibration = try sandbox.Isolate.spawn(.{ .limits = .{
+    const calibration = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 100_000 },
     } });
     defer calibration.deinit();
     _ = try calibration.run(script);
     const allowance = calibration.stats().gas.?.used;
 
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = allowance },
     } });
     defer iso.deinit();
@@ -2557,7 +2581,7 @@ test "sandbox: sequential executions each receive the full fixed allowance" {
 }
 
 test "sandbox: per-execution gas recovers after exhaustion on the same heap" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 2_000 },
     } });
     defer iso.deinit();
@@ -2593,7 +2617,7 @@ test "sandbox: run runImage and call each start a fresh gas generation" {
     const image = try sandbox.compile("6 * 7");
     defer mruby.alloc.gpa.free(image);
 
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 2_000 },
     } });
     defer iso.deinit();
@@ -2621,7 +2645,7 @@ test "sandbox: run runImage and call each start a fresh gas generation" {
 }
 
 test "sandbox: per-isolate gas reports charged and observed instructions" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_isolate = 300 },
     } });
     defer iso.deinit();
@@ -2639,7 +2663,7 @@ test "sandbox: per-isolate gas reports charged and observed instructions" {
 }
 
 test "sandbox: un-rescuable termination still runs ensure" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 5_000 } });
+    const iso = try spawnSealed(.{ .limits = .{ .instructions = 5_000 } });
     defer iso.deinit();
     // An unfinishable counted loop (an empty `while true; end` compiles to
     // a jump-to-self at the catch region start, where no raise can be
@@ -2660,7 +2684,7 @@ test "sandbox: un-rescuable termination still runs ensure" {
 }
 
 test "sandbox: termination cannot be suppressed by rescue" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 3_000 } });
+    const iso = try spawnSealed(.{ .limits = .{ .instructions = 3_000 } });
     defer iso.deinit();
     // A rescue that catches the termination grants only a bounded grace
     // budget of further execution (handler + immediate continuation);
@@ -2678,10 +2702,10 @@ test "sandbox: termination cannot be suppressed by rescue" {
         \\$after = :continued
     ));
     // Bounded execution: the run cannot have looped or continued freely.
-    try std.testing.expect(iso.instr_count <= 3_000 + 2_048);
+    try std.testing.expect(iso.internal.instr_count <= 3_000 + 2_048);
 
     // And a long post-rescue continuation is cut off by the grace budget.
-    const iso2 = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 3_000 } });
+    const iso2 = try spawnSealed(.{ .limits = .{ .instructions = 3_000 } });
     defer iso2.deinit();
     try std.testing.expectError(error.GasExhausted, iso2.run(
         \\y = 0
@@ -2696,11 +2720,11 @@ test "sandbox: termination cannot be suppressed by rescue" {
         \\  end
         \\end
     ));
-    try std.testing.expect(iso2.instr_count <= 3_000 + 1_024 + 4_096 + 64);
+    try std.testing.expect(iso2.internal.instr_count <= 3_000 + 1_024 + 4_096 + 64);
 }
 
 test "sandbox: memory cap escalates to MemoryLimitExceeded" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 10_000_000 },
         .memory_bytes = 2 * 1024 * 1024,
     } });
@@ -2711,7 +2735,7 @@ test "sandbox: memory cap escalates to MemoryLimitExceeded" {
         \\2000.times { s += "0123456789abcdef0123456789abcdef" }
         \\s.size
     ));
-    try std.testing.expect(iso.cell.anyOom());
+    try std.testing.expect(iso.internal.cell.anyOom());
     const terminated = iso.stats();
     try std.testing.expectError(error.MemoryLimitExceeded, iso.run("$memory_must_not_run = true"));
     const repeated = iso.stats();
@@ -2720,7 +2744,7 @@ test "sandbox: memory cap escalates to MemoryLimitExceeded" {
 }
 
 test "sandbox: call-depth limit" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 100_000 },
         .call_depth = 8,
     } });
@@ -2739,7 +2763,7 @@ test "sandbox: call-depth limit" {
 }
 
 test "sandbox: capabilities strip eval, send, introspection, ObjectSpace" {
-    const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{
+    const iso = try spawnSealed(.{ .capabilities = .{
         .eval = false,
         .send = false,
         .introspection = false,
@@ -2771,7 +2795,7 @@ test "sandbox: zero-value policy is the deny-by-default floor" {
     // A Policy constructed without a preset strips every language
     // capability, so plain compute scripts run but ambient authority does
     // not silently accrue.
-    const iso = try sandbox.Isolate.spawn(.{});
+    const iso = try spawnSealed(.{});
     defer iso.deinit();
 
     const plain = try iso.run("6 * 7");
@@ -2797,7 +2821,7 @@ test "sandbox: zero-value policy is the deny-by-default floor" {
 test "sandbox: trusted preset grants ambient language capabilities" {
     if (!test_config.has_core_language_suite) return error.SkipZigTest;
 
-    const iso = try sandbox.Isolate.spawn(sandbox.Policy.trusted(.{ .limits = .{
+    const iso = try spawnSealed(sandbox.Policy.trusted(.{ .limits = .{
         .gas = .{ .per_isolate = 1_000_000 },
     } }));
     defer iso.deinit();
@@ -2824,7 +2848,7 @@ test "sandbox: trusted preset grants ambient language capabilities" {
 }
 
 test "sandbox: restricted preset strips language grants and freezes the model" {
-    const iso = try sandbox.Isolate.spawn(sandbox.Policy.restricted(.{}));
+    const iso = try spawnSealed(sandbox.Policy.restricted(.{}));
     defer iso.deinit();
 
     try std.testing.expectError(error.RubyException, iso.run("eval('1')"));
@@ -2837,7 +2861,7 @@ test "sandbox: restricted preset strips language grants and freezes the model" {
 
     // Restricted discards language grants from the base policy rather than
     // merging them, so composition cannot re-open a stripped surface.
-    const composed = try sandbox.Isolate.spawn(
+    const composed = try spawnSealed(
         sandbox.Policy.restricted(sandbox.Policy.trusted(.{})),
     );
     defer composed.deinit();
@@ -2851,7 +2875,7 @@ test "sandbox: policy is resolved at spawn; host-side edits afterwards are ignor
 
     var policy = sandbox.Policy{};
     policy.capabilities.eval = true;
-    const iso = try sandbox.Isolate.spawn(policy);
+    const iso = try spawnSealed(policy);
     defer iso.deinit();
     const ev = try iso.run("eval('41 + 1')");
     try std.testing.expectEqual(@as(i64, 42), try ev.asInt());
@@ -2865,17 +2889,18 @@ test "sandbox: policy is resolved at spawn; host-side edits afterwards are ignor
 }
 
 test "sandbox: seal applies capabilities at an explicit bootstrap boundary" {
-    const iso = try sandbox.Isolate.spawn(.{});
-    defer iso.deinit();
+    var boot = try sandbox.BootstrapIsolate.spawn(.{});
+    defer boot.deinit();
 
     // Bootstrap window: raw-vm evaluation has not been masked yet, so the
     // host can define helpers that themselves rely on ambient methods.
     if (test_config.has_core_language_suite) {
-        const pre = try iso.vm.loadString("eval('40 + 2')");
+        const pre = try boot.vm().loadString("eval('40 + 2')");
         try std.testing.expectEqual(@as(i64, 42), try pre.asInt());
     }
 
-    try iso.seal();
+    const iso = try boot.seal();
+    defer iso.deinit();
 
     // The masks are installed even though no run has happened.
     if (test_config.has_core_language_suite) {
@@ -2885,17 +2910,16 @@ test "sandbox: seal applies capabilities at an explicit bootstrap boundary" {
     // A sealed isolate keeps executing compute-only scripts.
     const plain = try iso.run("21 * 2");
     try std.testing.expectEqual(@as(i64, 42), try plain.asInt());
-    // Sealing is idempotent.
-    try iso.seal();
 }
 
 test "sandbox: seal under per-execution gas keeps generation accounting" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    var boot = try sandbox.BootstrapIsolate.spawn(.{ .limits = .{
         .gas = .{ .per_execution = 20_000 },
     } });
+    defer boot.deinit();
+    const iso = try boot.seal();
     defer iso.deinit();
 
-    try iso.seal();
     const r = try iso.run("40 + 1");
     try std.testing.expectEqual(@as(i64, 41), try r.asInt());
     const stats = iso.stats();
@@ -2904,37 +2928,38 @@ test "sandbox: seal under per-execution gas keeps generation accounting" {
 }
 
 test "sandbox: seal rejects re-entrant use from inside a host callback" {
-    const iso = try sandbox.Isolate.spawn(.{});
-    defer iso.deinit();
+    var boot = try sandbox.BootstrapIsolate.spawn(.{});
+    defer boot.deinit();
+    const cls = try boot.vm().defineClass("SealReenter", null);
 
     const Reenter = struct {
-        var target: ?*sandbox.Isolate = null;
+        var target: ?*sandbox.BootstrapIsolate = null;
 
         fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
             _ = self;
-            try target.?.seal();
+            _ = try target.?.seal();
             return m.intValue(1);
         }
     };
-    Reenter.target = iso;
-
-    const cls = try iso.vm.defineClass("SealReenter", null);
+    Reenter.target = &boot;
     try cls.defineMethod("attempt", Reenter.call);
+    const iso = try boot.seal();
+    defer iso.deinit();
     try std.testing.expectError(error.RubyException, iso.run("SealReenter.new.attempt"));
     const message = try iso.lastError().?.message(std.testing.allocator);
     defer std.testing.allocator.free(message);
-    // The seal was rejected as out-of-contract re-entrancy and surfaced as
-    // an ordinary callback error, not a policy termination.
-    try std.testing.expectEqualStrings("zig error: IsolateThreadBusy", message);
+    // The consumed bootstrap handle was rejected inside the callback and
+    // surfaced as an ordinary callback error, not a policy termination.
+    try std.testing.expectEqualStrings("zig error: BootstrapHandleConsumed", message);
     // Capabilities were not applied by the rejected seal.
     const plain = try iso.run("21 * 2");
     try std.testing.expectEqual(@as(i64, 42), try plain.asInt());
-    try iso.seal();
+    // The successful seal applied them; eval stays masked.
     try std.testing.expectError(error.RubyException, iso.run("eval('1')"));
 }
 
 test "sandbox: host globals read and write between executions" {
-    const iso = try sandbox.Isolate.spawn(.{});
+    const iso = try spawnSealed(.{});
     defer iso.deinit();
 
     _ = try iso.run("$host_value = 11");
@@ -2947,14 +2972,14 @@ test "sandbox: host globals read and write between executions" {
     try std.testing.expectEqual(@as(i64, 12), try (try iso.getGlobal("host_value")).asInt());
 
     // Values from another interpreter are rejected.
-    const other = try sandbox.Isolate.spawn(.{});
+    const other = try spawnSealed(.{});
     defer other.deinit();
     const foreign = try other.getGlobal("host_value");
     try std.testing.expectError(error.ForeignValue, iso.setGlobal("host_value", foreign));
 }
 
 test "sandbox: clearError drops the retained diagnostic" {
-    const iso = try sandbox.Isolate.spawn(.{});
+    const iso = try spawnSealed(.{});
     defer iso.deinit();
 
     try std.testing.expectError(error.RubyException, iso.run("raise 'boom'"));
@@ -2966,11 +2991,11 @@ test "sandbox: clearError drops the retained diagnostic" {
 }
 
 test "sandbox: host operations reject re-entrant use from callbacks" {
-    const iso = try sandbox.Isolate.spawn(.{});
-    defer iso.deinit();
+    var boot = try sandbox.BootstrapIsolate.spawn(.{});
+    defer boot.deinit();
 
     const Probe = struct {
-        var target: ?*sandbox.Isolate = null;
+        var target: ?sandbox.Isolate = null;
         var rejected = false;
 
         fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
@@ -2985,10 +3010,12 @@ test "sandbox: host operations reject re-entrant use from callbacks" {
             return m.intValue(0);
         }
     };
-    Probe.target = iso;
 
-    const cls = try iso.vm.defineClass("HostProbe", null);
+    const cls = try boot.vm().defineClass("HostProbe", null);
     try cls.defineMethod("attempt", Probe.call);
+    const iso = try boot.seal();
+    defer iso.deinit();
+    Probe.target = iso;
     _ = try iso.run("HostProbe.new.attempt");
     try std.testing.expect(Probe.rejected);
     // Between executions the same operation succeeds.
@@ -2996,7 +3023,7 @@ test "sandbox: host operations reject re-entrant use from callbacks" {
 }
 
 test "sandbox: frozen object model blocks def on core classes" {
-    const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .freeze_object_model = true } });
+    const iso = try spawnSealed(.{ .capabilities = .{ .freeze_object_model = true } });
     defer iso.deinit();
     try std.testing.expectError(error.RubyException, iso.run("class String; def boom; end; end"));
     const exc = iso.lastError().?;
@@ -3011,7 +3038,7 @@ test "sandbox: deterministic RNG and frozen clock" {
     if (test_config.has_random) {
         const run_pair = struct {
             fn sample(seed: u64) !i64 {
-                const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .random_seed = seed } });
+                const iso = try spawnSealed(.{ .capabilities = .{ .random_seed = seed } });
                 defer iso.deinit();
                 const v = try iso.run("rand(1 << 40)");
                 return v.asInt();
@@ -3021,7 +3048,7 @@ test "sandbox: deterministic RNG and frozen clock" {
     }
 
     if (test_config.has_time) {
-        const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .clock_epoch_s = 1_700_000_000 } });
+        const iso = try spawnSealed(.{ .capabilities = .{ .clock_epoch_s = 1_700_000_000 } });
         defer iso.deinit();
         const t = try iso.run("Time.now.to_i");
         try std.testing.expectEqual(@as(i64, 1_700_000_000), try t.asInt());
@@ -3033,7 +3060,7 @@ test "sandbox: deterministic RNG and frozen clock" {
 test "sandbox: capability bytecode follows the selected gas scope" {
     if (!test_config.has_random) return error.SkipZigTest;
 
-    const renewable = try sandbox.Isolate.spawn(.{
+    const renewable = try spawnSealed(.{
         .limits = .{ .gas = .{ .per_execution = 10_000 } },
         .capabilities = .{ .random_seed = 42 },
     });
@@ -3044,7 +3071,7 @@ test "sandbox: capability bytecode follows the selected gas scope" {
     try std.testing.expect(renewable_stats.instructions > renewable_stats.gas.?.observed_instructions);
     try std.testing.expectEqual(@as(u64, 1), renewable_stats.gas.?.generation);
 
-    const lifetime = try sandbox.Isolate.spawn(.{
+    const lifetime = try spawnSealed(.{
         .limits = .{ .gas = .{ .per_isolate = 10_000 } },
         .capabilities = .{ .random_seed = 42 },
     });
@@ -3061,14 +3088,21 @@ test "sandbox: capability bytecode follows the selected gas scope" {
 test "sandbox: failed capability preparation is terminal before generation one" {
     if (test_config.has_random) return error.SkipZigTest;
 
-    const iso = try sandbox.Isolate.spawn(.{
+    var boot = try sandbox.BootstrapIsolate.spawn(.{
         .limits = .{ .gas = .{ .per_execution = 10_000 } },
         // A trimmed build without mruby-random must fail loudly instead of
         // claiming a deterministic seed was installed.
         .capabilities = .{ .random_seed = 42 },
     });
-    defer iso.deinit();
+    defer boot.deinit();
 
+    // Capability preparation fails at the seal boundary, and the failure is
+    // terminal for every later execution. Reach the failed state explicitly:
+    // sealing cannot succeed anymore.
+    try std.testing.expectError(error.CapabilityApplicationFailed, boot.seal());
+    const iso = sandbox.Isolate{ .internal = boot.state.? };
+    boot.state = null;
+    defer iso.deinit();
     try std.testing.expectError(error.CapabilityApplicationFailed, iso.run("$must_not_run = true"));
     const failed = iso.stats();
     try std.testing.expectEqual(@as(u64, 0), failed.gas.?.generation);
@@ -3081,11 +3115,12 @@ test "sandbox: failed capability preparation is terminal before generation one" 
 }
 
 test "sandbox: nested run from a method callback" {
-    const iso = try sandbox.Isolate.spawn(.{});
-    defer iso.deinit();
+    var boot = try sandbox.BootstrapIsolate.spawn(.{});
+    defer boot.deinit();
+    const cls = try boot.vm().defineClass("Nested", null);
 
     const Outer = struct {
-        var inner: ?*sandbox.Isolate = null;
+        var inner: ?sandbox.Isolate = null;
         fn call(m: *mruby.Vm, self: mruby.Value, n: i64) anyerror!mruby.Value {
             _ = self;
             const r = inner.?.run("'nested'") catch return error.NestedFailed;
@@ -3094,22 +3129,23 @@ test "sandbox: nested run from a method callback" {
             return m.intValue(n * 2);
         }
     };
-    Outer.inner = iso;
-    const cls = try iso.vm.defineClass("Nested", null);
     try cls.defineMethod("scale", Outer.call);
+    const iso = try boot.seal();
+    defer iso.deinit();
+    Outer.inner = iso;
 
     const r = try iso.run("Nested.new.scale(21)");
     try std.testing.expectEqual(@as(i64, 42), try r.asInt());
 }
 
 test "sandbox: nested callback re-entry shares the active gas generation" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    var boot = try sandbox.BootstrapIsolate.spawn(.{ .limits = .{
         .gas = .{ .per_execution = 10_000 },
     } });
-    defer iso.deinit();
+    defer boot.deinit();
 
     const Reenter = struct {
-        var target: ?*sandbox.Isolate = null;
+        var target: ?sandbox.Isolate = null;
         var generation_before: u64 = 0;
         var generation_after: u64 = 0;
         var used_before: u64 = 0;
@@ -3127,14 +3163,16 @@ test "sandbox: nested callback re-entry shares the active gas generation" {
             return m.intValue((try inner.asInt()) * 2);
         }
     };
-    Reenter.target = iso;
     Reenter.generation_before = 0;
     Reenter.generation_after = 0;
     Reenter.used_before = 0;
     Reenter.used_after = 0;
 
-    const cls = try iso.vm.defineClass("GasReenter", null);
+    const cls = try boot.vm().defineClass("GasReenter", null);
     try cls.defineMethod("call", Reenter.call);
+    const iso = try boot.seal();
+    defer iso.deinit();
+    Reenter.target = iso;
 
     const result = try iso.run("GasReenter.new.call");
     try std.testing.expectEqual(@as(i64, 42), try result.asInt());
@@ -3145,13 +3183,13 @@ test "sandbox: nested callback re-entry shares the active gas generation" {
 }
 
 test "sandbox: nested callback cannot mint a replacement gas generation" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    var boot = try sandbox.BootstrapIsolate.spawn(.{ .limits = .{
         .gas = .{ .per_execution = 1_000 },
     } });
-    defer iso.deinit();
+    defer boot.deinit();
 
     const Reenter = struct {
-        var target: ?*sandbox.Isolate = null;
+        var target: ?sandbox.Isolate = null;
         fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
             _ = m;
             _ = self;
@@ -3159,9 +3197,11 @@ test "sandbox: nested callback cannot mint a replacement gas generation" {
             return error.TestUnexpectedResult;
         }
     };
-    Reenter.target = iso;
-    const cls = try iso.vm.defineClass("GasNestedExhaust", null);
+    const cls = try boot.vm().defineClass("GasNestedExhaust", null);
     try cls.defineMethod("call", Reenter.call);
+    const iso = try boot.seal();
+    defer iso.deinit();
+    Reenter.target = iso;
 
     try std.testing.expectError(error.GasExhausted, iso.run("GasNestedExhaust.new.call"));
     const exhausted = iso.stats().gas.?;
@@ -3176,12 +3216,12 @@ test "sandbox: nested callback cannot mint a replacement gas generation" {
 test "sandbox: concurrent isolates with independent policies" {
     const Worker = struct {
         fn gasLimited() !void {
-            const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 500 } });
+            const iso = try spawnSealed(.{ .limits = .{ .instructions = 500 } });
             defer iso.deinit();
             try std.testing.expectError(error.GasExhausted, iso.run("while true; end"));
         }
         fn unlimited() !void {
-            const iso = try sandbox.Isolate.spawn(.{});
+            const iso = try spawnSealed(.{});
             defer iso.deinit();
             const v = try iso.run("(1..20).reduce(:+)");
             if (try v.asInt() != 210) return error.TestUnexpectedResult;
@@ -3197,15 +3237,15 @@ test "sandbox: irep snapshots compile and run" {
     const image = try sandbox.compile("[1, 2, 3].map { |x| x * x }");
     defer mruby.alloc.gpa.free(image);
 
-    const iso = try sandbox.Isolate.spawn(.{});
+    const iso = try spawnSealed(.{});
     defer iso.deinit();
     const r = try iso.runImage(image);
-    const arr = try iso.call(r, "join", .{try iso.vm.stringValue(",")});
+    const arr = try iso.call(r, "join", .{try iso.stringValue(",")});
     const str = try arr.asString();
     try std.testing.expectEqualStrings("1,4,9", str);
 
     // gas limits apply to image runs too
-    const iso2 = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 10 } });
+    const iso2 = try spawnSealed(.{ .limits = .{ .instructions = 10 } });
     defer iso2.deinit();
     try std.testing.expectError(error.GasExhausted, iso2.runImage(image));
 
@@ -3213,7 +3253,7 @@ test "sandbox: irep snapshots compile and run" {
 }
 
 test "sandbox: stats reflect execution" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .memory_bytes = 64 * 1024 * 1024 } });
+    const iso = try spawnSealed(.{ .limits = .{ .memory_bytes = 64 * 1024 * 1024 } });
     defer iso.deinit();
     _ = try iso.run("a = []\n1000.times { a << 'x' }\na.size");
     const s = iso.stats();
@@ -3224,7 +3264,7 @@ test "sandbox: stats reflect execution" {
 }
 
 test "sandbox: eval strip closes class_eval and BasicObject#instance_eval" {
-    const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .eval = false } });
+    const iso = try spawnSealed(.{ .capabilities = .{ .eval = false } });
     defer iso.deinit();
     // Module#class_eval / #module_eval take a source string and were a full
     // eval escape the old Kernel-only strip missed.
@@ -3240,7 +3280,7 @@ test "sandbox: eval strip closes class_eval and BasicObject#instance_eval" {
 test "sandbox: frozen clock pin cannot be reassigned by a script" {
     if (!test_config.has_time) return error.SkipZigTest;
 
-    const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .clock_epoch_s = 1_700_000_000 } });
+    const iso = try spawnSealed(.{ .capabilities = .{ .clock_epoch_s = 1_700_000_000 } });
     defer iso.deinit();
     // The hidden module is frozen: repointing FROZEN_TIME must raise, not
     // silently defeat the determinism pin.
@@ -3251,7 +3291,7 @@ test "sandbox: frozen clock pin cannot be reassigned by a script" {
 }
 
 test "sandbox: script cannot forge a policy termination" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 1_000 },
     } });
     defer iso.deinit();
@@ -3268,7 +3308,7 @@ test "sandbox: script cannot forge a policy termination" {
 }
 
 test "sandbox: policy exception delivery does not dispatch guest factories" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 1_000 },
     } });
     defer iso.deinit();
@@ -3288,7 +3328,7 @@ test "sandbox: policy exception delivery does not dispatch guest factories" {
 }
 
 test "sandbox: lastError uses inert exception metadata" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 100_000 },
     } });
     defer iso.deinit();
@@ -3321,12 +3361,13 @@ test "sandbox: lastError uses inert exception metadata" {
     // through non-executing collection. Symbol lookups then exercise the
     // reusable short-symbol buffer before the cached class path is copied.
     {
-        mruby.alloc.enterIsolate(&iso.cell);
+        mruby.alloc.enterIsolate(&iso.internal.cell);
         defer mruby.alloc.exitIsolate();
-        mruby.c.mrb_full_gc(iso.vm.mrb);
-        mruby.c.mrb_incremental_gc(iso.vm.mrb);
-        const unrelated = try iso.vm.internSymbol("unrelated_short_symbol");
-        _ = iso.vm.symbolName(unrelated);
+        mruby.c.mrb_full_gc(sandbox.internalVm(iso).mrb);
+        mruby.c.mrb_incremental_gc(sandbox.internalVm(iso).mrb);
+        const vm = sandbox.internalVm(iso);
+        const unrelated = try vm.internSymbol("unrelated_short_symbol");
+        _ = vm.symbolName(unrelated);
     }
 
     const ruby_error = iso.lastError().?;
@@ -3368,7 +3409,7 @@ test "sandbox: lastError uses inert exception metadata" {
 }
 
 test "sandbox: inert diagnostics use a fixed anonymous class fallback" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 10_000 },
     } });
     defer iso.deinit();
@@ -3387,7 +3428,7 @@ test "sandbox: inert diagnostics use a fixed anonymous class fallback" {
 }
 
 test "sandbox: rejected outer entry invalidates the previous lastError" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{
+    const iso = try spawnSealed(.{ .limits = .{
         .gas = .{ .per_execution = 10_000 },
     } });
     defer iso.deinit();
@@ -3405,7 +3446,7 @@ test "sandbox: rejected outer entry invalidates the previous lastError" {
 test "sandbox: private diagnostic and policy roots are hidden from ObjectSpace" {
     if (!test_config.has_object_space) return error.SkipZigTest;
 
-    const iso = try sandbox.Isolate.spawn(sandbox.Policy.trusted(.{ .limits = .{
+    const iso = try spawnSealed(sandbox.Policy.trusted(.{ .limits = .{
         .gas = .{ .per_execution = 100_000 },
     } }));
     defer iso.deinit();
@@ -3430,7 +3471,7 @@ test "sandbox: private diagnostic and policy roots are hidden from ObjectSpace" 
 }
 
 test "sandbox: frozen object model also freezes the immediate-value singletons" {
-    const iso = try sandbox.Isolate.spawn(.{ .capabilities = .{ .freeze_object_model = true } });
+    const iso = try spawnSealed(.{ .capabilities = .{ .freeze_object_model = true } });
     defer iso.deinit();
     try std.testing.expectError(error.RubyException, iso.run("class NilClass; def boom; end; end"));
     try iso.clearError();
@@ -3440,15 +3481,17 @@ test "sandbox: frozen object model also freezes the immediate-value singletons" 
 test "sandbox: sealModel is the two-phase freeze_object_model" {
     // Phase 1: the model is unfrozen while the host loads its script, so
     // top-level definitions -- including reopening a core class -- land.
-    const iso = try sandbox.Isolate.spawn(.{});
-    defer iso.deinit();
-    _ = try iso.run("class LoadTime; end");
-    _ = try iso.run("class String; def load_time_helper; 7; end; end");
+    var boot = try sandbox.BootstrapIsolate.spawn(sandbox.Policy.trusted(.{}));
+    defer boot.deinit();
+    _ = try boot.vm().loadString("class LoadTime; end");
+    _ = try boot.vm().loadString("class String; def load_time_helper; 7; end; end");
 
-    // Phase 2: seal at a host-chosen time; every later run sees the same
-    // frozen model the capability produces, and the load-time definitions
-    // survive and stay callable.
-    try iso.sealModel();
+    // Phase 2: freeze at a host-chosen time, then seal; every later run
+    // sees the same frozen model the capability produces, and the
+    // load-time definitions survive and stay callable.
+    try boot.sealModel();
+    const iso = try boot.seal();
+    defer iso.deinit();
     try std.testing.expectError(error.RubyException, iso.run("class String; def later; end; end"));
     try iso.clearError();
     try std.testing.expectError(error.RubyException, iso.run("class NilClass; def boom; end; end"));
@@ -3457,13 +3500,12 @@ test "sandbox: sealModel is the two-phase freeze_object_model" {
     try std.testing.expectEqual(@as(i64, 7), try got.asInt());
     _ = try iso.run("LoadTime.new");
 
-    // Idempotent: sealing again changes nothing.
-    try iso.sealModel();
+    // Freezing again changes nothing.
     try std.testing.expectError(error.RubyException, iso.run("class String; def later; end; end"));
 }
 
 test "sandbox: a terminated isolate refuses further runs" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .instructions = 2_000 } });
+    const iso = try spawnSealed(.{ .limits = .{ .instructions = 2_000 } });
     defer iso.deinit();
     try std.testing.expectError(error.GasExhausted, iso.run("while true; end"));
     // The isolate is dead: a second run must execute no script (no fresh grace
@@ -3550,23 +3592,23 @@ test "sandbox: reallocating a pre-run buffer does not underflow accounting" {
         extern fn mrb_str_cat(mrb: *mruby.c.mrb_state, str: mruby.c.mrb_value, p: [*]const u8, len: usize) mruby.c.mrb_value;
     };
 
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .memory_bytes = 64 * 1024 * 1024 } });
+    const iso = try spawnSealed(.{ .limits = .{ .memory_bytes = 64 * 1024 * 1024 } });
     defer iso.deinit();
     // Allocate a large buffer via iso.vm before the first run: no cell is
-    // entered yet, so it is not attributed to iso.cell.
+    // entered yet, so it is not attributed to iso.internal.cell.
     const bytes = try std.testing.allocator.alloc(u8, 5_000_000);
     defer std.testing.allocator.free(bytes);
     @memset(bytes, 'x');
-    const buf = try iso.vm.stringValue(bytes);
+    const buf = try iso.stringValue(bytes);
     try iso.setGlobal("buf", buf);
 
     // Growing it under the isolate cell reallocs a block whose `old` exceeds
     // the cell's tracked bytes; the pre-fix `live_bytes - old` underflowed
     // (Debug panic; release wrapped huge and poisoned the isolate).
     const suffix = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy";
-    mruby.alloc.enterIsolate(&iso.cell);
+    mruby.alloc.enterIsolate(&iso.internal.cell);
     defer mruby.alloc.exitIsolate();
-    _ = test_c.mrb_str_cat(iso.vm.mrb, buf.v, suffix.ptr, suffix.len);
+    _ = test_c.mrb_str_cat(sandbox.internalVm(iso).mrb, buf.v, suffix.ptr, suffix.len);
     try std.testing.expect(!iso.stats().hard_memory_limit_hit);
 }
 
@@ -3611,7 +3653,7 @@ test "alloc: shrinking realloc via the copy path preserves bytes" {
 test "sandbox: runImage surfaces an uncaught exception without poisoning the isolate" {
     const image = try sandbox.compile("raise 'boom'");
     defer mruby.alloc.gpa.free(image);
-    const iso = try sandbox.Isolate.spawn(.{});
+    const iso = try spawnSealed(.{});
     defer iso.deinit();
     // Pre-fix, runImage returned the RuntimeError as a successful Value and
     // left mrb->exc pending. It must now report the raise as an error.
@@ -3625,7 +3667,7 @@ test "sandbox: runImage surfaces an uncaught exception without poisoning the iso
 }
 
 test "sandbox: wall_time_ns is recorded even when a run is terminated" {
-    const iso = try sandbox.Isolate.spawn(.{ .limits = .{ .wall_time_ns = 20 * std.time.ns_per_ms } });
+    const iso = try spawnSealed(.{ .limits = .{ .wall_time_ns = 20 * std.time.ns_per_ms } });
     defer iso.deinit();
     try std.testing.expectError(error.DeadlineExceeded, iso.run("while true; end"));
     // Pre-fix, elapsed_ns was assigned only on the success path, so a killed

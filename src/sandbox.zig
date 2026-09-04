@@ -41,9 +41,14 @@ const gas_mod = @import("gas.zig");
 const artifact_mod = @import("artifact.zig");
 const artifact_value = @import("artifact_value.zig");
 const artifact_config = @import("artifact_config");
+const arena_mod = @import("arena.zig");
 
 pub const Vm = vm_mod.Vm;
 pub const Value = value_mod.Value;
+pub const Array = value_mod.Array;
+pub const Hash = value_mod.Hash;
+pub const HashEntry = value_mod.HashEntry;
+pub const RootedValue = arena_mod.RootedValue;
 pub const RubyError = error_mod.RubyError;
 
 pub const GasPolicy = gas_mod.Policy;
@@ -283,13 +288,13 @@ pub fn sleepNs(ns: u64) void {
     _ = std.c.nanosleep(&req, &empty);
 }
 
-pub const Isolate = struct {
+const IsolateState = struct {
     /// Trusted-bootstrap escape hatch: direct access to the underlying `Vm`
     /// bypasses admission, gas, deadlines, and capability state. Intended for
     /// the bootstrap window — defining host classes and methods — which ends
-    /// at `seal()` (explicitly or at the first execution).
+    /// at `seal()`.
     vm: *Vm,
-    /// Spawn-time resolution of `Policy`. The Isolate never consults a
+    /// Spawn-time resolution of `Policy`. The isolate never consults a
     /// mutable policy after spawn: everything below was resolved once and
     /// later mutation of a host-held `Policy` value has no effect.
     resolved_caps: Capabilities,
@@ -359,19 +364,15 @@ pub const Isolate = struct {
     artifact_diagnostic: ?ArtifactDiagnostic = null,
     artifact_path: ?[]u8 = null,
 
-    /// Spawn an isolate with a policy. The policy is resolved completely at
-    /// spawn (gas scope, memory caps, wall budget, call-depth ceiling,
-    /// capability snapshot, artifact acceptance); the Isolate retains no
-    /// mutable policy. Capabilities apply lazily on the first
-    /// `run`/`call`, or eagerly via `seal` — register host methods on
-    /// `iso.vm` before then when freezing.
-    pub fn spawn(policy: Policy) !*Isolate {
+    /// Allocate and initialize the underlying state. Public entry points
+    /// are `BootstrapIsolate.spawn` (bootstrap window) and its `seal`.
+    fn create(policy: Policy) !*IsolateState {
         const resolved_gas = try resolveGas(policy.limits);
         const initial_meter = gas_mod.Meter.init(resolved_gas);
 
         // Allocate the stable owner cell before mruby. Allocation headers keep
         // this address so frees/reallocs remain attributable after bootstrap.
-        const iso = try alloc_mod.gpa.create(Isolate);
+        const iso = try alloc_mod.gpa.create(IsolateState);
         errdefer alloc_mod.gpa.destroy(iso);
         iso.cell = .{};
         try iso.cell.initOwnership();
@@ -431,7 +432,7 @@ pub const Isolate = struct {
         return iso;
     }
 
-    pub fn deinit(iso: *Isolate) void {
+    pub fn deinit(iso: *IsolateState) void {
         iso.clearArtifactDiagnostic();
         const attribution = alloc_mod.pushIsolate(&iso.cell);
         c.mrz_set_sandbox_context(iso.vm.mrb, null);
@@ -445,9 +446,9 @@ pub const Isolate = struct {
     /// errors (`ScriptTerminated`, `DeadlineExceeded`, `GasExhausted`,
     /// `MemoryLimitExceeded`, `CallDepthExceeded`); ordinary script errors
     /// as `error.RubyException` (see `iso.lastError()`).
-    pub fn run(iso: *Isolate, src: []const u8) !Value {
+    pub fn run(iso: *IsolateState, src: []const u8) !Value {
         return iso.enterExecution(struct {
-            fn body(iso_: *Isolate, src_: []const u8) !Value {
+            fn body(iso_: *IsolateState, src_: []const u8) !Value {
                 return iso_.vm.loadString(src_);
             }
         }.body, src);
@@ -455,9 +456,9 @@ pub const Isolate = struct {
 
     /// Deprecated compatibility operation: run an unframed snapshot produced
     /// by `compile` (no compatibility or application checks). Use `runRite`.
-    pub fn runImage(iso: *Isolate, image: []const u8) !Value {
+    pub fn runImage(iso: *IsolateState, image: []const u8) !Value {
         return iso.enterExecution(struct {
-            fn body(iso_: *Isolate, image_: []const u8) !Value {
+            fn body(iso_: *IsolateState, image_: []const u8) !Value {
                 // loadIrep's C trampoline runs under mrb_protect_error and
                 // checks mrb->exc, so a raising image surfaces as
                 // error.RubyException (mapped to a termination error when a
@@ -469,9 +470,9 @@ pub const Isolate = struct {
     }
 
     /// Validate and execute a typed RITE image. Framing and compatibility
-    /// failures occur before the execution lifecycle mutates Isolate state.
+    /// failures occur before the execution lifecycle mutates isolate state.
     pub fn runRite(
-        iso: *Isolate,
+        iso: *IsolateState,
         image: artifact_mod.RiteImageView,
     ) RunRiteError!Value {
         const admission = try iso.admitExecution();
@@ -485,7 +486,7 @@ pub const Isolate = struct {
         });
 
         const Body = struct {
-            fn load(iso_: *Isolate, bytes: []const u8) !Value {
+            fn load(iso_: *IsolateState, bytes: []const u8) !Value {
                 return iso_.vm.loadIrep(bytes);
             }
         };
@@ -497,9 +498,9 @@ pub const Isolate = struct {
     }
 
     /// Call a Ruby method under the policy (same error mapping as `run`).
-    pub fn call(iso: *Isolate, recv: Value, name: []const u8, args: anytype) !Value {
+    pub fn call(iso: *IsolateState, recv: Value, name: []const u8, args: anytype) !Value {
         return iso.enterExecution(struct {
-            fn body(iso_: *Isolate, ctx: anytype) !Value {
+            fn body(iso_: *IsolateState, ctx: anytype) !Value {
                 return iso_.vm.call(ctx.recv, ctx.name, ctx.args);
             }
         }.body, .{ .recv = recv, .name = name, .args = args });
@@ -515,7 +516,7 @@ pub const Isolate = struct {
     /// `.per_execution` generation, which the next run still renews.
     /// Idempotent: sealing an already-sealed isolate does nothing. Cannot
     /// be called from inside a host callback.
-    pub fn seal(iso: *Isolate) !void {
+    pub fn seal(iso: *IsolateState) !void {
         const admission = try iso.admitExecution();
         // A nested admission means guest frames are live; applying
         // capability masks mid-execution is out of contract.
@@ -541,7 +542,7 @@ pub const Isolate = struct {
     /// Export a bounded, inert Ruby value graph. The returned bytes are owned
     /// by `allocator`; release them with `capsule.deinit(allocator)`.
     pub fn exportValue(
-        iso: *Isolate,
+        iso: *IsolateState,
         allocator: std.mem.Allocator,
         root: Value,
         options: ExportValueOptions,
@@ -574,10 +575,10 @@ pub const Isolate = struct {
     }
 
     /// Validate a complete StateCapsule before constructing its value graph in
-    /// this Isolate. Process scratch is freed before return; a successful heap
+    /// this isolate. Process scratch is freed before return; a successful heap
     /// result retains exactly one mruby arena root.
     pub fn importValue(
-        iso: *Isolate,
+        iso: *IsolateState,
         capsule: artifact_mod.StateCapsuleView,
         options: ImportValueOptions,
     ) ImportValueError!Value {
@@ -626,7 +627,7 @@ pub const Isolate = struct {
     /// it; delivery and guest unwind then complete within bounded wait/grace
     /// budgets (`ensure` runs, while `rescue` cannot suppress it). The pending
     /// outer execution returns `error.ScriptTerminated`.
-    pub fn terminate(iso: *Isolate) void {
+    pub fn terminate(iso: *IsolateState) void {
         noteTerm(iso, .script);
     }
 
@@ -634,18 +635,18 @@ pub const Isolate = struct {
     /// after observation; renewable per-execution gas clears only after the
     /// outer unwind completes. Host callbacks can poll this to cooperatively
     /// unwind for an external or already-recorded cause.
-    pub fn pendingTermination(iso: *Isolate) bool {
+    pub fn pendingTermination(iso: *IsolateState) bool {
         return iso.termination_bits.load(.acquire) != 0 or iso.cell.anyOom();
     }
 
     /// Details for the most recent admitted StateCapsule export/import
     /// failure. Borrowed slices remain valid until the next admitted value
-    /// artifact operation or Isolate destruction.
-    pub fn lastArtifactError(iso: *const Isolate) ?ArtifactDiagnostic {
+    /// artifact operation or isolate destruction.
+    pub fn lastArtifactError(iso: *const IsolateState) ?ArtifactDiagnostic {
         return iso.artifact_diagnostic;
     }
 
-    pub fn stats(iso: *Isolate) Stats {
+    pub fn stats(iso: *IsolateState) Stats {
         const depth: u32 = @intCast(@max(0, c.mrz_ci_depth(iso.vm.mrb)));
         const gas_stats: ?GasStats = switch (iso.resolved_gas) {
             .unlimited => null,
@@ -686,14 +687,14 @@ pub const Isolate = struct {
 
     const ExecutionAdmission = enum { nested, outer };
 
-    fn clearArtifactDiagnostic(iso: *Isolate) void {
+    fn clearArtifactDiagnostic(iso: *IsolateState) void {
         if (iso.artifact_path) |path| alloc_mod.gpa.free(path);
         iso.artifact_path = null;
         iso.artifact_diagnostic = null;
     }
 
     fn setArtifactDiagnostic(
-        iso: *Isolate,
+        iso: *IsolateState,
         diagnostic: ArtifactDiagnostic,
         path: ?[]const u8,
     ) void {
@@ -710,7 +711,7 @@ pub const Isolate = struct {
     }
 
     fn recordArtifactFailure(
-        iso: *Isolate,
+        iso: *IsolateState,
         err: anyerror,
         failure: *const artifact_value.Failure,
     ) void {
@@ -763,29 +764,29 @@ pub const Isolate = struct {
         };
     }
 
-    fn beginArtifactOperation(iso: *Isolate) !void {
+    fn beginArtifactOperation(iso: *IsolateState) !void {
         try iso.lockIdlePhase();
         iso.clearArtifactDiagnostic();
     }
 
-    fn endArtifactOperation(iso: *Isolate) void {
+    fn endArtifactOperation(iso: *IsolateState) void {
         iso.unlockIdlePhase();
     }
 
     /// Serialize a host-side (non-guest, non-artifact) operation against
-    /// this Isolate's state: mutual exclusion with guest execution and
+    /// isolate state: mutual exclusion with guest execution and
     /// artifact operations, nested callback use rejected. Unlike artifact
     /// admission it does not discard a pending artifact diagnostic the
     /// host may not have observed yet.
-    fn beginHostOperation(iso: *Isolate) !void {
+    fn beginHostOperation(iso: *IsolateState) !void {
         try iso.lockIdlePhase();
     }
 
-    fn endHostOperation(iso: *Isolate) void {
+    fn endHostOperation(iso: *IsolateState) void {
         iso.unlockIdlePhase();
     }
 
-    fn lockIdlePhase(iso: *Isolate) !void {
+    fn lockIdlePhase(iso: *IsolateState) !void {
         if (alloc_mod.currentIsolateCell()) |cell| {
             if (cell != &iso.cell) return error.IsolateThreadBusy;
             return switch (iso.phase) {
@@ -808,13 +809,13 @@ pub const Isolate = struct {
         iso.phase = .preparing;
     }
 
-    fn unlockIdlePhase(iso: *Isolate) void {
+    fn unlockIdlePhase(iso: *IsolateState) void {
         std.debug.assert(iso.phase == .preparing);
         iso.phase = .idle;
         iso.operation_lock.unlock();
     }
 
-    fn admitExecution(iso: *Isolate) !ExecutionAdmission {
+    fn admitExecution(iso: *IsolateState) !ExecutionAdmission {
         // Allocator TLS identifies legitimate same-thread re-entry without
         // reading the non-atomic phase from an unrelated thread.
         if (alloc_mod.currentIsolateCell()) |cell| {
@@ -842,14 +843,14 @@ pub const Isolate = struct {
         };
     }
 
-    fn enterExecution(iso: *Isolate, comptime body: anytype, ctx: anytype) !Value {
+    fn enterExecution(iso: *IsolateState, comptime body: anytype, ctx: anytype) !Value {
         const admission = try iso.admitExecution();
         if (admission == .nested) return body(iso, ctx);
         defer iso.operation_lock.unlock();
         return iso.enterOuterExecution(body, ctx);
     }
 
-    fn enterOuterExecution(iso: *Isolate, comptime body: anytype, ctx: anytype) !Value {
+    fn enterOuterExecution(iso: *IsolateState, comptime body: anytype, ctx: anytype) !Value {
         iso.clearErrorView();
         iso.startTiming();
         defer iso.updateElapsed();
@@ -888,7 +889,7 @@ pub const Isolate = struct {
         return result;
     }
 
-    fn startTiming(iso: *Isolate) void {
+    fn startTiming(iso: *IsolateState) void {
         if (iso.start_ns != 0) return;
         iso.start_ns = monotonicNs();
         if (iso.wall_budget_ns) |budget| {
@@ -896,17 +897,17 @@ pub const Isolate = struct {
         }
     }
 
-    fn updateElapsed(iso: *Isolate) void {
+    fn updateElapsed(iso: *IsolateState) void {
         iso.elapsed_ns = @intCast(@max(0, monotonicNs() - iso.start_ns));
     }
 
-    fn pollDeadline(iso: *Isolate) void {
+    fn pollDeadline(iso: *IsolateState) void {
         if (iso.deadline_ns) |deadline| {
             if (monotonicNs() > deadline) noteTerm(iso, .deadline);
         }
     }
 
-    fn rejectPending(iso: *Isolate, ignore_gas: bool) !void {
+    fn rejectPending(iso: *IsolateState, ignore_gas: bool) !void {
         syncOomCause(iso);
         iso.pollDeadline();
         var bits = iso.termination_bits.load(.acquire);
@@ -914,7 +915,7 @@ pub const Isolate = struct {
         if (selectedTermination(bits)) |kind| return terminationError(kind);
     }
 
-    fn prepareCapabilities(iso: *Isolate) !void {
+    fn prepareCapabilities(iso: *IsolateState) !void {
         switch (iso.capabilities) {
             .ready => return,
             .failed => return error.CapabilityApplicationFailed,
@@ -940,7 +941,7 @@ pub const Isolate = struct {
         complete = true;
     }
 
-    fn finishExecution(iso: *Isolate) void {
+    fn finishExecution(iso: *IsolateState) void {
         if (iso.gas_meter) |*meter| {
             iso.last_gas = meter.snapshot();
             if (meter.scope == .execution) {
@@ -955,7 +956,7 @@ pub const Isolate = struct {
     /// Commit the next `.per_execution` allowance: forgive a sticky
     /// exhaustion from the finished generation, then install the fresh
     /// meter state.
-    fn renewExecutionGas(iso: *Isolate) !void {
+    fn renewExecutionGas(iso: *IsolateState) !void {
         const candidate = iso.gas_meter.?.nextGeneration();
         _ = iso.termination_bits.fetchAnd(~term_gas, .acq_rel);
         try iso.rejectPending(true);
@@ -964,7 +965,7 @@ pub const Isolate = struct {
         iso.clearGasDelivery();
     }
 
-    fn clearGasDelivery(iso: *Isolate) void {
+    fn clearGasDelivery(iso: *IsolateState) void {
         iso.handler_grace = 0;
         iso.grace_armed = false;
         iso.raise_pending = false;
@@ -976,7 +977,7 @@ pub const Isolate = struct {
     /// terminations are distinct Zig errors). Reading it executes no guest
     /// methods or bytecodes. Valid only until the next outer entry, including
     /// one rejected during preflight.
-    pub fn lastError(iso: *Isolate) ?RubyError {
+    pub fn lastError(iso: *IsolateState) ?RubyError {
         if (c.mrz_nil_p(iso.last_exc)) return null;
         return RubyError.fromInert(
             iso.vm.mrb,
@@ -990,7 +991,7 @@ pub const Isolate = struct {
     /// under the same operation lock as guest execution. The returned
     /// `Value` follows ordinary rooting rules: consume it inside an arena
     /// `Scope` or `Vm.root` it if it must outlive further execution.
-    pub fn getGlobal(iso: *Isolate, name: []const u8) !Value {
+    pub fn getGlobal(iso: *IsolateState, name: []const u8) !Value {
         try iso.beginHostOperation();
         defer iso.endHostOperation();
         return iso.vm.getGlobal(name);
@@ -998,7 +999,7 @@ pub const Isolate = struct {
 
     /// Set a global variable between executions; values from another
     /// interpreter are rejected as `error.ForeignValue`.
-    pub fn setGlobal(iso: *Isolate, name: []const u8, val: Value) !void {
+    pub fn setGlobal(iso: *IsolateState, name: []const u8, val: Value) !void {
         try iso.beginHostOperation();
         defer iso.endHostOperation();
         return iso.vm.setGlobal(name, val);
@@ -1007,21 +1008,21 @@ pub const Isolate = struct {
     /// Discard the pending Ruby exception and the retained `lastError`
     /// view. Ordinary flows do not need this — the next outer entry resets
     /// both — but it lets a host drop a diagnostic it has already read.
-    pub fn clearError(iso: *Isolate) !void {
+    pub fn clearError(iso: *IsolateState) !void {
         try iso.beginHostOperation();
         defer iso.endHostOperation();
         iso.clearErrorView();
         iso.vm.clearError();
     }
 
-    fn clearErrorView(iso: *Isolate) void {
+    fn clearErrorView(iso: *IsolateState) void {
         _ = c.mrz_error_release(iso.vm.mrb, iso.error_root);
         iso.last_exc = c.mrz_nil_value();
         iso.error_message = c.mrz_nil_value();
         iso.error_class = c.mrz_nil_value();
     }
 
-    fn captureErrorView(iso: *Isolate) void {
+    fn captureErrorView(iso: *IsolateState) void {
         const exc = c.mrz_exc_value(iso.vm.mrb);
         var metadata: c.mrz_exception_metadata = undefined;
         if (c.mrz_error_capture(iso.vm.mrb, iso.error_root, exc, &metadata)) {
@@ -1042,7 +1043,7 @@ pub const Isolate = struct {
     /// so trusting the name would let a script forge a termination the host
     /// then acts on. `raiseTerm` always calls `noteTerm` before raising, so a
     /// genuine termination is fully covered by the flag check below.
-    fn mapError(iso: *Isolate, err: anyerror) anyerror {
+    fn mapError(iso: *IsolateState, err: anyerror) anyerror {
         if (err != error.RubyException) return err;
         iso.pollDeadline();
         if (currentTermination(iso)) |kind| {
@@ -1071,11 +1072,11 @@ pub const Isolate = struct {
     fn allocatorLimit(ctx: ?*anyopaque, kind: alloc_mod.IsolateCell.LimitKind, attempted: usize) void {
         _ = kind;
         _ = attempted;
-        const iso: *Isolate = @ptrCast(@alignCast(ctx orelse return));
+        const iso: *IsolateState = @ptrCast(@alignCast(ctx orelse return));
         noteTerm(iso, .memory);
     }
 
-    fn applyCapabilities(iso: *Isolate) !void {
+    fn applyCapabilities(iso: *IsolateState) !void {
         const caps = iso.resolved_caps;
         const m = iso.vm.mrb;
 
@@ -1169,7 +1170,7 @@ pub const Isolate = struct {
     /// definitions intact. Idempotent: `mrb_obj_freeze` on an
     /// already-frozen class is a no-op, so a host may also combine both
     /// phases defensively.
-    pub fn sealModel(iso: *Isolate) !void {
+    pub fn sealModel(iso: *IsolateState) !void {
         const m = iso.vm.mrb;
         const frozen_classes = [_][]const u8{
             "BasicObject",       "Object",              "Module",
@@ -1207,7 +1208,7 @@ pub const Isolate = struct {
         )) return error.RubyException;
     }
 
-    fn installFrozenClock(iso: *Isolate, epoch: i64) !void {
+    fn installFrozenClock(iso: *IsolateState, epoch: i64) !void {
         const m = iso.vm.mrb;
         const time = try iso.vm.getClass("Time");
         // Build Time.at(epoch) via funcall and root it as a constant on the
@@ -1227,7 +1228,7 @@ pub const Isolate = struct {
             fn now(mrb: ?*c.mrb_state, self: c.mrb_value) callconv(.c) c.mrb_value {
                 _ = self;
                 const mm = mrb orelse return c.mrz_nil_value();
-                const active: *Isolate =
+                const active: *IsolateState =
                     @ptrCast(@alignCast(c.mrz_get_ud(mm) orelse return c.mrz_nil_value()));
                 return active.frozen_time;
             }
@@ -1260,7 +1261,7 @@ pub const Isolate = struct {
     ) callconv(.c) c.mrb_value {
         _ = regs;
         const m = mrb orelse return c.mrz_nil_value();
-        const iso: *Isolate =
+        const iso: *IsolateState =
             @ptrCast(@alignCast(c.mrz_get_ud(m) orelse return c.mrz_nil_value()));
 
         iso.instr_count +|= 1;
@@ -1334,7 +1335,7 @@ pub const Isolate = struct {
         return c.mrz_nil_value();
     }
 
-    fn noteTerm(iso: *Isolate, kind: TerminationKind) void {
+    fn noteTerm(iso: *IsolateState, kind: TerminationKind) void {
         _ = iso.termination_bits.fetchOr(terminationBit(kind), .release);
     }
 
@@ -1357,16 +1358,16 @@ pub const Isolate = struct {
         return null;
     }
 
-    fn syncOomCause(iso: *Isolate) void {
+    fn syncOomCause(iso: *IsolateState) void {
         if (iso.cell.anyOom()) noteTerm(iso, .memory);
     }
 
-    fn currentTermination(iso: *Isolate) ?TerminationKind {
+    fn currentTermination(iso: *IsolateState) ?TerminationKind {
         syncOomCause(iso);
         return selectedTermination(iso.termination_bits.load(.acquire));
     }
 
-    fn terminationException(iso: *Isolate, kind: TerminationKind) c.mrb_value {
+    fn terminationException(iso: *IsolateState, kind: TerminationKind) c.mrb_value {
         noteTerm(iso, kind);
         if (!iso.grace_armed) {
             iso.handler_grace = handler_grace_instructions;
@@ -1378,7 +1379,7 @@ pub const Isolate = struct {
 
 test "derived hard cap saturates at usize maximum" {
     const maximum = std.math.maxInt(usize);
-    try std.testing.expectEqual(maximum, Isolate.defaultHardCap(maximum).?);
+    try std.testing.expectEqual(maximum, IsolateState.defaultHardCap(maximum).?);
 }
 
 const SandboxBootstrap = struct {
@@ -1524,4 +1525,280 @@ fn mrb_free_via_allocator(ptr: [*]u8, size: usize) void {
     // its header prefix), so free it through the same path.
     _ = alloc_mod.mrb_basic_alloc_func_pub(@ptrCast(ptr), 0);
     _ = size;
+}
+
+// ---------------------------------------------------------------------------
+// public handles: the bootstrap/execution typestate
+// ---------------------------------------------------------------------------
+
+/// The execution handle: a sealed isolate. Created by
+/// `BootstrapIsolate.seal()`; every operation runs under the resolved
+/// policy (admission, gas, deadlines, capabilities). There is no raw `vm`
+/// access here — value construction, symbols, rooting, globals, and error
+/// inspection are first-class locked operations, and anything else is
+/// bootstrap work that belongs before `seal()`.
+pub const Isolate = struct {
+    /// Internal state pointer. Touching it opts out of every guarantee;
+    /// it exists so the handle can be passed and stored by value.
+    internal: *IsolateState,
+
+    pub fn deinit(iso: Isolate) void {
+        iso.internal.deinit();
+    }
+
+    /// Run `src` under the policy. Policy terminations surface as distinct
+    /// errors (`ScriptTerminated`, `DeadlineExceeded`, `GasExhausted`,
+    /// `MemoryLimitExceeded`, `CallDepthExceeded`); ordinary script errors
+    /// as `error.RubyException` (see `lastError`).
+    pub fn run(iso: Isolate, src: []const u8) !Value {
+        return iso.internal.run(src);
+    }
+
+    /// Deprecated compatibility operation: run an unframed snapshot (no
+    /// compatibility or application checks). Use `runRite`.
+    pub fn runImage(iso: Isolate, image: []const u8) !Value {
+        return iso.internal.runImage(image);
+    }
+
+    /// Validate and execute a typed RITE image.
+    pub fn runRite(iso: Isolate, image: artifact_mod.RiteImageView) RunRiteError!Value {
+        return iso.internal.runRite(image);
+    }
+
+    /// Call a Ruby method under the policy (same error mapping as `run`).
+    pub fn call(iso: Isolate, recv: Value, name: []const u8, args: anytype) !Value {
+        return iso.internal.call(recv, name, args);
+    }
+
+    /// Call a Ruby method with options (block argument), under the policy.
+    pub fn callWithOptions(
+        iso: Isolate,
+        recv: Value,
+        name: []const u8,
+        args: anytype,
+        options: vm_mod.CallOptions,
+    ) !Value {
+        return iso.internal.enterExecution(struct {
+            fn body(iso_: *IsolateState, ctx: anytype) !Value {
+                return iso_.vm.callWithOptions(ctx.recv, ctx.name, ctx.args, ctx.options);
+            }
+        }.body, .{ .recv = recv, .name = name, .args = args, .options = options });
+    }
+
+    /// Export a bounded, inert Ruby value graph. The returned bytes are
+    /// owned by `allocator`; release them with `capsule.deinit(allocator)`.
+    pub fn exportValue(
+        iso: Isolate,
+        allocator: std.mem.Allocator,
+        root_value: Value,
+        options: ExportValueOptions,
+    ) ExportValueError!artifact_mod.StateCapsule {
+        return iso.internal.exportValue(allocator, root_value, options);
+    }
+
+    /// Import a state capsule under the isolate's artifact acceptance.
+    pub fn importValue(
+        iso: Isolate,
+        capsule: artifact_mod.StateCapsuleView,
+        options: ImportValueOptions,
+    ) ImportValueError!Value {
+        return iso.internal.importValue(capsule, options);
+    }
+
+    /// The typed diagnostic behind the last rejected artifact operation,
+    /// if any (see `mruby.artifact`).
+    pub fn lastArtifactError(iso: Isolate) ?ArtifactDiagnostic {
+        return iso.internal.lastArtifactError();
+    }
+
+    /// Request termination from any thread; observed at the next bytecode
+    /// fetch with guaranteed `ensure` unwinding.
+    pub fn terminate(iso: Isolate) void {
+        iso.internal.terminate();
+    }
+
+    pub fn pendingTermination(iso: Isolate) bool {
+        return iso.internal.pendingTermination();
+    }
+
+    pub fn stats(iso: Isolate) Stats {
+        return iso.internal.stats();
+    }
+
+    /// The inert exception metadata behind the last failed outer
+    /// execution (ordinary script errors only). Valid only until the next
+    /// outer entry.
+    pub fn lastError(iso: Isolate) ?RubyError {
+        return iso.internal.lastError();
+    }
+
+    /// Read a global variable between executions (`name` excludes `$`).
+    pub fn getGlobal(iso: Isolate, name: []const u8) !Value {
+        return iso.internal.getGlobal(name);
+    }
+
+    /// Set a global variable between executions; foreign values rejected.
+    pub fn setGlobal(iso: Isolate, name: []const u8, val: Value) !void {
+        return iso.internal.setGlobal(name, val);
+    }
+
+    /// Discard the pending Ruby exception and the retained `lastError` view.
+    pub fn clearError(iso: Isolate) !void {
+        return iso.internal.clearError();
+    }
+
+    // ---- value construction (locked delegations) -------------------------
+
+    /// Construct an Integer; out-of-range values return `error.Overflow`.
+    pub fn intValue(iso: Isolate, x: anytype) !Value {
+        try iso.internal.beginHostOperation();
+        defer iso.internal.endHostOperation();
+        return iso.internal.vm.intValue(x);
+    }
+
+    /// Construct an Integer, clamping out-of-range values.
+    pub fn saturatingIntValue(iso: Isolate, x: anytype) !Value {
+        try iso.internal.beginHostOperation();
+        defer iso.internal.endHostOperation();
+        return iso.internal.vm.saturatingIntValue(x);
+    }
+
+    /// Construct a Float; non-finite or destination-overflow values return
+    /// `error.Overflow`.
+    pub fn floatValue(iso: Isolate, x: f64) !Value {
+        try iso.internal.beginHostOperation();
+        defer iso.internal.endHostOperation();
+        return iso.internal.vm.floatValue(x);
+    }
+
+    /// Construct a String (no allocation failure swallowing).
+    pub fn stringValue(iso: Isolate, s: []const u8) !Value {
+        try iso.internal.beginHostOperation();
+        defer iso.internal.endHostOperation();
+        return iso.internal.vm.stringValue(s);
+    }
+
+    /// Construct a Boolean (immediate; cannot fail).
+    pub fn boolValue(iso: Isolate, x: bool) Value {
+        return iso.internal.vm.boolValue(x);
+    }
+
+    /// Construct nil (immediate; cannot fail).
+    pub fn nilValue(iso: Isolate) Value {
+        return iso.internal.vm.nilValue();
+    }
+
+    /// Construct an Array from same-VM values.
+    pub fn array(iso: Isolate, values: []const Value) !Array {
+        try iso.internal.beginHostOperation();
+        defer iso.internal.endHostOperation();
+        return iso.internal.vm.array(values);
+    }
+
+    /// Construct a Hash from same-VM entries.
+    pub fn hash(iso: Isolate, entries: []const HashEntry) !Hash {
+        try iso.internal.beginHostOperation();
+        defer iso.internal.endHostOperation();
+        return iso.internal.vm.hash(entries);
+    }
+
+    // ---- symbols and rooting ----------------------------------------------
+
+    /// Intern a symbol name (allocating; serialized with execution).
+    pub fn internSymbol(iso: Isolate, name: []const u8) !u32 {
+        try iso.internal.beginHostOperation();
+        defer iso.internal.endHostOperation();
+        return iso.internal.vm.internSymbol(name);
+    }
+
+    /// Borrowed symbol name (no allocation; same-thread use only).
+    pub fn symbolName(iso: Isolate, sym: u32) []const u8 {
+        return iso.internal.vm.symbolName(sym);
+    }
+
+    /// Keep `value` alive independently of the GC arena until the returned
+    /// root is destroyed. Roots must be destroyed before this Isolate.
+    pub fn root(iso: Isolate, value: Value) arena_mod.RootError!RootedValue {
+        try iso.internal.beginHostOperation();
+        defer iso.internal.endHostOperation();
+        return iso.internal.vm.root(value);
+    }
+
+    /// Save the GC arena index; same-thread use only, like the raw layer.
+    pub fn arenaScope(iso: Isolate) arena_mod.Scope {
+        return iso.internal.vm.arenaScope();
+    }
+};
+
+/// The bootstrap handle: the window between allocation and sealing where
+/// the host owns the raw `Vm` — defining classes and methods, loading
+/// definition-time code, applying a model freeze. `seal()` consumes it and
+/// returns the execution `Isolate`; using a bootstrap handle after a
+/// successful seal (other than `deinit`, which becomes a no-op) is out of
+/// contract.
+pub const BootstrapIsolate = struct {
+    state: ?*IsolateState = null,
+
+    /// Spawn an isolate with a policy. The policy is resolved completely at
+    /// spawn (gas scope, memory caps, wall budget, call-depth ceiling,
+    /// capability snapshot, artifact acceptance) and never changes
+    /// afterwards. Register host methods on `vm` before `seal()` when
+    /// freezing the object model.
+    pub fn spawn(policy: Policy) !BootstrapIsolate {
+        return .{ .state = try IsolateState.create(policy) };
+    }
+
+    /// The raw `Vm` for the bootstrap window: trusted host access that
+    /// bypasses admission, gas, and capabilities. Out of contract after
+    /// `seal()`.
+    pub fn vm(boot: BootstrapIsolate) *Vm {
+        const state = boot.state orelse @panic("bootstrap handle already sealed");
+        return state.vm;
+    }
+
+    /// End the bootstrap window: apply the policy's capabilities through
+    /// the same preflight bracket as an execution (admission, deadline
+    /// start, pending termination; setup gas is charged to the current
+    /// generation exactly as it would be inside a first run) and return
+    /// the execution handle. Consumes this handle; `deinit` becomes a
+    /// no-op so `defer boot.deinit()` alongside `defer iso.deinit()` is
+    /// always safe. On failure the bootstrap handle remains usable for
+    /// `deinit` and the failure is terminal for the state.
+    pub fn seal(boot: *BootstrapIsolate) !Isolate {
+        const state = boot.state orelse return error.BootstrapHandleConsumed;
+        boot.sealState(state) catch |err| {
+            return err;
+        };
+        boot.state = null;
+        return .{ .internal = state };
+    }
+
+    fn sealState(boot: *BootstrapIsolate, state: *IsolateState) !void {
+        _ = boot;
+        try state.seal();
+    }
+
+    /// Freeze the core object model during bootstrap (the two-phase form
+    /// of the `freeze_object_model` capability): load definitions on the
+    /// unfrozen model via `vm`, call this, then `seal`. Idempotent.
+    pub fn sealModel(boot: BootstrapIsolate) !void {
+        const state = boot.state orelse @panic("bootstrap handle already sealed");
+        return state.sealModel();
+    }
+
+    /// Destroy the isolate if it has not been sealed; a no-op after a
+    /// successful `seal()` (the returned `Isolate` owns the state).
+    pub fn deinit(boot: *BootstrapIsolate) void {
+        const state = boot.state orelse return;
+        state.deinit();
+        boot.state = null;
+    }
+};
+
+/// Test-build-only raw VM access for diagnostics (GC forcing, allocator
+/// probing). Compiled out of library builds; use the public surface
+/// otherwise.
+pub fn internalVm(iso: Isolate) *Vm {
+    if (!@import("builtin").is_test) @compileError("sandbox.internalVm is test-build only");
+    return iso.internal.vm;
 }

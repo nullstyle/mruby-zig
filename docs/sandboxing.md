@@ -11,20 +11,24 @@ limits and artifact acceptance:
 
 ```zig
 // Semi-trusted scripts: deny-by-default capabilities plus a frozen object
-// model and resource ceilings. Host classes/methods go on iso.vm first,
-// then seal, then run.
-const iso = try mruby.sandbox.Isolate.spawn(mruby.sandbox.Policy.restricted(.{
-    .limits = .{
-        .gas = .{ .per_isolate = 10_000_000 }, // cumulative gas budget
-        .wall_time_ns = 250 * std.time.ns_per_ms,
-        .memory_bytes = 8 * 1024 * 1024,      // soft cap -> hard cap
-        .call_depth = 64,
-    },
-    .capabilities = .{
-        .random_seed = 42,             // reproducible rand sequences
-        .clock_epoch_s = 1_700_000_000, // frozen Time.now
-    },
-}));
+// model and resource ceilings. Host classes/methods go on the bootstrap
+// handle's raw vm, then seal, then run.
+var boot = try mruby.sandbox.BootstrapIsolate.spawn(
+    mruby.sandbox.Policy.restricted(.{
+        .limits = .{
+            .gas = .{ .per_isolate = 10_000_000 }, // cumulative gas budget
+            .wall_time_ns = 250 * std.time.ns_per_ms,
+            .memory_bytes = 8 * 1024 * 1024,      // soft cap -> hard cap
+            .call_depth = 64,
+        },
+        .capabilities = .{
+            .random_seed = 42,             // reproducible rand sequences
+            .clock_epoch_s = 1_700_000_000, // frozen Time.now
+        },
+    }),
+);
+defer boot.deinit();
+const iso = try boot.seal();
 defer iso.deinit();
 
 // Trusted embedding (scripts the host authored or fully controls) grants
@@ -66,9 +70,13 @@ after gas exhaustion:
 const std = @import("std");
 const mruby = @import("mruby");
 
-const iso = try mruby.sandbox.Isolate.spawn(mruby.sandbox.Policy.trusted(.{
-    .limits = .{ .gas = .{ .per_execution = 20_000 } },
-}));
+var boot = try mruby.sandbox.BootstrapIsolate.spawn(
+    mruby.sandbox.Policy.trusted(.{
+        .limits = .{ .gas = .{ .per_execution = 20_000 } },
+    }),
+);
+defer boot.deinit();
+const iso = try boot.seal();
 defer iso.deinit();
 
 if (iso.run(
@@ -147,14 +155,15 @@ report prospective generation 0; actual requests start at generation 1.
 
 ## Lifecycle and host access
 
-- **Lifecycle**: lazy capability setup joins `.per_isolate` gas, but completes
-  before generation 1 for `.per_execution`. `Isolate.seal()` ends the
-  bootstrap window explicitly: it applies the policy's capabilities through
-  the same preflight bracket as an execution (so setup gas and deadlines are
-  accounted identically) and is idempotent; the first `run`/`call` seals
-  lazily otherwise. Route untrusted work through `Isolate.run`, `runImage`,
-  `runRite`, or `call`; executing directly through `iso.vm` bypasses the
-  generation lifecycle and is for trusted bootstrap before `seal()` only.
+- **Lifecycle**: the typestate is `BootstrapIsolate.spawn(policy)` → raw
+  `vm` bootstrap work (host classes and methods, definition-time loads,
+  optional `sealModel`) → `seal()` → the execution `Isolate`. Sealing
+  applies the policy's capabilities through the same preflight bracket as
+  an execution (so setup gas and deadlines are accounted identically) and
+  consumes the bootstrap handle (`deinit` becomes a no-op, so paired defers
+  are always safe). The execution handle has no raw `vm` access:
+  run/`runImage`/`runRite`/`call`, termination, stats, error inspection,
+  globals, and value construction are first-class locked operations.
   One non-blocking operation lock covers guest execution and value artifact
   operations; simultaneous same-Isolate access returns `IsolateThreadBusy`.
   Nested guest execution from a callback retains its existing behavior, but a

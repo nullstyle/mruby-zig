@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+Bootstrap/execution typestate for isolates:
+
+- `sandbox.BootstrapIsolate.spawn(policy)` opens the bootstrap window: the
+  raw `vm` for defining host classes and methods, loading definition-time
+  code, and the two-phase `sealModel`. `seal()` consumes the handle and
+  returns the execution `Isolate`; paired `defer boot.deinit()` /
+  `defer iso.deinit()` are always safe because a consumed bootstrap handle
+  deinits as a no-op.
+- The execution `Isolate` no longer exposes the raw VM. Value construction
+  (`intValue`, `floatValue`, `stringValue`, `boolValue`, `nilValue`,
+  `array`, `hash`), symbols (`internSymbol`, `symbolName`), rooting
+  (`root`, `arenaScope`), and `callWithOptions` are first-class
+  delegations, serialized with guest execution — cross-thread construction
+  now reports `IsolateThreadBusy` instead of racing the interpreter.
+- The policy is applied strictly at `seal()` (no lazy first-run
+  application), so capability setup gas and deadlines are always accounted
+  at the seal boundary. A consumed or unsealed bootstrap handle used out of
+  contract fails loudly (`error.BootstrapHandleConsumed`, panic on `vm`).
+- `sandbox.internalVm(iso)` provides test-build-only raw access for
+  diagnostics (GC forcing, allocator probing); it does not exist in
+  library builds.
+
 Documentation reorganization:
 
 - The README is now a lean overview plus quickstart; the detailed guides
@@ -137,6 +159,17 @@ Production-safe Zig API:
 
 Migration:
 
+- Isolate creation becomes two-phase:
+  `var boot = try sandbox.BootstrapIsolate.spawn(policy); const iso = try boot.seal();`.
+  Move every `iso.vm` use before the seal (class/method definition,
+  definition-time loads, receiver construction); replace post-seal raw
+  construction with the `Isolate` constructors (`iso.intValue`,
+  `iso.stringValue`, `iso.array`, ...). `Isolate.seal` and the post-seal
+  `Isolate.sealModel` are gone — freezing during bootstrap is
+  `BootstrapIsolate.sealModel`, before `seal()`.
+- Capability setup is no longer lazy: it is charged at `seal()`, so tests
+  asserting zero instructions before the first execution of a sealed
+  isolate should compare before/after a rejected execution instead.
 - Rename `defineMethod`/`defineClassMethod`/`defineModuleFunction` calls
   that pass an explicit format string to the `...Raw` spellings. Where the
   format is derivable (`i`, `f`, `b`, `n`, `o`, `z`, `s`, `*`), drop the

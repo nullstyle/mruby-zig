@@ -21,9 +21,13 @@ var image = try mruby.sandbox.compileRite(allocator, worker_source, .{
 });
 defer image.deinit(allocator);
 
-const worker = try mruby.sandbox.Isolate.spawn(mruby.sandbox.Policy.trusted(.{
-    .artifacts = .{ .application = app },
-}));
+var worker_boot = try mruby.sandbox.BootstrapIsolate.spawn(
+    mruby.sandbox.Policy.trusted(.{
+        .artifacts = .{ .application = app },
+    }),
+);
+defer worker_boot.deinit();
+const worker = try worker_boot.seal();
 defer worker.deinit();
 
 const result = try worker.runRite(image.view());

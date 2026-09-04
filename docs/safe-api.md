@@ -200,6 +200,13 @@ Two lifetime rules keep you safe:
   keep them. `vm.loadString` rejects source containing an interior NUL byte
   rather than silently evaluating only the prefix visible to the lexer.
 
+## Sandbox handles
+
+Sandboxed execution uses two types: `BootstrapIsolate` (from `spawn`,
+holding the raw `vm` for host definitions) and the `Isolate` returned by
+`seal()` (execution, globals, termination, stats, and lock-serialized value
+construction — see [sandboxing.md](sandboxing.md)).
+
 ## Threading
 
 One `Vm` (or `Isolate`) is owned by one thread at a time; mruby states are

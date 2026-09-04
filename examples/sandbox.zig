@@ -10,15 +10,17 @@ pub fn main() !void {
     // 1. Bootstrap: define host surface on the raw vm, then seal.
     //    The restricted preset strips eval/send/introspection/ObjectSpace
     //    and freezes the object model; limits apply from the first run.
-    const iso = try mruby.sandbox.Isolate.spawn(mruby.sandbox.Policy.restricted(.{
-        .limits = .{
-            .gas = .{ .per_execution = 200_000 },
-            .call_depth = 64,
-        },
-    }));
-    defer iso.deinit();
+    var boot = try mruby.sandbox.BootstrapIsolate.spawn(
+        mruby.sandbox.Policy.restricted(.{
+            .limits = .{
+                .gas = .{ .per_execution = 200_000 },
+                .call_depth = 64,
+            },
+        }),
+    );
+    defer boot.deinit();
 
-    const budget = try iso.vm.defineClass("Budget", null);
+    const budget = try boot.vm().defineClass("Budget", null);
     try budget.defineMethod("spend", struct {
         fn call(vm: *mruby.Vm, self: mruby.Value, units: i64) anyerror!mruby.Value {
             _ = self;
@@ -26,7 +28,8 @@ pub fn main() !void {
             return vm.intValue(units * 2);
         }
     }.call);
-    try iso.seal();
+    const iso = try boot.seal();
+    defer iso.deinit();
 
     // 2. Ordinary execution; results are observed through the locked host
     //    surface, not raw vm access.
