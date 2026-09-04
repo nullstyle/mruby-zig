@@ -29,6 +29,7 @@ jobs:
           ./zig-out/bin/exceptions
           ./zig-out/bin/sandbox
           ./zig-out/bin/mruby-repl -e '[1,2,3].sum'
+          ./zig-out/bin/mruby-bench
           if ./zig-out/bin/mruby-repl -e "raise 'expected failure'"; then
             exit 1
           fi

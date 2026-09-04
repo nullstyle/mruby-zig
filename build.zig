@@ -738,6 +738,22 @@ pub fn build(b: *std.Build) !void {
         const run_step = b.step(b.fmt("run-{s}", .{ex_name}), b.fmt("run the {s} example", .{ex_name}));
         run_step.dependOn(&run_cmd.step);
     }
+
+    // Benchmarks.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+    });
+    bench_mod.addImport("mruby", mruby_mod);
+    const bench = b.addExecutable(.{ .name = "mruby-bench", .root_module = bench_mod });
+    check_step.dependOn(&bench.step);
+    b.installArtifact(bench);
+    const run_bench_cmd = b.addRunArtifact(bench);
+    run_bench_cmd.step.dependOn(b.getInstallStep());
+    const bench_step = b.step("run-bench", "run the runtime benchmarks");
+    bench_step.dependOn(&run_bench_cmd.step);
 }
 
 // --------------------------------------------------------------------------

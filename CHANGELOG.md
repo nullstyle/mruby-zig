@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+Performance and size baselines:
+
+- Added `zig build run-bench` (`tools/bench.zig`): VM and isolate lifecycle,
+  cold evaluation vs cached RITE execution, Zig->Ruby call-loop and
+  Ruby->Zig host-callback throughput, the gas-hook overhead ratio,
+  StateCapsule export/import of a fixed 200-entry graph, and the one-shot
+  worker-process roundtrip (skipped where the platform or deployment lacks
+  the helper). Timing uses the sandbox's monotonic clock; results are
+  informational, and CI records a Linux run per push without gating on it.
+- Added [docs/benchmarks.md](docs/benchmarks.md) with methodology,
+  reference observations (aarch64-macos, ReleaseSafe), and the
+  binary-size baseline procedure: standard quickstart 1.79 MB vs minimal
+  1.29 MB, worker 1.96 MB / 1.49 MB. Notable findings: the instruction
+  hook costs ~1.03x, cached RITE is only ~9% cheaper than cold eval, and
+  capsule export runs ~1.7x import (the export-side reparse the
+  assessment flagged as the main optimization target).
+
 Auditable authority and fail-closed workers:
 
 - Core, compiler, and every catalog gem now declare conservative
