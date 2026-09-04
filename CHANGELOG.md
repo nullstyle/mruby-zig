@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+Sanitizer and platform coverage:
+
+- Added `-Dsanitize-c`, wiring C undefined-behavior detection into every
+  module; CI runs the suite in a ReleaseFast + `-Dsanitize-c=true` build
+  where detection is otherwise off.
+- Added a best-effort, non-blocking Windows runtime CI job (Debug and
+  ReleaseSafe suites plus the example binaries) — Windows stays
+  compile-only-supported until that job is made blocking.
+- Added weekly scheduled sustained fuzzing (2M StateCapsule executions,
+  also dispatchable manually via `workflow_dispatch`).
+
 Performance and size baselines:
 
 - Added `zig build run-bench` (`tools/bench.zig`): VM and isolate lifecycle,

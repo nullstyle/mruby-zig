@@ -52,6 +52,14 @@
   timeout/reap coverage
 - cross-compiles for the targets above
 - ThreadSanitizer build and test on Linux
+- C undefined-behavior detection in a ReleaseFast build
+  (`-Dsanitize-c=true`) on Linux
+- a best-effort, non-blocking Windows runtime job (unit + integration
+  suites, ReleaseSafe, and the example binaries); promoting Windows to
+  supported means making that job blocking and updating this matrix in
+  the same change
+- weekly sustained StateCapsule fuzzing (2M executions, scheduled and
+  manually dispatchable)
 - gem profiles: `-Dgem-set=minimal`, `-Dwithout-gems=…` subsets
 
 Windows runtime behavior is explicitly **not** claimed: compilation is

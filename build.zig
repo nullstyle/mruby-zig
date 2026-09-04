@@ -46,6 +46,10 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const sanitize_thread = b.option(bool, "sanitize-thread", "enable ThreadSanitizer") orelse false;
+    const sanitize_c = if (b.option(bool, "sanitize-c", "enable C undefined-behavior detection in unsafe builds") orelse false)
+        std.zig.SanitizeC.full
+    else
+        null;
     const worker_target_supported = switch (target.result.os.tag) {
         .linux, .macos => target.result.ptrBitWidth() == 64,
         else => false,
@@ -297,6 +301,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
     });
 
     const authority_manifest_mod = b.createModule(.{
@@ -310,6 +315,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
         .link_libc = true,
     });
     mruby_mod.addImport("authority_manifest", authority_manifest_mod);
@@ -423,6 +429,7 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
         });
         worker_mod.addImport("mruby", mruby_mod);
         worker_mod.addImport("worker_protocol", worker_protocol_mod);
@@ -439,6 +446,7 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
         });
         descendant_fixture_mod.addImport("worker_protocol", worker_protocol_mod);
         const descendant_fixture = b.addExecutable(.{
@@ -455,6 +463,7 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
         });
         signal_fixture_mod.addOptions("worker_signal_fixture_config", signal_fixture_config);
         const signal_fixture = b.addExecutable(.{
@@ -475,6 +484,7 @@ pub fn build(b: *std.Build) !void {
                 .target = target,
                 .optimize = optimize,
                 .sanitize_thread = sanitize_thread,
+                .sanitize_c = sanitize_c,
             });
             address_space_fixture_mod.addOptions(
                 "worker_address_space_fixture_config",
@@ -495,6 +505,7 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
         });
         sigchld_fixture_mod.addImport("mruby", mruby_mod);
         sigchld_fixture_mod.addOptions(
@@ -516,6 +527,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
     });
     repl_mod.addImport("mruby", mruby_mod);
     const repl = b.addExecutable(.{ .name = "mruby-repl", .root_module = repl_mod });
@@ -532,6 +544,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
     });
     test_mod.addImport("mruby", mruby_mod);
     test_mod.addImport("authority_manifest", authority_manifest_mod);
@@ -589,6 +602,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
     });
     features_only_mod.addImport("mruby", mruby_mod);
     const features_only_consumer = b.addExecutable(.{
@@ -651,6 +665,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
     });
     state_capsule_fuzz_mod.addImport("mruby", mruby_mod);
     const state_capsule_fuzz_tests = b.addTest(.{ .root_module = state_capsule_fuzz_mod });
@@ -686,6 +701,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
     });
     capsule_producer_mod.addImport("mruby", mruby_mod);
     const capsule_producer = b.addExecutable(.{
@@ -703,6 +719,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
     });
     capsule_consumer_mod.addImport("mruby", mruby_mod);
     const capsule_consumer = b.addExecutable(.{
@@ -727,6 +744,7 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
         });
         ex_mod.addImport("mruby", mruby_mod);
         const ex = b.addExecutable(.{ .name = ex_name, .root_module = ex_mod });
@@ -745,6 +763,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
     });
     bench_mod.addImport("mruby", mruby_mod);
     const bench = b.addExecutable(.{ .name = "mruby-bench", .root_module = bench_mod });

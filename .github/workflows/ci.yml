@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Sustained fuzzing: Mondays 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 jobs:
   test:
@@ -63,6 +67,53 @@ jobs:
           install: true
       - run: mise install
       - run: mise x -- zig build test -Dsanitize-thread=true
+
+  c-sanitizer:
+    name: c undefined behavior (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+      - run: mise install
+      # C UB detection is on by default in safe builds; this exercises it
+      # in an unsafe build where it would otherwise be off.
+      - run: mise x -- zig build test -Doptimize=ReleaseFast -Dsanitize-c=true
+
+  windows-runtime:
+    name: windows runtime (best effort)
+    runs-on: windows-latest
+    # Promoting Windows out of compile-only means making this job blocking
+    # and updating docs/platforms.md in the same change.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+      - run: mise install
+      - run: mise x -- zig build test
+      - run: mise x -- zig build test -Doptimize=ReleaseSafe
+      - run: mise x -- zig build
+      - run: |
+          ./zig-out/bin/quickstart
+          ./zig-out/bin/host_functions
+          ./zig-out/bin/exceptions
+          ./zig-out/bin/sandbox
+          ./zig-out/bin/mruby-repl -e '[1,2,3].sum'
+
+  sustained-fuzzing:
+    name: sustained fuzzing (linux)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+      - run: mise install
+      - run: mise x -- zig build fuzz-state-capsule --fuzz=2000000
 
   gem-sets:
     name: gem set (${{ matrix.gem_set }})
