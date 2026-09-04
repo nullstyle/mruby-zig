@@ -100,3 +100,47 @@ accepted, documented risks remain.
 mruby upstream C code itself (pinned, hash-verified, patched via the
 audited hash patch), the host application's own Ruby scripts, and Zig
 toolchain soundness.
+
+## Follow-up status (2026-09-04)
+
+Recorded after the runtime-assurance sprint
+([plans/runtime-assurance.md](plans/runtime-assurance.md)); the findings
+above are the original, unmodified review record.
+
+- **Finding 1 (medium) — closed.** `zig build fuzz-state-materialize` now
+  drives fuzzer bytes through `Isolate.importValue` — envelope validation,
+  graph admission, and C-side construction of live objects — inside a
+  memory-capped isolate, with the harness's declared capsule limits actually
+  passed to import. Deterministic regressions in
+  [state_materialize_fuzz.zig](../src/state_materialize_fuzz.zig) pin single
+  isolate ownership across at least two memory-exhaustion replacements
+  (including failed replacement), boundary fixtures for every configured
+  ceiling, golden schema-bearing and schema-free seeds reaching C
+  materialization, zero executed guest instructions for successful and
+  rejected imports, and stable memory across repeated valid imports.
+  Unexpected lifecycle and construction failures surface instead of being
+  swallowed. CI runs bounded campaigns in the compiler-enabled and
+  compiler-free profiles and a weekly sustained campaign per profile;
+  failing inputs are retained as artifacts and reduced into regression
+  fixtures. Zig-side coverage guidance is active — mruby's Clang coverage
+  counters are disabled for the pinned fuzzer (see
+  [artifacts.md](artifacts.md#state-capsules)).
+- **Finding 2 (low) — closed.** `zig build test-worker-orphan` builds a
+  supervisor → controller → real worker tree, synchronizes at real worker
+  boundaries, SIGKILLs only its own controller, and verifies bounded worker
+  exit on Linux and macOS in both compiler profiles, observing the exact
+  lifetime through a worker-owned pipe with subreaper/kqueue exit
+  confirmation: pipe EOF for an incomplete request, SIGXCPU for a CPU-bound
+  loop under its inherited `RLIMIT_CPU`, and exit 1 for response delivery
+  after the only reader died. The exact demonstrated guarantee — and its
+  limits — are documented in [workers.md](workers.md): parent death removes
+  parent-side wall supervision, CPU ceilings do not bound blocked native
+  work, and no general orphan wall-time containment is claimed.
+- **Finding 3 (low) — closed.** The sandboxing threat model now states that
+  the worker helper binary is part of the trusted computing base and must be
+  shipped and verified exactly like the application binary
+  ([sandboxing.md](sandboxing.md#threat-model)).
+- **Findings 4–5 (info) — remain accepted platform limitations.** macOS has
+  no usable `RLIMIT_AS` (surfaced as `HardMemoryLimitUnavailable`, never
+  pretended), and the in-process tier remains unsuitable for genuinely
+  hostile input by design; the worker tier exists for that case.

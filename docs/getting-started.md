@@ -237,12 +237,29 @@ mise x -- zig build test              # unit + Ruby integration suites
 mise x -- zig build test-state-capsule-process
 mise x -- zig build test-codedb        # build-time Ruby and artifact admission
 mise x -- zig build test-runtime-only -Dno-compiler
+mise x -- zig build test-worker-orphan # controller death and bounded worker exit
 mise x -- bash tools/test_codedb_package.sh # fetched package + relocated worker
 mise x -- zig build run-codedb-demo    # compiled invoice job under policy
 mise x -- zig build fuzz-state-capsule --fuzz=100K
+mise x -- zig build fuzz-state-materialize --fuzz=100K
+mise x -- zig build fuzz-state-materialize -Dno-compiler --fuzz=100K
 mise x -- zig build run-host-functions
 mise x -- zig build run-repl -- -e 'RUBY_VERSION'
 ```
+
+The fuzz limits count iterations. Without `--fuzz`, the targets run their
+regression tests and seed corpus once. Materialization fuzzing validates input
+and constructs live objects inside a bounded isolate; assertions check that
+no guest instructions execute. Coverage guidance comes from Zig code: the
+pinned fuzzer cannot consume mruby's Clang C coverage counters.
+
+CI runs 25,000 materialization iterations in compiler-enabled and compiler-free
+profiles on Linux/macOS. The scheduled job runs 2 million parser iterations and
+500,000 materialization iterations per compiler profile. Failed campaigns retain
+the generated corpus, coverage state, and fuzzer log as CI artifacts for 14 days.
+Locally, preserve `.zig-cache/f`, `.zig-cache/v`, and
+`.zig-cache/tmp/libfuzzer.log` before clearing caches; reduce useful failing
+inputs into checked-in regression fixtures.
 
 ## Running CI locally
 

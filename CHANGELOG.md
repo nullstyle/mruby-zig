@@ -48,6 +48,27 @@ Security review follow-up:
   graph admission, and C-side construction of live objects — inside a
   memory-capped isolate, closing security review finding 1. The weekly
   scheduled fuzzing job runs it alongside the pure parser target.
+- Repaired the materialization fuzz harness and pinned its behavior with
+  deterministic regressions: a single owner now follows the isolate through
+  memory-exhaustion rollover and failed replacement (no stale-handle
+  teardown, no global pointing at a destroyed isolate), the declared capsule
+  limits are passed into `importValue`, schema-bearing and schema-free seeds
+  are exercised deliberately, unexpected lifecycle and construction failures
+  surface instead of being swallowed, successful and rejected imports assert
+  zero executed guest instructions, and discarded import roots are released
+  so repeated valid imports stabilize memory. Boundary fixtures show every
+  configured ceiling is enforced. CI runs bounded campaigns in both compiler
+  profiles and retains failing inputs; see docs/security-review-2026-09.md
+  (follow-up status) and docs/artifacts.md.
+- Added `zig build test-worker-orphan`, closing security review finding 2: a
+  test-only supervisor spawns the real worker under a controller it owns,
+  waits for a readiness marker at a real worker boundary, then SIGKILLs only
+  that controller and observes the worker's exact lifetime through a
+  worker-owned pipe. Incomplete-request EOF, CPU-bound SIGXCPU under an
+  inherited `RLIMIT_CPU`, and broken-pipe response delivery all end in
+  bounded worker exit on Linux and macOS in both compiler profiles. As
+  documented in docs/workers.md, this claims pipe-closure and CPU-ceiling
+  exits after controller death — not general orphan wall-time containment.
 
 ## 0.4.0 (2026-09-04)
 

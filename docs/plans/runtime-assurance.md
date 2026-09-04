@@ -1,6 +1,8 @@
 # Runtime assurance after CodeDB
 
-Status: proposed next sprint; implementation has not started.
+Status: implemented and validated locally on macOS arm64 (Debug and
+ReleaseSafe, both compiler profiles); hosted CI validation of this sprint's
+commits pending push.
 Planning date: 2026-09-04.
 Baseline: `786c41a`, with CodeDB phases 1–5 complete and pushed to `main`.
 
