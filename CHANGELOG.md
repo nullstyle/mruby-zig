@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+Post-seal host-operation accounting:
+
+- Allocating host operations invoked through the sealed `Isolate` interface
+  now run under the same non-blocking operation lock and allocator attribution
+  as guest execution. Their mruby-heap allocations contribute to
+  `live_memory_bytes` and `peak_memory_bytes`, respect the isolate's sticky
+  soft/hard memory caps, and surface a crossed cap as
+  `error.MemoryLimitExceeded`. Host-allocator scratch and root-registry
+  bookkeeping remain host-owned and are not included in the mruby quota.
+- This accounting applies to methods on `Isolate` itself (including value and
+  collection construction, globals, symbols, and rooting). Direct operations
+  on raw `Value`, `Array`, and `Hash` handles retain their existing VM-level
+  threading and accounting contract.
+- Threaded tests now return worker failures to the joining test instead of
+  relying on `Thread.join()` (which discards a worker's error result). This
+  exposed and fixed a stale policy fixture, and capability tests now pin the
+  `Enumerable#reduce(:+)` dependency on the `send` grant.
+
 Bootstrap/execution typestate for isolates:
 
 - `sandbox.BootstrapIsolate.spawn(policy)` opens the bootstrap window: the

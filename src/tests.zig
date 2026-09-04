@@ -1275,7 +1275,13 @@ test "unsigned overflow in toValue errors rather than panics" {
 
 test "concurrent VMs on separate threads" {
     const Worker = struct {
-        fn run() !void {
+        fn run(result: *?anyerror) void {
+            runFallible() catch |err| {
+                result.* = err;
+            };
+        }
+
+        fn runFallible() !void {
             const vm = try mruby.Vm.init();
             defer vm.deinit();
             var i: usize = 0;
@@ -1286,8 +1292,12 @@ test "concurrent VMs on separate threads" {
         }
     };
     var threads: [4]std.Thread = undefined;
-    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{});
+    var results: [threads.len]?anyerror = @splat(null);
+    for (&threads, &results) |*t, *result| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{result});
+    }
     for (threads) |t| t.join();
+    for (results) |result| if (result) |err| return err;
 }
 
 test "init failure diagnostics are queryable" {
@@ -2804,6 +2814,13 @@ test "sandbox: zero-value policy is the deny-by-default floor" {
     try iso.clearError();
     try std.testing.expectError(error.RubyException, iso.run("[1, 2].send(:size)"));
     try iso.clearError();
+    // mruby's symbol form of reduce dispatches through `__send__`, so it is
+    // intentionally unavailable with the send capability stripped. The block
+    // form remains capability-independent plain computation.
+    try std.testing.expectError(error.RubyException, iso.run("[1, 2, 3].reduce(:+)"));
+    try iso.clearError();
+    const reduced = try iso.run("[1, 2, 3].reduce { |sum, n| sum + n }");
+    try std.testing.expectEqual(@as(i64, 6), try reduced.asInt());
     try std.testing.expectError(error.RubyException, iso.run("@x = 1; instance_variable_get(:@x)"));
     try iso.clearError();
     const gone = try iso.run(
@@ -2830,6 +2847,8 @@ test "sandbox: trusted preset grants ambient language capabilities" {
     try std.testing.expectEqual(@as(i64, 42), try ev.asInt());
     const sd = try iso.run("[1, 2].send(:size)");
     try std.testing.expectEqual(@as(i64, 2), try sd.asInt());
+    const reduced = try iso.run("[1, 2, 3].reduce(:+)");
+    try std.testing.expectEqual(@as(i64, 6), try reduced.asInt());
     const iv = try iso.run("@x = 5; instance_variable_get(:@x)");
     try std.testing.expectEqual(@as(i64, 5), try iv.asInt());
     const reachable = try iso.run(
@@ -3215,22 +3234,38 @@ test "sandbox: nested callback cannot mint a replacement gas generation" {
 
 test "sandbox: concurrent isolates with independent policies" {
     const Worker = struct {
-        fn gasLimited() !void {
-            const iso = try spawnSealed(.{ .limits = .{ .instructions = 500 } });
+        fn gasLimited(result: *?anyerror) void {
+            gasLimitedFallible() catch |err| {
+                result.* = err;
+            };
+        }
+        fn gasLimitedFallible() !void {
+            const iso = try spawnSealed(sandbox.Policy.trusted(.{
+                .limits = .{ .instructions = 500 },
+            }));
             defer iso.deinit();
             try std.testing.expectError(error.GasExhausted, iso.run("while true; end"));
         }
-        fn unlimited() !void {
-            const iso = try spawnSealed(.{});
+        fn unlimited(result: *?anyerror) void {
+            unlimitedFallible() catch |err| {
+                result.* = err;
+            };
+        }
+        fn unlimitedFallible() !void {
+            const iso = try spawnSealed(sandbox.Policy.trusted(.{}));
             defer iso.deinit();
             const v = try iso.run("(1..20).reduce(:+)");
             if (try v.asInt() != 210) return error.TestUnexpectedResult;
         }
     };
-    var t1 = try std.Thread.spawn(.{}, Worker.gasLimited, .{});
-    var t2 = try std.Thread.spawn(.{}, Worker.unlimited, .{});
+    var result1: ?anyerror = null;
+    var result2: ?anyerror = null;
+    var t1 = try std.Thread.spawn(.{}, Worker.gasLimited, .{&result1});
+    var t2 = try std.Thread.spawn(.{}, Worker.unlimited, .{&result2});
     t1.join();
     t2.join();
+    if (result1) |err| return err;
+    if (result2) |err| return err;
 }
 
 test "sandbox: irep snapshots compile and run" {
@@ -3261,6 +3296,124 @@ test "sandbox: stats reflect execution" {
     try std.testing.expect(s.peak_memory_bytes > 0);
     try std.testing.expect(s.live_objects > 0);
     try std.testing.expect(!s.soft_memory_limit_hit);
+}
+
+test "sandbox: host construction is charged to isolate memory" {
+    const iso = try spawnSealed(sandbox.Policy.trusted(.{ .limits = .{
+        .memory_bytes = 64 * 1024 * 1024,
+    } }));
+    defer iso.deinit();
+
+    const before = iso.stats();
+    const bytes = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'x');
+    const string_value = try iso.stringValue(bytes);
+    var rooted = try iso.root(string_value);
+    defer rooted.deinit();
+    const after_string = iso.stats();
+    try std.testing.expect(after_string.live_memory_bytes > before.live_memory_bytes);
+
+    const values = try std.testing.allocator.alloc(mruby.Value, 4096);
+    defer std.testing.allocator.free(values);
+    @memset(values, iso.nilValue());
+    _ = try iso.array(values);
+    const after_array = iso.stats();
+    try std.testing.expect(after_array.live_memory_bytes > after_string.live_memory_bytes);
+
+    const entries = try std.testing.allocator.alloc(mruby.HashEntry, 256);
+    defer std.testing.allocator.free(entries);
+    for (entries, 0..) |*entry, i| entry.* = .{
+        .key = try iso.intValue(i),
+        .value = iso.nilValue(),
+    };
+    _ = try iso.hash(entries);
+    const after_hash = iso.stats();
+    try std.testing.expect(after_hash.live_memory_bytes > after_array.live_memory_bytes);
+
+    var symbol_buf: [64]u8 = undefined;
+    for (0..4096) |i| {
+        const symbol_name = try std.fmt.bufPrint(&symbol_buf, "host_accounted_symbol_{d}", .{i});
+        _ = try iso.internSymbol(symbol_name);
+    }
+    const after_symbol = iso.stats();
+    try std.testing.expect(after_symbol.peak_memory_bytes > after_hash.peak_memory_bytes);
+    try std.testing.expect(after_symbol.peak_memory_bytes >= after_symbol.live_memory_bytes);
+    try std.testing.expect(!after_symbol.soft_memory_limit_hit);
+
+    var global_name: [200]u8 = undefined;
+    @memset(&global_name, 'g');
+    try iso.setGlobal(&global_name, string_value);
+    try std.testing.expectEqualStrings(bytes, try (try iso.getGlobal(&global_name)).asString());
+}
+
+test "sandbox: host construction enforces sticky memory caps and restores admission" {
+    const policy = sandbox.Policy.trusted(.{ .limits = .{
+        .memory_bytes = 1,
+        .hard_memory_bytes = std.math.maxInt(usize),
+    } });
+    const bytes = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'x');
+
+    const string_iso = try spawnSealed(policy);
+    defer string_iso.deinit();
+    try std.testing.expectError(error.MemoryLimitExceeded, string_iso.stringValue(bytes));
+    try std.testing.expect(string_iso.stats().soft_memory_limit_hit);
+    try std.testing.expect(mruby.c.mrz_nil_p(mruby.c.mrz_exc_value(sandbox.internalVm(string_iso).mrb)));
+    try std.testing.expect(mruby.alloc.currentIsolateCell() == null);
+    // Clearing diagnostics is lock-only and remains available even though
+    // allocating operations and guest execution are now permanently refused.
+    try string_iso.clearError();
+    try std.testing.expectError(error.MemoryLimitExceeded, string_iso.stringValue("retry"));
+
+    const hard_iso = try spawnSealed(sandbox.Policy.trusted(.{ .limits = .{
+        .hard_memory_bytes = 1,
+    } }));
+    defer hard_iso.deinit();
+    try std.testing.expectError(error.MemoryLimitExceeded, hard_iso.stringValue(bytes));
+    try std.testing.expect(hard_iso.stats().hard_memory_limit_hit);
+    try std.testing.expect(mruby.c.mrz_nil_p(mruby.c.mrz_exc_value(sandbox.internalVm(hard_iso).mrb)));
+    try std.testing.expect(mruby.alloc.currentIsolateCell() == null);
+
+    const symbol_iso = try spawnSealed(policy);
+    defer symbol_iso.deinit();
+    var symbol_limit_hit = false;
+    var symbol_buf: [64]u8 = undefined;
+    for (0..4096) |i| {
+        const symbol_name = try std.fmt.bufPrint(&symbol_buf, "host_capped_symbol_{d}", .{i});
+        if (symbol_iso.internSymbol(symbol_name)) |_| {
+            continue;
+        } else |err| {
+            try std.testing.expectEqual(error.MemoryLimitExceeded, err);
+            symbol_limit_hit = true;
+            break;
+        }
+    }
+    try std.testing.expect(symbol_limit_hit);
+    try std.testing.expect(symbol_iso.stats().soft_memory_limit_hit);
+    try std.testing.expect(mruby.alloc.currentIsolateCell() == null);
+
+    const array_iso = try spawnSealed(policy);
+    defer array_iso.deinit();
+    const array_values = try std.testing.allocator.alloc(mruby.Value, 4096);
+    defer std.testing.allocator.free(array_values);
+    @memset(array_values, array_iso.nilValue());
+    try std.testing.expectError(error.MemoryLimitExceeded, array_iso.array(array_values));
+    try std.testing.expect(array_iso.stats().soft_memory_limit_hit);
+    try std.testing.expect(mruby.alloc.currentIsolateCell() == null);
+
+    const hash_iso = try spawnSealed(policy);
+    defer hash_iso.deinit();
+    const hash_entries = try std.testing.allocator.alloc(mruby.HashEntry, 256);
+    defer std.testing.allocator.free(hash_entries);
+    for (hash_entries, 0..) |*entry, i| entry.* = .{
+        .key = try hash_iso.intValue(i),
+        .value = hash_iso.nilValue(),
+    };
+    try std.testing.expectError(error.MemoryLimitExceeded, hash_iso.hash(hash_entries));
+    try std.testing.expect(hash_iso.stats().soft_memory_limit_hit);
+    try std.testing.expect(mruby.alloc.currentIsolateCell() == null);
 }
 
 test "sandbox: eval strip closes class_eval and BasicObject#instance_eval" {
@@ -3592,14 +3745,17 @@ test "sandbox: reallocating a pre-run buffer does not underflow accounting" {
         extern fn mrb_str_cat(mrb: *mruby.c.mrb_state, str: mruby.c.mrb_value, p: [*]const u8, len: usize) mruby.c.mrb_value;
     };
 
-    const iso = try spawnSealed(.{ .limits = .{ .memory_bytes = 64 * 1024 * 1024 } });
-    defer iso.deinit();
-    // Allocate a large buffer via iso.vm before the first run: no cell is
-    // entered yet, so it is not attributed to iso.internal.cell.
+    var boot = try sandbox.BootstrapIsolate.spawn(.{ .limits = .{ .memory_bytes = 64 * 1024 * 1024 } });
+    defer boot.deinit();
+    // Allocate a large buffer through the raw bootstrap VM. Post-seal host
+    // construction is attributed, so the bootstrap window is the remaining
+    // supported way to exercise an unowned allocation in this regression.
     const bytes = try std.testing.allocator.alloc(u8, 5_000_000);
     defer std.testing.allocator.free(bytes);
     @memset(bytes, 'x');
-    const buf = try iso.stringValue(bytes);
+    const buf = try boot.vm().stringValue(bytes);
+    const iso = try boot.seal();
+    defer iso.deinit();
     try iso.setGlobal("buf", buf);
 
     // Growing it under the isolate cell reallocs a block whose `old` exceeds

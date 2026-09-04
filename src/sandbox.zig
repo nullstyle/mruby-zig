@@ -67,6 +67,14 @@ pub const CompileRiteError = std.mem.Allocator.Error || error{
     InvalidSourceName,
 };
 
+pub const HostOperationError = error{
+    IsolatePreparing,
+    IsolateThreadBusy,
+    MemoryLimitExceeded,
+};
+
+pub const RootError = HostOperationError || arena_mod.RootError;
+
 pub const RunRiteError = artifact_mod.RiteValidationError || error{
     IsolatePreparing,
     IsolateThreadBusy,
@@ -773,17 +781,43 @@ const IsolateState = struct {
         iso.unlockIdlePhase();
     }
 
-    /// Serialize a host-side (non-guest, non-artifact) operation against
-    /// isolate state: mutual exclusion with guest execution and
-    /// artifact operations, nested callback use rejected. Unlike artifact
-    /// admission it does not discard a pending artifact diagnostic the
-    /// host may not have observed yet.
-    fn beginHostOperation(iso: *IsolateState) !void {
+    const HostOperationMode = enum { lock_only, attributed };
+
+    /// Run a host-side (non-guest, non-artifact) operation against isolate
+    /// state. One bracket owns mutual exclusion and, for potentially
+    /// allocating operations, mruby allocator attribution plus memory-limit
+    /// translation. Host-owned Zig scratch remains outside the mruby quota.
+    /// Unlike artifact admission this preserves a pending artifact diagnostic
+    /// the host may not have observed yet.
+    fn hostOperation(
+        iso: *IsolateState,
+        comptime mode: HostOperationMode,
+        comptime Result: type,
+        comptime body: anytype,
+        ctx: anytype,
+    ) anyerror!Result {
         try iso.lockIdlePhase();
+        defer iso.unlockIdlePhase();
+
+        if (mode == .lock_only) return body(iso, ctx);
+
+        const attribution = alloc_mod.pushIsolate(&iso.cell);
+        defer alloc_mod.restoreIsolate(attribution);
+
+        try iso.rejectHostMemoryLimit();
+        const result: Result = body(iso, ctx) catch |err| {
+            iso.rejectHostMemoryLimit() catch |limit_err| return limit_err;
+            return err;
+        };
+        try iso.rejectHostMemoryLimit();
+        return result;
     }
 
-    fn endHostOperation(iso: *IsolateState) void {
-        iso.unlockIdlePhase();
+    fn rejectHostMemoryLimit(iso: *IsolateState) error{MemoryLimitExceeded}!void {
+        if (!iso.cell.anyOom()) return;
+        noteTerm(iso, .memory);
+        c.mrz_exc_clear(iso.vm.mrb);
+        return error.MemoryLimitExceeded;
     }
 
     fn lockIdlePhase(iso: *IsolateState) !void {
@@ -992,27 +1026,33 @@ const IsolateState = struct {
     /// `Value` follows ordinary rooting rules: consume it inside an arena
     /// `Scope` or `Vm.root` it if it must outlive further execution.
     pub fn getGlobal(iso: *IsolateState, name: []const u8) !Value {
-        try iso.beginHostOperation();
-        defer iso.endHostOperation();
-        return iso.vm.getGlobal(name);
+        return iso.hostOperation(.attributed, Value, struct {
+            fn body(iso_: *IsolateState, name_: []const u8) !Value {
+                return iso_.vm.getGlobal(name_);
+            }
+        }.body, name);
     }
 
     /// Set a global variable between executions; values from another
     /// interpreter are rejected as `error.ForeignValue`.
     pub fn setGlobal(iso: *IsolateState, name: []const u8, val: Value) !void {
-        try iso.beginHostOperation();
-        defer iso.endHostOperation();
-        return iso.vm.setGlobal(name, val);
+        return iso.hostOperation(.attributed, void, struct {
+            fn body(iso_: *IsolateState, ctx: anytype) !void {
+                return iso_.vm.setGlobal(ctx.name, ctx.val);
+            }
+        }.body, .{ .name = name, .val = val });
     }
 
     /// Discard the pending Ruby exception and the retained `lastError`
     /// view. Ordinary flows do not need this — the next outer entry resets
     /// both — but it lets a host drop a diagnostic it has already read.
     pub fn clearError(iso: *IsolateState) !void {
-        try iso.beginHostOperation();
-        defer iso.endHostOperation();
-        iso.clearErrorView();
-        iso.vm.clearError();
+        return iso.hostOperation(.lock_only, void, struct {
+            fn body(iso_: *IsolateState, _: void) !void {
+                iso_.clearErrorView();
+                iso_.vm.clearError();
+            }
+        }.body, {});
     }
 
     fn clearErrorView(iso: *IsolateState) void {
@@ -1651,31 +1691,39 @@ pub const Isolate = struct {
 
     /// Construct an Integer; out-of-range values return `error.Overflow`.
     pub fn intValue(iso: Isolate, x: anytype) !Value {
-        try iso.internal.beginHostOperation();
-        defer iso.internal.endHostOperation();
-        return iso.internal.vm.intValue(x);
+        return iso.internal.hostOperation(.attributed, Value, struct {
+            fn body(iso_: *IsolateState, x_: anytype) !Value {
+                return iso_.vm.intValue(x_);
+            }
+        }.body, x);
     }
 
     /// Construct an Integer, clamping out-of-range values.
     pub fn saturatingIntValue(iso: Isolate, x: anytype) !Value {
-        try iso.internal.beginHostOperation();
-        defer iso.internal.endHostOperation();
-        return iso.internal.vm.saturatingIntValue(x);
+        return iso.internal.hostOperation(.attributed, Value, struct {
+            fn body(iso_: *IsolateState, x_: anytype) !Value {
+                return iso_.vm.saturatingIntValue(x_);
+            }
+        }.body, x);
     }
 
     /// Construct a Float; non-finite or destination-overflow values return
     /// `error.Overflow`.
     pub fn floatValue(iso: Isolate, x: f64) !Value {
-        try iso.internal.beginHostOperation();
-        defer iso.internal.endHostOperation();
-        return iso.internal.vm.floatValue(x);
+        return iso.internal.hostOperation(.attributed, Value, struct {
+            fn body(iso_: *IsolateState, x_: f64) !Value {
+                return iso_.vm.floatValue(x_);
+            }
+        }.body, x);
     }
 
     /// Construct a String (no allocation failure swallowing).
     pub fn stringValue(iso: Isolate, s: []const u8) !Value {
-        try iso.internal.beginHostOperation();
-        defer iso.internal.endHostOperation();
-        return iso.internal.vm.stringValue(s);
+        return iso.internal.hostOperation(.attributed, Value, struct {
+            fn body(iso_: *IsolateState, s_: []const u8) !Value {
+                return iso_.vm.stringValue(s_);
+            }
+        }.body, s);
     }
 
     /// Construct a Boolean (immediate; cannot fail).
@@ -1690,25 +1738,31 @@ pub const Isolate = struct {
 
     /// Construct an Array from same-VM values.
     pub fn array(iso: Isolate, values: []const Value) !Array {
-        try iso.internal.beginHostOperation();
-        defer iso.internal.endHostOperation();
-        return iso.internal.vm.array(values);
+        return iso.internal.hostOperation(.attributed, Array, struct {
+            fn body(iso_: *IsolateState, values_: []const Value) !Array {
+                return iso_.vm.array(values_);
+            }
+        }.body, values);
     }
 
     /// Construct a Hash from same-VM entries.
     pub fn hash(iso: Isolate, entries: []const HashEntry) !Hash {
-        try iso.internal.beginHostOperation();
-        defer iso.internal.endHostOperation();
-        return iso.internal.vm.hash(entries);
+        return iso.internal.hostOperation(.attributed, Hash, struct {
+            fn body(iso_: *IsolateState, entries_: []const HashEntry) !Hash {
+                return iso_.vm.hash(entries_);
+            }
+        }.body, entries);
     }
 
     // ---- symbols and rooting ----------------------------------------------
 
     /// Intern a symbol name (allocating; serialized with execution).
     pub fn internSymbol(iso: Isolate, name: []const u8) !u32 {
-        try iso.internal.beginHostOperation();
-        defer iso.internal.endHostOperation();
-        return iso.internal.vm.internSymbol(name);
+        return iso.internal.hostOperation(.attributed, u32, struct {
+            fn body(iso_: *IsolateState, name_: []const u8) !u32 {
+                return iso_.vm.internSymbol(name_);
+            }
+        }.body, name);
     }
 
     /// Borrowed symbol name (no allocation; same-thread use only).
@@ -1718,10 +1772,12 @@ pub const Isolate = struct {
 
     /// Keep `value` alive independently of the GC arena until the returned
     /// root is destroyed. Roots must be destroyed before this Isolate.
-    pub fn root(iso: Isolate, value: Value) arena_mod.RootError!RootedValue {
-        try iso.internal.beginHostOperation();
-        defer iso.internal.endHostOperation();
-        return iso.internal.vm.root(value);
+    pub fn root(iso: Isolate, value: Value) RootError!RootedValue {
+        return iso.internal.hostOperation(.attributed, RootedValue, struct {
+            fn body(iso_: *IsolateState, value_: Value) arena_mod.RootError!RootedValue {
+                return iso_.vm.root(value_);
+            }
+        }.body, value) catch |err| return @errorCast(err);
     }
 
     /// Save the GC arena index; same-thread use only, like the raw layer.

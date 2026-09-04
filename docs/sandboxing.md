@@ -9,6 +9,12 @@ scripts run while ambient language authority must be granted explicitly —
 including anything a future release might add. The presets compose with your
 limits and artifact acceptance:
 
+Some library conveniences dispatch through a stripped capability internally.
+For example, mruby implements `Enumerable#reduce(:+)` with `__send__`, so it
+raises under the zero/restricted policy; use the block form
+`reduce { |sum, item| sum + item }` or explicitly grant `send` (the trusted
+preset does so).
+
 ```zig
 // Semi-trusted scripts: deny-by-default capabilities plus a frozen object
 // model and resource ceilings. Host classes/methods go on the bootstrap
@@ -131,9 +137,15 @@ report prospective generation 0; actual requests start at generation 1.
 - **Memory**: the soft cap fails the next allocation (mruby raises the
   rescuable `NoMemoryError`, then the hook escalates); the hard cap
   (default soft + max(1 MiB, soft/2)) fails allocations permanently and
-  terminates immediately. `iso.stats()` reports
+  terminates immediately. Allocating post-seal host operations invoked through
+  `Isolate` are serialized and run with the isolate's allocator attribution,
+  so their mruby-heap allocations update live/peak memory statistics and
+  enforce the same sticky caps; a cap crossed by one of these operations
+  surfaces directly as `error.MemoryLimitExceeded`. `iso.stats()` reports
   instructions/peak-memory/peak-depth/live-objects/wall-time; the isolate
-  cell exposes an `on_limit` callback for quota accounting.
+  cell exposes an `on_limit` callback for quota accounting. Temporary
+  conversion buffers and root-registry bookkeeping use the host allocator,
+  are not part of this mruby quota, and should be bounded by the host.
 - **Recovery**: only gas exhaustion under `.per_execution` is renewable.
   `.per_isolate` exhaustion, deadline, memory, call depth, and external
   termination remain sticky. `Isolate.lastError()` is reserved for ordinary
@@ -179,7 +191,13 @@ report prospective generation 0; actual requests start at generation 1.
   observing interpreter state between runs — no raw `vm` access needed for
   ordinary host introspection. They serialize like every other operation
   (re-entrant use from a callback returns `IsolateThreadBusy`) and
-  `setGlobal` rejects foreign-VM values with `error.ForeignValue`.
+  `setGlobal` rejects foreign-VM values with `error.ForeignValue`. Allocating
+  methods on `Isolate` use that same host-operation bracket for both locking
+  and allocator attribution. The non-allocating `clearError` method uses the
+  lock without rejecting a previously recorded memory termination, so retained
+  diagnostics can still be discarded. This guarantee is scoped to calls made
+  through `Isolate`; calling methods directly on returned `Value`, `Array`, or
+  `Hash` handles does not enter the post-seal host-operation bracket.
 - **Compiled images**: prefer typed `compileRite`/`runRite`, which add framing,
   corruption checks, generated build compatibility, and optional application
   identity. Legacy `sandbox.compile`/`runImage` remain temporarily available

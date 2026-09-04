@@ -207,11 +207,25 @@ holding the raw `vm` for host definitions) and the `Isolate` returned by
 `seal()` (execution, globals, termination, stats, and lock-serialized value
 construction — see [sandboxing.md](sandboxing.md)).
 
+Allocating post-seal operations called on `Isolate` itself are both serialized
+and allocator-attributed to that isolate. Their allocations update
+the mruby heap reflected by `Stats.live_memory_bytes` / `peak_memory_bytes`,
+enforce the policy's sticky soft and hard memory caps, and return
+`error.MemoryLimitExceeded` when a cap is crossed. This applies to the
+`Isolate` host surface, including value and collection construction, globals,
+symbols, and rooting. It does not change the contract of methods called
+directly on raw `Value`, `Array`, or `Hash` handles; those remain VM-level
+operations and do not themselves enter the Isolate's post-seal host-operation
+bracket. Temporary conversion buffers and root-registry bookkeeping allocated
+from the host allocator are likewise outside the mruby heap quota; hosts must
+bound the collection slices they supply.
+
 ## Threading
 
 One `Vm` (or `Isolate`) is owned by one thread at a time; mruby states are
 not thread-safe. Separate VMs may run on separate threads — the process
-allocator is thread-safe. The sandbox layer additionally serializes its
-public operations with a non-blocking lock: accidental same-Isolate
-concurrency is reported as `error.IsolateThreadBusy` rather than corrupting
-state (see [sandboxing.md](sandboxing.md)).
+allocator is thread-safe. Methods on `Isolate` additionally use a non-blocking
+operation lock: accidental same-Isolate concurrency through that interface is
+reported as `error.IsolateThreadBusy` rather than corrupting state. Raw value
+handle methods retain the ordinary same-thread rule above (see
+[sandboxing.md](sandboxing.md)).
