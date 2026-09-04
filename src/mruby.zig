@@ -37,6 +37,13 @@ pub const sandbox = @import("sandbox.zig");
 pub const worker = @import("worker.zig");
 pub const features = @import("features.zig");
 
+// libmruby's C objects call this Zig export even when a consumer only reads
+// compile-time metadata from this module. Force the allocator namespace to be
+// analyzed so such consumers still get the required symbol at link time.
+comptime {
+    _ = alloc.mrb_basic_alloc_func_pub;
+}
+
 /// Test-build-only access to private seams used by standalone fuzz targets.
 /// This declaration is empty in library and executable builds.
 pub const internal_test = if (@import("builtin").is_test) struct {

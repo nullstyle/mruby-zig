@@ -26,6 +26,12 @@ const std = @import("std");
 
 const config = @import("build_features");
 const artifact_config = @import("artifact_config");
+const authority_types = @import("authority_manifest");
+
+pub const AuthorityKind = authority_types.Kind;
+pub const AuthoritySet = authority_types.Set;
+pub const AuthoritySource = authority_types.Source;
+pub const AuthorityManifest = authority_types.Manifest;
 
 /// Gems linked into this build, in dependency-respecting initialization
 /// order (dependencies first). Core mruby and the compiler are always
@@ -47,6 +53,35 @@ pub const gem_set: []const u8 = config.gem_set;
 /// True when `-Dwith-gems` or `-Dwithout-gems` customized the selection,
 /// meaning `gem_set` alone does not describe the linked gems.
 pub const custom_selection: bool = config.custom_selection;
+
+const authority_sources = blk: {
+    if (config.authority_source_names.len != config.authority_source_bits.len) {
+        @compileError("authority source names and masks disagree");
+    }
+    var result: [config.authority_source_names.len]AuthoritySource = undefined;
+    for (&result, 0..) |*source, i| {
+        source.* = .{
+            .name = config.authority_source_names[i],
+            .authority = AuthoritySet.fromBits(config.authority_source_bits[i]),
+        };
+    }
+    break :blk result;
+};
+
+/// Conservative authority exposed by core, compiler, and every selected gem,
+/// with per-source attribution. This is linked/available authority; a sandbox
+/// policy can remove some language entry points before guest execution.
+pub const authority: AuthorityManifest = .{
+    .aggregate = AuthoritySet.fromBits(config.authority_bits),
+    .sources = &authority_sources,
+};
+
+/// Authority attributed to one selected gem, or null when it is not linked.
+pub fn authorityForGem(name: []const u8) ?AuthoritySet {
+    if (!hasGem(name)) return null;
+    const source = authority.find(name) orelse return null;
+    return source.authority;
+}
 
 /// Version of the vendored mruby this package builds.
 pub const mruby_version: []const u8 = config.mruby_version;
@@ -87,17 +122,34 @@ pub const has_compiler: bool = true;
 /// must be compiled in and the target must satisfy the ABI constraint.
 pub const sandbox_supported: bool = has_debug_hook and pointer_bits == 64;
 
-/// Whether this target supports the bundled one-shot worker-process tier.
-/// The first implementation deliberately limits its OS-level enforcement
-/// contract to 64-bit Linux and macOS.
-pub const worker_process_supported: bool = sandbox_supported and
-    std.process.can_spawn and switch (@import("builtin").os.tag) {
-    .linux, .macos => true,
-    else => false,
-};
+/// Whether the target can host the bundled one-shot worker before considering
+/// the selected authority profile.
+pub const worker_target_supported: bool = config.worker_target_supported;
+
+/// Whether the selected core/gem profile contains no authority that can access
+/// host assets or process control through the generic worker.
+pub const worker_profile_eligible: bool = config.worker_profile_eligible;
+
+/// True only when an ineligible profile was explicitly enabled with
+/// `-Dallow-worker-ambient-authority=true`.
+pub const worker_ambient_authority_opt_in: bool =
+    config.worker_ambient_authority_opt_in;
+
+/// Whether the bundled one-shot worker artifact and controller are enabled.
+/// This combines target support with the fail-closed authority decision made
+/// by the build graph.
+pub const worker_process_supported: bool = config.worker_process_supported;
 
 comptime {
     if (sandbox_supported and @bitSizeOf(usize) != pointer_bits) {
         @compileError("features.sandbox_supported disagrees with the compiled target");
+    }
+    if (worker_process_supported and !worker_target_supported) {
+        @compileError("worker enabled on an unsupported target");
+    }
+    if (worker_process_supported and !worker_profile_eligible and
+        !worker_ambient_authority_opt_in)
+    {
+        @compileError("worker authority gate was bypassed without explicit opt-in");
     }
 }

@@ -6,8 +6,21 @@
 //! `funcname` (used for generated init functions) is the gem name with
 //! `-` replaced by `_`, exactly as `lib/mruby/gem.rb` computes it.
 
+const authority_mod = @import("authority.zig");
+
+pub const builtin_authority = [_]authority_mod.Source{
+    // Core supplies context evaluation, __send__, reflection, and class/model
+    // mutation. The compiler adds no Ruby-visible entry point by itself;
+    // mruby-eval is the source that exposes compilation to guest code.
+    .{ .name = "mruby-core", .authority = auth(&.{ .dynamic_code, .dynamic_dispatch, .introspection, .model_mutation, .host_output }) },
+    .{ .name = "mruby-compiler", .authority = .empty },
+};
+
 pub const Gem = struct {
     name: []const u8,
+    /// Conservative Ruby-visible authority exposed by this gem. Intentionally
+    /// has no default: adding a catalog entry requires an explicit review.
+    authority: authority_mod.Set,
     /// C sources, relative to the mruby dependency root.
     c_srcs: []const []const u8 = &.{},
     /// Ruby files, relative to the mruby dependency root; compiled to cdump
@@ -29,6 +42,10 @@ pub const Gem = struct {
     }
 };
 
+fn auth(comptime kinds: []const authority_mod.Kind) authority_mod.Set {
+    return authority_mod.Set.init(kinds);
+}
+
 fn gemDir(comptime name: []const u8) []const u8 {
     return "mrbgems/" ++ name ++ "/";
 }
@@ -37,42 +54,42 @@ fn gemDir(comptime name: []const u8) []const u8 {
 /// io/socket/dir/errno/print gems (excluded for cross-platform builds).
 /// Order is dependency-respecting (dependencies init before dependents).
 pub const standard = [_]Gem{
-    .{ .name = "mruby-metaprog", .c_srcs = &.{gemDir("mruby-metaprog") ++ "src/metaprog.c"} },
-    .{ .name = "mruby-method", .c_srcs = &.{gemDir("mruby-method") ++ "src/method.c"}, .rb_files = &.{gemDir("mruby-method") ++ "mrblib/method.rb"} },
-    .{ .name = "mruby-binding", .c_srcs = &.{gemDir("mruby-binding") ++ "src/binding.c"} },
-    .{ .name = "mruby-eval", .c_srcs = &.{gemDir("mruby-eval") ++ "src/eval.c"}, .deps = &.{"mruby-binding"} },
-    .{ .name = "mruby-compar-ext", .rb_files = &.{gemDir("mruby-compar-ext") ++ "mrblib/compar.rb"} },
-    .{ .name = "mruby-enum-ext", .rb_files = &.{gemDir("mruby-enum-ext") ++ "mrblib/enum.rb"} },
-    .{ .name = "mruby-string-ext", .c_srcs = &.{gemDir("mruby-string-ext") ++ "src/string.c"}, .rb_files = &.{gemDir("mruby-string-ext") ++ "mrblib/string.rb"} },
-    .{ .name = "mruby-numeric-ext", .c_srcs = &.{gemDir("mruby-numeric-ext") ++ "src/numeric_ext.c"}, .rb_files = &.{gemDir("mruby-numeric-ext") ++ "mrblib/numeric_ext.rb"} },
-    .{ .name = "mruby-array-ext", .c_srcs = &.{gemDir("mruby-array-ext") ++ "src/array.c"}, .rb_files = &.{gemDir("mruby-array-ext") ++ "mrblib/array.rb"} },
-    .{ .name = "mruby-hash-ext", .c_srcs = &.{gemDir("mruby-hash-ext") ++ "src/hash_ext.c"}, .rb_files = &.{gemDir("mruby-hash-ext") ++ "mrblib/hash.rb"} },
-    .{ .name = "mruby-range-ext", .c_srcs = &.{gemDir("mruby-range-ext") ++ "src/range.c"}, .rb_files = &.{gemDir("mruby-range-ext") ++ "mrblib/range.rb"} },
-    .{ .name = "mruby-proc-ext", .c_srcs = &.{gemDir("mruby-proc-ext") ++ "src/proc.c"}, .rb_files = &.{gemDir("mruby-proc-ext") ++ "mrblib/proc.rb"} },
-    .{ .name = "mruby-symbol-ext", .c_srcs = &.{gemDir("mruby-symbol-ext") ++ "src/symbol.c"}, .rb_files = &.{gemDir("mruby-symbol-ext") ++ "mrblib/symbol.rb"} },
-    .{ .name = "mruby-object-ext", .c_srcs = &.{gemDir("mruby-object-ext") ++ "src/object.c"}, .rb_files = &.{gemDir("mruby-object-ext") ++ "mrblib/object.rb"} },
-    .{ .name = "mruby-objectspace", .c_srcs = &.{gemDir("mruby-objectspace") ++ "src/mruby_objectspace.c"} },
-    .{ .name = "mruby-fiber", .c_srcs = &.{gemDir("mruby-fiber") ++ "src/fiber.c"} },
-    .{ .name = "mruby-enumerator", .rb_files = &.{gemDir("mruby-enumerator") ++ "mrblib/enumerator.rb"} },
-    .{ .name = "mruby-enum-lazy", .rb_files = &.{gemDir("mruby-enum-lazy") ++ "mrblib/lazy.rb"}, .deps = &.{ "mruby-enumerator", "mruby-enum-ext" } },
-    .{ .name = "mruby-set", .c_srcs = &.{gemDir("mruby-set") ++ "src/set.c"}, .rb_files = &.{gemDir("mruby-set") ++ "mrblib/set.rb"}, .defines = &.{"MRB_USE_SET"}, .deps = &.{ "mruby-hash-ext", "mruby-enumerator" } },
-    .{ .name = "mruby-toplevel-ext", .rb_files = &.{gemDir("mruby-toplevel-ext") ++ "mrblib/toplevel.rb"} },
-    .{ .name = "mruby-kernel-ext", .c_srcs = &.{gemDir("mruby-kernel-ext") ++ "src/kernel.c"} },
-    .{ .name = "mruby-class-ext", .c_srcs = &.{gemDir("mruby-class-ext") ++ "src/class.c"} },
-    .{ .name = "mruby-pack", .c_srcs = &.{gemDir("mruby-pack") ++ "src/pack.c"} },
-    .{ .name = "mruby-sprintf", .c_srcs = &.{gemDir("mruby-sprintf") ++ "src/sprintf.c"}, .rb_files = &.{gemDir("mruby-sprintf") ++ "mrblib/string.rb"} },
-    .{ .name = "mruby-time", .c_srcs = &.{gemDir("mruby-time") ++ "src/time.c"}, .include_dirs = &.{gemDir("mruby-time") ++ "include"} },
-    .{ .name = "mruby-struct", .c_srcs = &.{gemDir("mruby-struct") ++ "src/struct.c"}, .rb_files = &.{gemDir("mruby-struct") ++ "mrblib/struct.rb"} },
-    .{ .name = "mruby-data", .c_srcs = &.{gemDir("mruby-data") ++ "src/data.c"} },
-    .{ .name = "mruby-random", .c_srcs = &.{gemDir("mruby-random") ++ "src/random.c"} },
-    .{ .name = "mruby-math", .c_srcs = &.{gemDir("mruby-math") ++ "src/math.c"} },
+    .{ .name = "mruby-metaprog", .authority = auth(&.{ .dynamic_dispatch, .introspection, .model_mutation }), .c_srcs = &.{gemDir("mruby-metaprog") ++ "src/metaprog.c"} },
+    .{ .name = "mruby-method", .authority = auth(&.{ .dynamic_dispatch, .introspection }), .c_srcs = &.{gemDir("mruby-method") ++ "src/method.c"}, .rb_files = &.{gemDir("mruby-method") ++ "mrblib/method.rb"}, .deps = &.{"mruby-proc-ext"} },
+    .{ .name = "mruby-binding", .authority = auth(&.{.introspection}), .c_srcs = &.{gemDir("mruby-binding") ++ "src/binding.c"} },
+    .{ .name = "mruby-eval", .authority = auth(&.{.dynamic_code}), .c_srcs = &.{gemDir("mruby-eval") ++ "src/eval.c"}, .deps = &.{"mruby-binding"} },
+    .{ .name = "mruby-compar-ext", .authority = .empty, .rb_files = &.{gemDir("mruby-compar-ext") ++ "mrblib/compar.rb"} },
+    .{ .name = "mruby-enum-ext", .authority = .empty, .rb_files = &.{gemDir("mruby-enum-ext") ++ "mrblib/enum.rb"} },
+    .{ .name = "mruby-string-ext", .authority = .empty, .c_srcs = &.{gemDir("mruby-string-ext") ++ "src/string.c"}, .rb_files = &.{gemDir("mruby-string-ext") ++ "mrblib/string.rb"} },
+    .{ .name = "mruby-numeric-ext", .authority = .empty, .c_srcs = &.{gemDir("mruby-numeric-ext") ++ "src/numeric_ext.c"}, .rb_files = &.{gemDir("mruby-numeric-ext") ++ "mrblib/numeric_ext.rb"} },
+    .{ .name = "mruby-array-ext", .authority = .empty, .c_srcs = &.{gemDir("mruby-array-ext") ++ "src/array.c"}, .rb_files = &.{gemDir("mruby-array-ext") ++ "mrblib/array.rb"} },
+    .{ .name = "mruby-hash-ext", .authority = .empty, .c_srcs = &.{gemDir("mruby-hash-ext") ++ "src/hash_ext.c"}, .rb_files = &.{gemDir("mruby-hash-ext") ++ "mrblib/hash.rb"}, .deps = &.{"mruby-array-ext"} },
+    .{ .name = "mruby-range-ext", .authority = .empty, .c_srcs = &.{gemDir("mruby-range-ext") ++ "src/range.c"}, .rb_files = &.{gemDir("mruby-range-ext") ++ "mrblib/range.rb"} },
+    .{ .name = "mruby-proc-ext", .authority = auth(&.{.introspection}), .c_srcs = &.{gemDir("mruby-proc-ext") ++ "src/proc.c"}, .rb_files = &.{gemDir("mruby-proc-ext") ++ "mrblib/proc.rb"} },
+    .{ .name = "mruby-symbol-ext", .authority = auth(&.{.introspection}), .c_srcs = &.{gemDir("mruby-symbol-ext") ++ "src/symbol.c"}, .rb_files = &.{gemDir("mruby-symbol-ext") ++ "mrblib/symbol.rb"} },
+    .{ .name = "mruby-object-ext", .authority = auth(&.{.dynamic_code}), .c_srcs = &.{gemDir("mruby-object-ext") ++ "src/object.c"}, .rb_files = &.{gemDir("mruby-object-ext") ++ "mrblib/object.rb"} },
+    .{ .name = "mruby-objectspace", .authority = auth(&.{ .introspection, .heap_enumeration }), .c_srcs = &.{gemDir("mruby-objectspace") ++ "src/mruby_objectspace.c"} },
+    .{ .name = "mruby-fiber", .authority = auth(&.{.continuations}), .c_srcs = &.{gemDir("mruby-fiber") ++ "src/fiber.c"} },
+    .{ .name = "mruby-enumerator", .authority = auth(&.{ .continuations, .dynamic_dispatch }), .rb_files = &.{gemDir("mruby-enumerator") ++ "mrblib/enumerator.rb"}, .deps = &.{"mruby-fiber"} },
+    .{ .name = "mruby-enum-lazy", .authority = auth(&.{.continuations}), .rb_files = &.{gemDir("mruby-enum-lazy") ++ "mrblib/lazy.rb"}, .deps = &.{ "mruby-enumerator", "mruby-enum-ext" } },
+    .{ .name = "mruby-set", .authority = .empty, .c_srcs = &.{gemDir("mruby-set") ++ "src/set.c"}, .rb_files = &.{gemDir("mruby-set") ++ "mrblib/set.rb"}, .defines = &.{"MRB_USE_SET"}, .deps = &.{ "mruby-hash-ext", "mruby-enumerator" } },
+    .{ .name = "mruby-toplevel-ext", .authority = auth(&.{.model_mutation}), .rb_files = &.{gemDir("mruby-toplevel-ext") ++ "mrblib/toplevel.rb"} },
+    .{ .name = "mruby-kernel-ext", .authority = auth(&.{.introspection}), .c_srcs = &.{gemDir("mruby-kernel-ext") ++ "src/kernel.c"} },
+    .{ .name = "mruby-class-ext", .authority = auth(&.{ .dynamic_code, .introspection, .heap_enumeration }), .c_srcs = &.{gemDir("mruby-class-ext") ++ "src/class.c"} },
+    .{ .name = "mruby-pack", .authority = .empty, .c_srcs = &.{gemDir("mruby-pack") ++ "src/pack.c"} },
+    .{ .name = "mruby-sprintf", .authority = .empty, .c_srcs = &.{gemDir("mruby-sprintf") ++ "src/sprintf.c"}, .rb_files = &.{gemDir("mruby-sprintf") ++ "mrblib/string.rb"} },
+    .{ .name = "mruby-time", .authority = auth(&.{.clock}), .c_srcs = &.{gemDir("mruby-time") ++ "src/time.c"}, .include_dirs = &.{gemDir("mruby-time") ++ "include"} },
+    .{ .name = "mruby-struct", .authority = auth(&.{.model_mutation}), .c_srcs = &.{gemDir("mruby-struct") ++ "src/struct.c"}, .rb_files = &.{gemDir("mruby-struct") ++ "mrblib/struct.rb"} },
+    .{ .name = "mruby-data", .authority = auth(&.{.model_mutation}), .c_srcs = &.{gemDir("mruby-data") ++ "src/data.c"} },
+    .{ .name = "mruby-random", .authority = auth(&.{.entropy}), .c_srcs = &.{gemDir("mruby-random") ++ "src/random.c"} },
+    .{ .name = "mruby-math", .authority = .empty, .c_srcs = &.{gemDir("mruby-math") ++ "src/math.c"} },
 };
 
 /// The "minimal" set: just enough for `Vm.loadString` with no stdlib
 /// extensions beyond core mruby (plus `mruby-eval`, which is tiny and
 /// commonly wanted even in constrained builds).
 pub const minimal = [_]Gem{
-    .{ .name = "mruby-eval", .c_srcs = &.{gemDir("mruby-eval") ++ "src/eval.c"}, .deps = &.{"mruby-binding"} },
+    .{ .name = "mruby-eval", .authority = auth(&.{.dynamic_code}), .c_srcs = &.{gemDir("mruby-eval") ++ "src/eval.c"}, .deps = &.{"mruby-binding"} },
 };
 
 /// All gems known to the catalog, used to resolve `-Dwith-gems=...`.
@@ -305,4 +322,46 @@ test "selection rejects unknown exclusions" {
         .without = "mruby-not-real",
     }, &failure));
     try std.testing.expectEqualStrings("mruby-not-real", failure.name);
+}
+
+test "selection closes audited upstream runtime dependencies" {
+    const cases = [_]struct { gem: []const u8, dependency: []const u8 }{
+        .{ .gem = "mruby-method", .dependency = "mruby-proc-ext" },
+        .{ .gem = "mruby-hash-ext", .dependency = "mruby-array-ext" },
+        .{ .gem = "mruby-enumerator", .dependency = "mruby-fiber" },
+    };
+
+    for (cases) |case| {
+        var failure: SelectionFailure = .{};
+        const selected = try select(std.testing.allocator, .{
+            .gem_set = "minimal",
+            .with = case.gem,
+        }, &failure);
+        defer std.testing.allocator.free(selected);
+
+        const dependency_index = findGem(selected, case.dependency) orelse
+            return error.TestUnexpectedResult;
+        const gem_index = findGem(selected, case.gem) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expect(dependency_index < gem_index);
+    }
+}
+
+test "catalog authority is explicit and worker eligible" {
+    var sources: [builtin_authority.len + all.len]authority_mod.Source = undefined;
+    for (builtin_authority, 0..) |source, i| sources[i] = source;
+    for (all, 0..) |gem, i| {
+        sources[builtin_authority.len + i] = .{
+            .name = gem.name,
+            .authority = gem.authority,
+        };
+    }
+
+    const available = authority_mod.aggregate(&sources);
+    try std.testing.expect(available.has(.dynamic_code));
+    try std.testing.expect(available.has(.clock));
+    try std.testing.expect(available.has(.entropy));
+    try std.testing.expect(available.has(.heap_enumeration));
+    try std.testing.expect(available.has(.host_output));
+    try std.testing.expect(available.workerEligible());
 }

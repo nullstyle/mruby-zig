@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+Auditable authority and fail-closed workers:
+
+- Core, compiler, and every catalog gem now declare conservative
+  Ruby-visible authority. `mruby.features.authority` exposes the aggregate and
+  per-source attribution, `authorityForGem` supports direct gem queries, and
+  the manifest distinguishes linked/available authority from the entry points
+  left effective by an Isolate policy.
+- Sandbox method masks, constant removal, and model freezing now consume
+  centralized exact-target audit tables with inventory-driven tests. A pinned
+  `ObjectSpace` reference can no longer bypass the object-space gate. A pinned
+  `random_seed` also masks reseeding and fresh `Random` construction after
+  initial seeding, preventing guest code from restoring time/address-derived
+  state. A pinned clock masks current-time `Time` construction after replacing
+  `Time.now`.
+- Generic worker builds now fail closed when linked authority includes
+  filesystem, network, process, environment, or arbitrary native-host access.
+  New feature flags expose target support, profile eligibility, explicit
+  ambient-authority opt-in, and the combined result. The
+  `-Dallow-worker-ambient-authority=true` override acknowledges an audited
+  exception; it does not provide syscall, filesystem, network, or user
+  confinement. Application bootstrap callbacks remain outside the package
+  authority catalog and are absent from the generic helper.
+
 One-shot worker processes:
 
 - Added `mruby.worker.runRite`, a synchronous fresh-process boundary for one

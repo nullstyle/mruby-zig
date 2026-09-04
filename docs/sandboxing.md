@@ -4,10 +4,10 @@
 globals — nothing is shared between isolates) with an enforced policy.
 
 Capability grants are **deny-by-default**: a `Policy` built without a preset
-strips `eval`, `send`, introspection, and `ObjectSpace`, so plain compute
-scripts run while ambient language authority must be granted explicitly —
-including anything a future release might add. The presets compose with your
-limits and artifact acceptance:
+strips `eval`, `send`, an audited set of high-powered reflection operations,
+and `ObjectSpace`, so plain compute scripts run while ambient language
+authority must be granted explicitly — including anything a future release
+might add. The presets compose with your limits and artifact acceptance:
 
 Some library conveniences dispatch through a stripped capability internally.
 For example, mruby implements `Enumerable#reduce(:+)` with `__send__`, so it
@@ -58,6 +58,66 @@ edits to a host-held `Policy` value have no effect. Dynamic per-request
 amounts are not currently supported. `Limits.instructions` is a deprecated
 alias for `.gas = .{ .per_isolate = N }`; setting both fields returns
 `error.ConflictingGasPolicy`.
+
+## Available authority and effective policy
+
+`mruby.features.authority` describes **available authority**: the conservative
+union of what linked core, compiler, and selected gem code can expose, with a
+source entry for each. It describes the binary and therefore does not change
+when an Isolate is sealed. A policy determines the **effective Ruby surface**
+for that Isolate; capability denial and model freezing can make it smaller.
+There is intentionally no derived `effective_authority` bitset: restrictions
+are entry-point-specific, and arbitrary behavior inside native code cannot be
+inferred from a capability flag.
+
+The deny-by-default floor is driven by canonical audited inventories in
+[`build/authority.zig`](../build/authority.zig). Each restricted method is an
+exact `(gate, owner, name, instance-or-class)` target, each restricted
+constant is an exact `(gate, owner, name)` target, and object-model sealing
+uses one explicit class/module list. Policy application iterates those tables;
+tests iterate the same tables to verify every listed target is masked or
+frozen. An authority label is review metadata, not enforcement by itself: a
+new Ruby entry point that should follow a policy gate must also be added to the
+corresponding audited inventory.
+
+`object_space = false` removes the `ObjectSpace` constant and masks
+`ObjectSpace.count_objects`, `ObjectSpace.each_object`, and
+`Class#subclasses`. The method masks also revoke a module reference retained
+during trusted bootstrap; constant removal alone would not.
+
+The `introspection` gate is deliberately an exact API restriction, not an
+information-hiding boundary. Ordinary observational queries including
+`class`, `respond_to?`, `ancestors`, `method_defined?`, and `const_get` remain
+available when it is false. The restricted inventory instead covers the
+listed variable access/mutation, method handles and listings, binding and
+symbol-table access, source locations, and selected class/module metadata.
+
+Application-defined classes and Zig callbacks registered through the
+bootstrap VM are outside the generated package manifest. The sandbox cannot
+infer or mask their authority. Keep callbacks narrow and bounded, validate
+their inputs, expose only deliberately chosen host operations, and treat any
+native gem carrying host-access authority the same way. The generic worker
+has no application bootstrap callbacks; see [workers.md](workers.md).
+
+Core's `print` and `p` entry points are reported as `host_output`: an
+in-process embedding can route them to a host writer. The generic worker
+admits this authority only because it redirects process stdout before starting
+the VM; the manifest still reports the linked surface.
+
+When `random_seed` is set, sealing seeds the default RNG once and then masks
+the reseeding methods and fresh `Random` construction. Guest code therefore
+cannot replace the pinned sequence, including by calling no-argument `srand`
+or `Random.new` to restore time/address-derived state. mruby consumes the low
+32 bits of the configured `u64` seed. Requesting a seed without `mruby-random`
+fails capability application instead of silently leaving nondeterministic
+state.
+
+When `clock_epoch_s` is set, sealing replaces `Time.now` and masks `Time.new`,
+`Time.allocate`, and `Time#initialize`, which are the other upstream paths
+that read the current clock. Explicit-value constructors such as `Time.at`,
+`Time.gm`, and `Time.local` remain available. Local-time operations still use
+the host timezone and daylight-saving rules; the option pins current time,
+not the timezone database.
 
 ## Gas scopes
 
@@ -228,11 +288,14 @@ operation across the process boundary.
 
 The helper is still not a complete hostile-code sandbox. It runs as the same
 OS user and currently has no syscall filter, filesystem jail, network
-namespace, or privilege separation. The default gems omit filesystem,
-network, and general I/O access, but custom gem selections can add that
-authority. Authenticate executable artifacts and add an external
-OS/container sandbox where fully hostile code is in scope. See
-[workers.md](workers.md) for the exact platform and enforcement contract.
+namespace, or privilege separation. The build omits the generic helper when
+the selected authority manifest reports filesystem, network, process,
+environment, or arbitrary native-host access, unless the build owner uses the
+explicit ambient-authority override. That gate prevents an accidental worker
+configuration; it does not confine an enabled helper. Authenticate executable
+artifacts and add an external OS/container sandbox where fully hostile code is
+in scope. See [workers.md](workers.md) for the exact platform and enforcement
+contract.
 
 Run `examples/sandbox.zig` (`zig build run-sandbox`) for a runnable
 end-to-end tour of presets, limits, sealing, and host access.

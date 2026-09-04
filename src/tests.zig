@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const mruby = @import("mruby");
+const authority_manifest = @import("authority_manifest");
 const test_config = @import("test_config");
 
 test {
@@ -55,6 +56,56 @@ test "features: generated manifest matches the build" {
     try std.testing.expect(features.sandbox_supported);
     try std.testing.expectEqual(mruby.worker.supported, features.worker_process_supported);
     try std.testing.expectEqual(@as(u16, 64), features.pointer_bits);
+
+    // Authority attribution is complete and its generated aggregate agrees
+    // with recomputing the union from every source.
+    try std.testing.expectEqual(features.gems.len + 2, features.authority.sources.len);
+    const core_authority = features.authority.find("mruby-core") orelse
+        return error.TestUnexpectedResult;
+    const compiler_authority = features.authority.find("mruby-compiler") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(core_authority.authority.has(.dynamic_dispatch));
+    try std.testing.expect(core_authority.authority.has(.host_output));
+    try std.testing.expectEqual(@as(u16, 0), compiler_authority.authority.toBits());
+    try std.testing.expect(features.authority.has(.host_output));
+    var authority_union: features.AuthoritySet = .empty;
+    for (features.authority.sources) |source| {
+        authority_union = authority_union.unionWith(source.authority);
+    }
+    try std.testing.expectEqual(
+        features.authority.aggregate.toBits(),
+        authority_union.toBits(),
+    );
+    for (features.gems) |name| {
+        const attributed = features.authorityForGem(name) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expectEqual(
+            features.authority.find(name).?.authority.toBits(),
+            attributed.toBits(),
+        );
+    }
+    try std.testing.expect(features.authorityForGem("mruby-not-a-gem") == null);
+    try std.testing.expectEqual(
+        features.hasGem("mruby-time"),
+        features.authority.has(.clock),
+    );
+    try std.testing.expectEqual(
+        features.hasGem("mruby-random"),
+        features.authority.has(.entropy),
+    );
+    try std.testing.expectEqual(
+        features.authority.workerEligible(),
+        features.worker_profile_eligible,
+    );
+    try std.testing.expectEqual(
+        features.worker_target_supported and
+            (features.worker_profile_eligible or
+                features.worker_ambient_authority_opt_in),
+        features.worker_process_supported,
+    );
+    if (features.worker_ambient_authority_opt_in) {
+        try std.testing.expect(!features.worker_profile_eligible);
+    }
 
     // Identity surfaces are consistent with the artifact config.
     try std.testing.expectEqual(
@@ -2803,6 +2854,87 @@ test "sandbox: capabilities strip eval, send, introspection, ObjectSpace" {
     try std.testing.expectEqualStrings("gone", try gone_sym.asString());
 }
 
+test "sandbox: audited restriction inventory is enforced" {
+    if (!test_config.has_core_language_suite) return error.SkipZigTest;
+
+    var boot = try sandbox.BootstrapIsolate.spawn(.{});
+    defer boot.deinit();
+    if (test_config.has_object_space) {
+        _ = try boot.vm().loadString("$audit_object_space = ObjectSpace");
+    }
+    const iso = try boot.seal();
+    defer iso.deinit();
+
+    for (authority_manifest.restricted_methods) |restriction| {
+        var source_buf: [256]u8 = undefined;
+        const owner = if (std.mem.eql(u8, restriction.owner, "ObjectSpace"))
+            "$audit_object_space"
+        else
+            restriction.owner;
+        const source = switch (restriction.kind) {
+            .instance => try std.fmt.bufPrint(
+                &source_buf,
+                "{s}.method_defined?(:\"{s}\")",
+                .{ owner, restriction.name },
+            ),
+            .class => try std.fmt.bufPrint(
+                &source_buf,
+                "(class << {s}; self; end).method_defined?(:\"{s}\")",
+                .{ owner, restriction.name },
+            ),
+        };
+        const visible = try iso.run(source);
+        try std.testing.expect(!visible.isTruthy());
+    }
+
+    try std.testing.expectError(error.RubyException, iso.run("$audit_object_space.count_objects"));
+    try iso.clearError();
+    try std.testing.expectError(
+        error.RubyException,
+        iso.run("$audit_object_space.each_object { |_| }"),
+    );
+    try iso.clearError();
+
+    for (authority_manifest.restricted_constants) |restriction| {
+        var source_buf: [256]u8 = undefined;
+        const source = try std.fmt.bufPrint(
+            &source_buf,
+            "begin; {s}::{s}; 0; rescue NameError; 1; end",
+            .{ restriction.owner, restriction.name },
+        );
+        try std.testing.expectEqual(@as(i64, 1), try (try iso.run(source)).asInt());
+    }
+}
+
+test "sandbox: introspection gate is not an information-hiding mode" {
+    if (!test_config.has_core_language_suite) return error.SkipZigTest;
+
+    const iso = try spawnSealed(.{});
+    defer iso.deinit();
+
+    try std.testing.expect((try iso.run("String.class == Class")).isTruthy());
+    try std.testing.expect((try iso.run("String.ancestors.include?(Object)")).isTruthy());
+    try std.testing.expect((try iso.run("String.method_defined?(:upcase)")).isTruthy());
+    try std.testing.expect((try iso.run("Object.const_get(:Object) == Object")).isTruthy());
+}
+
+test "sandbox: audited frozen-class inventory is enforced" {
+    if (!test_config.has_core_language_suite) return error.SkipZigTest;
+
+    const iso = try spawnSealed(sandbox.Policy.restricted(.{}));
+    defer iso.deinit();
+
+    for (authority_manifest.frozen_classes) |name| {
+        var source_buf: [192]u8 = undefined;
+        const source = try std.fmt.bufPrint(
+            &source_buf,
+            "begin; {s}.frozen? ? 2 : 1; rescue NameError; 0; end",
+            .{name},
+        );
+        try std.testing.expectEqual(@as(i64, 2), try (try iso.run(source)).asInt());
+    }
+}
+
 test "sandbox: zero-value policy is the deny-by-default floor" {
     // A Policy constructed without a preset strips every language
     // capability, so plain compute scripts run but ambient authority does
@@ -3061,20 +3193,68 @@ test "sandbox: deterministic RNG and frozen clock" {
             fn sample(seed: u64) !i64 {
                 const iso = try spawnSealed(.{ .capabilities = .{ .random_seed = seed } });
                 defer iso.deinit();
+                // A seeded policy owns the RNG seed; no-argument srand would
+                // otherwise restore time/address-derived nondeterminism.
+                try std.testing.expectError(error.RubyException, iso.run("srand()"));
+                try iso.clearError();
+                try std.testing.expectError(error.RubyException, iso.run("Random.new.rand"));
+                try iso.clearError();
+                for (authority_manifest.random_reseed_methods) |restriction| {
+                    var source_buf: [256]u8 = undefined;
+                    const source = switch (restriction.kind) {
+                        .instance => try std.fmt.bufPrint(
+                            &source_buf,
+                            "{s}.method_defined?(:\"{s}\")",
+                            .{ restriction.owner, restriction.name },
+                        ),
+                        .class => try std.fmt.bufPrint(
+                            &source_buf,
+                            "(class << {s}; self; end).method_defined?(:\"{s}\")",
+                            .{ restriction.owner, restriction.name },
+                        ),
+                    };
+                    const visible = try iso.run(source);
+                    try std.testing.expect(!visible.isTruthy());
+                }
                 const v = try iso.run("rand(1 << 40)");
                 return v.asInt();
             }
         }.sample;
         try std.testing.expectEqual(try run_pair(42), try run_pair(42));
+        try std.testing.expectEqual(
+            try run_pair(42),
+            try run_pair(0xffff_ffff_0000_002a),
+        );
     }
 
     if (test_config.has_time) {
         const iso = try spawnSealed(.{ .capabilities = .{ .clock_epoch_s = 1_700_000_000 } });
         defer iso.deinit();
+        try std.testing.expectError(error.RubyException, iso.run("Time.new"));
+        try iso.clearError();
+        for (authority_manifest.clock_read_methods) |restriction| {
+            var source_buf: [256]u8 = undefined;
+            const source = switch (restriction.kind) {
+                .instance => try std.fmt.bufPrint(
+                    &source_buf,
+                    "{s}.method_defined?(:\"{s}\")",
+                    .{ restriction.owner, restriction.name },
+                ),
+                .class => try std.fmt.bufPrint(
+                    &source_buf,
+                    "(class << {s}; self; end).method_defined?(:\"{s}\")",
+                    .{ restriction.owner, restriction.name },
+                ),
+            };
+            const visible = try iso.run(source);
+            try std.testing.expect(!visible.isTruthy());
+        }
         const t = try iso.run("Time.now.to_i");
         try std.testing.expectEqual(@as(i64, 1_700_000_000), try t.asInt());
         const same = try iso.run("Time.now.equal?(MRubyZigSandbox::FROZEN_TIME)");
         try std.testing.expect(same.isTruthy());
+        const explicit = try iso.run("Time.at(123).to_i");
+        try std.testing.expectEqual(@as(i64, 123), try explicit.asInt());
     }
 }
 
@@ -3418,8 +3598,11 @@ test "sandbox: host construction enforces sticky memory caps and restores admiss
     try std.testing.expect(mruby.alloc.currentIsolateCell() == null);
 }
 
-test "sandbox: eval strip closes class_eval and BasicObject#instance_eval" {
-    const iso = try spawnSealed(.{ .capabilities = .{ .eval = false } });
+test "sandbox: eval strip closes every audited context-evaluation path" {
+    var boot = try sandbox.BootstrapIsolate.spawn(.{ .capabilities = .{ .eval = false } });
+    defer boot.deinit();
+    _ = try boot.vm().loadString("$audit_binding = binding");
+    const iso = try boot.seal();
     defer iso.deinit();
     // Module#class_eval / #module_eval take a source string and were a full
     // eval escape the old Kernel-only strip missed.
@@ -3430,6 +3613,27 @@ test "sandbox: eval strip closes class_eval and BasicObject#instance_eval" {
     // instance_eval is defined on BasicObject; a BasicObject receiver bypassed
     // a Kernel-only strip.
     try std.testing.expectError(error.RubyException, iso.run("BasicObject.new.instance_eval(\"1\")"));
+    try iso.clearError();
+    // Binding#eval is its own entry point and must be masked even when the
+    // Kernel method used to create the binding is no longer reachable.
+    try std.testing.expectError(error.RubyException, iso.run("$audit_binding.eval(\"1\")"));
+    try iso.clearError();
+    if (mruby.features.hasGem("mruby-class-ext")) {
+        try std.testing.expectError(error.RubyException, iso.run("Integer.class_exec { 1 }"));
+        try iso.clearError();
+        try std.testing.expectError(error.RubyException, iso.run("Integer.module_exec { 1 }"));
+    }
+}
+
+test "sandbox: ObjectSpace denial closes Class subclasses enumeration" {
+    if (!mruby.features.hasGem("mruby-class-ext")) return error.SkipZigTest;
+
+    var policy = sandbox.Policy.trusted(.{});
+    policy.capabilities.object_space = false;
+    const iso = try spawnSealed(policy);
+    defer iso.deinit();
+
+    try std.testing.expectError(error.RubyException, iso.run("String.subclasses"));
 }
 
 test "sandbox: frozen clock pin cannot be reassigned by a script" {

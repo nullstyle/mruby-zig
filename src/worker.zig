@@ -10,13 +10,11 @@ const builtin = @import("builtin");
 const artifact = @import("artifact.zig");
 const artifact_config = @import("artifact_config");
 const artifact_value = @import("artifact_value.zig");
+const build_features = @import("build_features");
 const sandbox = @import("sandbox.zig");
 const protocol = @import("worker_protocol");
 
-pub const supported: bool = @bitSizeOf(usize) == 64 and std.process.can_spawn and switch (builtin.os.tag) {
-    .linux, .macos => true,
-    else => false,
-};
+pub const supported: bool = build_features.worker_process_supported;
 
 pub const AddressSpaceLimit = union(enum) {
     unbounded,

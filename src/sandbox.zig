@@ -42,6 +42,7 @@ const artifact_mod = @import("artifact.zig");
 const artifact_value = @import("artifact_value.zig");
 const artifact_config = @import("artifact_config");
 const arena_mod = @import("arena.zig");
+const authority = @import("authority_manifest");
 
 pub const Vm = vm_mod.Vm;
 pub const Value = value_mod.Value;
@@ -176,15 +177,18 @@ pub const Capabilities = struct {
     eval: bool = false,
     /// send / __send__ / public_send. Denied by default.
     send: bool = false,
-    /// instance_variable_* / methods / method / singleton_methods.
-    /// Denied by default.
+    /// The exact audited set of reflective variable, method, binding, symbol,
+    /// class, and module operations in authority_manifest. This is not an
+    /// information-hiding mode: basic queries such as `class`, `respond_to?`,
+    /// `ancestors`, `method_defined?`, and `const_get` remain. Denied by default.
     introspection: bool = false,
     /// The ObjectSpace module. Denied by default.
     object_space: bool = false,
     /// Freeze core classes: later `def`/`include` on them raises
     /// FrozenError. Apply after registering host methods.
     freeze_object_model: bool = false,
-    /// Seed the RNG for reproducible `rand` sequences (mruby-random).
+    /// Seed the RNG for reproducible `rand` sequences (mruby-random). mruby's
+    /// generator consumes the low 32 bits.
     random_seed: ?u64 = null,
     /// Make `Time.now` return a fixed time (epoch seconds).
     clock_epoch_s: ?i64 = null,
@@ -1120,66 +1124,48 @@ const IsolateState = struct {
         const caps = iso.resolved_caps;
         const m = iso.vm.mrb;
 
-        if (!caps.eval) {
-            const kernel = try iso.vm.getClass("Kernel");
-            const basic = try iso.vm.getClass("BasicObject");
-            const module = try iso.vm.getClass("Module");
-            try maskMethod(kernel, "eval");
-            try maskMethod(kernel, "binding");
-            // instance_eval/instance_exec are defined on BasicObject, not
-            // Kernel; a BasicObject-receiver call (whose ancestry excludes
-            // Kernel) would bypass a Kernel-only strip. Mask on both.
-            try maskMethod(kernel, "instance_eval");
-            try maskMethod(kernel, "instance_exec");
-            try maskMethod(basic, "instance_eval");
-            try maskMethod(basic, "instance_exec");
-            // Module#class_eval / #module_eval accept a source string and are
-            // a full string-eval escape; they live on the module class,
-            // untouched by the Kernel/BasicObject strips above.
-            try maskMethod(module, "class_eval");
-            try maskMethod(module, "module_eval");
-        }
-        if (!caps.send) {
-            const kernel = try iso.vm.getClass("Kernel");
-            const basic = try iso.vm.getClass("BasicObject");
-            try maskMethod(kernel, "send");
-            try maskMethod(kernel, "public_send");
-            try maskMethod(basic, "__send__");
-        }
-        if (!caps.introspection) {
-            const kernel = try iso.vm.getClass("Kernel");
-            for ([_][]const u8{
-                "instance_variable_get", "instance_variable_set",
-                "instance_variables",    "instance_variable_defined?",
-                "methods",               "method",
-                "singleton_methods",
-            }) |name| try maskMethod(kernel, name);
-        }
-        if (!caps.object_space) {
-            const present = blk: {
-                _ = iso.vm.getClass("ObjectSpace") catch break :blk false;
-                break :blk true;
+        for (authority.restricted_methods) |restriction| {
+            if (capabilityGranted(caps, restriction.gate)) continue;
+            const owner = iso.vm.getClass(restriction.owner) catch |err| switch (err) {
+                error.UnknownClass => continue,
+                else => return err,
             };
-            if (present) {
-                const object = try iso.vm.getClass("Object");
-                if (!c.mrz_protected_remove_const(
-                    m,
-                    object.class,
-                    "ObjectSpace",
-                    "ObjectSpace".len,
-                )) return error.RubyException;
-            }
+            try maskMethod(owner, restriction.name, restriction.kind);
+        }
+        for (authority.restricted_constants) |restriction| {
+            if (capabilityGranted(caps, restriction.gate)) continue;
+            const owner = try iso.vm.getClass(restriction.owner);
+            var found = false;
+            var ignored: c.mrb_value = undefined;
+            if (!c.mrz_protected_const_get(
+                m,
+                owner.class,
+                restriction.name.ptr,
+                restriction.name.len,
+                &found,
+                &ignored,
+            )) return error.RubyException;
+            if (!found) continue;
+            if (!c.mrz_protected_remove_const(
+                m,
+                owner.class,
+                restriction.name.ptr,
+                restriction.name.len,
+            )) return error.RubyException;
         }
         if (caps.random_seed) |seed| {
             var buf: [64]u8 = undefined;
-            const src = std.fmt.bufPrint(&buf, "srand({d})", .{seed}) catch unreachable;
+            const upstream_seed: u32 = @truncate(seed);
+            const src = std.fmt.bufPrint(&buf, "srand({d})", .{upstream_seed}) catch unreachable;
             // Fail loudly (prepare maps this to CapabilityApplicationFailed) if
             // mruby-random is absent: silently skipping srand would leave the
             // isolate non-deterministic while the host believes the pin applied.
             _ = try iso.vm.loadString(src);
+            try maskMethods(iso, &authority.random_reseed_methods);
         }
         if (caps.clock_epoch_s) |epoch| {
             try iso.installFrozenClock(epoch);
+            try maskMethods(iso, &authority.clock_read_methods);
         }
         if (caps.freeze_object_model) try iso.sealModel();
 
@@ -1212,21 +1198,7 @@ const IsolateState = struct {
     /// phases defensively.
     pub fn sealModel(iso: *IsolateState) !void {
         const m = iso.vm.mrb;
-        const frozen_classes = [_][]const u8{
-            "BasicObject",       "Object",              "Module",
-            "Class",             "Kernel",              "Comparable",
-            "Enumerable",        "NilClass",            "TrueClass",
-            "FalseClass",        "Numeric",             "Integer",
-            "Float",             "String",              "Symbol",
-            "Array",             "Hash",                "Range",
-            "Proc",              "Struct",              "Exception",
-            "StandardError",     "RuntimeError",        "ArgumentError",
-            "TypeError",         "NameError",           "NoMethodError",
-            "IndexError",        "KeyError",            "RangeError",
-            "ZeroDivisionError", "FrozenError",         "StopIteration",
-            "ScriptError",       "NotImplementedError", "LocalJumpError",
-        };
-        for (frozen_classes) |name| {
+        for (authority.frozen_classes) |name| {
             const cls = iso.vm.getClass(name) catch |err| switch (err) {
                 error.UnknownClass => continue,
                 else => return err,
@@ -1238,14 +1210,43 @@ const IsolateState = struct {
         }
     }
 
-    fn maskMethod(cls: anytype, name: []const u8) !void {
+    fn maskMethod(
+        cls: anytype,
+        name: []const u8,
+        kind: authority.MethodKind,
+    ) !void {
         if (!c.mrz_protected_mask_method(
             cls.mrb,
             cls.class,
             name.ptr,
             name.len,
-            c.MRZ_MASK_INSTANCE,
+            switch (kind) {
+                .instance => c.MRZ_MASK_INSTANCE,
+                .class => c.MRZ_MASK_CLASS,
+            },
         )) return error.RubyException;
+    }
+
+    fn maskMethods(
+        iso: *IsolateState,
+        restrictions: []const authority.DeterminismMethod,
+    ) !void {
+        for (restrictions) |restriction| {
+            const owner = iso.vm.getClass(restriction.owner) catch |err| switch (err) {
+                error.UnknownClass => continue,
+                else => return err,
+            };
+            try maskMethod(owner, restriction.name, restriction.kind);
+        }
+    }
+
+    fn capabilityGranted(caps: Capabilities, gate: authority.PolicyGate) bool {
+        return switch (gate) {
+            .eval => caps.eval,
+            .send => caps.send,
+            .introspection => caps.introspection,
+            .object_space => caps.object_space,
+        };
     }
 
     fn installFrozenClock(iso: *IsolateState, epoch: i64) !void {

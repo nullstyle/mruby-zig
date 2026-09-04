@@ -6,12 +6,12 @@ process-isolated counterpart to `sandbox.Isolate.runRite`, with a deliberately
 smaller boundary: one optional `StateCapsule` enters as `$input`, one RITE
 image runs, and one `StateCapsule` or typed failure comes back.
 
-The helper is built from `tools/mruby_worker.zig` and installed as
-`mruby-worker`. Always deploy the helper artifact produced by the same
-mruby-zig dependency configuration as the `mruby` module. In a consuming
-`build.zig`, forward the application's target and optimization settings,
-retrieve the helper with `dep.artifact("mruby-worker")`, and install it beside
-the application:
+When `mruby.features.worker_process_supported` is true, the helper is built
+from `tools/mruby_worker.zig` and installed as `mruby-worker`. Always deploy
+the helper artifact produced by the same mruby-zig dependency configuration as
+the `mruby` module. In a consuming `build.zig`, forward the application's
+target and optimization settings, retrieve the helper with
+`dep.artifact("mruby-worker")`, and install it beside the application:
 
 ```zig
 const target = b.standardTargetOptions(.{});
@@ -120,8 +120,35 @@ preferable to a hard kill.
 
 ## Enforcement and platform contract
 
-The worker tier is available when `mruby.features.worker_process_supported`
-is true: currently 64-bit Linux and macOS targets that can spawn processes.
+Worker availability is fail-closed and visible through separate feature
+flags:
+
+- `worker_target_supported` is true for supported process targets (currently
+  64-bit Linux and macOS).
+- `worker_profile_eligible` is true only when the aggregate linked authority
+  excludes filesystem, network, process, environment, and `native_host`
+  access. `native_host` means an arbitrary native-host escape, not merely that
+  a gem happens to be implemented in C.
+- Core `host_output` authority is deliberately eligible: the helper preserves
+  its protocol on a private descriptor and redirects process stdout to
+  `/dev/null` before constructing the VM.
+- `worker_process_supported` combines the target check with profile
+  eligibility. When false, the helper is not built and `runRite` returns
+  `error.UnsupportedPlatform`.
+
+Both shipped gem presets are eligible today. A build owner who has separately
+audited an ineligible local catalog may pass
+`-Dallow-worker-ambient-authority=true`; the generated
+`worker_ambient_authority_opt_in` records that choice and re-enables the
+worker on supported targets. This override neither strips the reported
+authority nor adds syscall confinement.
+
+In a consuming package, `-Dallow-worker-ambient-authority=true` sets a root
+option; Zig does not implicitly pass it to dependencies. The application must
+declare that option and forward it as
+`.@"allow-worker-ambient-authority" = allow_worker_ambient_authority` in the
+`b.dependency("mruby", .{ ... })` options, as shown in
+[getting-started.md](getting-started.md#gem-configuration).
 
 - The parent applies one absolute boot-clock deadline to request writing,
   response reading, process exit, and reaping. On expiry it sends `SIGKILL` to
@@ -172,14 +199,17 @@ is true: currently 64-bit Linux and macOS targets that can spawn processes.
   marked close-on-exec. Custom native or I/O gems with ambient file-descriptor
   access remain inside the trust boundary: they can reach those inherited
   descriptors and can subvert the stdout separation.
-- The generic helper has no host bootstrap callbacks or classes, so
-  application-fingerprinted RITE images are intentionally unsupported. Use
-  build-compatible, application-independent images.
+- The authority manifest covers linked core/compiler/gem code. The generic
+  helper has no application host bootstrap callbacks or classes, so callback
+  authority is absent rather than inferred, and application-fingerprinted
+  RITE images are intentionally unsupported. Use build-compatible,
+  application-independent images.
 
 This is process and resource isolation, not a complete operating-system
 sandbox. It does not yet install a syscall filter, filesystem jail, network
 namespace, or separate user identity. The default gem set omits filesystem,
-socket, directory, and general I/O gems, but custom gem selections can add
-ambient authority. Treat the helper as defense in depth for crash and resource
-containment; add an external OS/container sandbox before running fully hostile
-code with access-sensitive deployments.
+socket, directory, and general I/O gems. If the explicit authority override is
+used for a profile that can access host assets, that code runs as the same OS
+user as the helper. Treat the helper as defense in depth for crash and
+resource containment; add an external OS/container sandbox before running
+fully hostile code with access-sensitive deployments.

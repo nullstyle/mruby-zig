@@ -90,6 +90,36 @@ Note that without `mruby-bigint`, integer *literals* beyond the int32 pool
 range raise `RangeError` at load time (upstream 4.0 behavior); computed
 values up to ±2^63 work fine.
 
+Every catalog entry declares the conservative authority its Ruby-visible
+surface can expose. The generic worker is omitted when the selected profile
+includes filesystem, network, process, environment, or arbitrary native-host
+authority. Both shipped presets are eligible today. A deployment that has
+separately reviewed an ineligible local catalog can acknowledge the risk with:
+
+```sh
+mise x -- zig build -Dallow-worker-ambient-authority=true
+```
+
+When mruby-zig is a dependency, root build options are not forwarded
+automatically. Declare the acknowledgement in the consuming build and pass it
+through explicitly:
+
+```zig
+const allow_worker_ambient_authority = b.option(
+    bool,
+    "allow-worker-ambient-authority",
+    "acknowledge authority exposed by the selected mruby worker profile",
+) orelse false;
+const dep = b.dependency("mruby", .{
+    .target = target,
+    .optimize = optimize,
+    .@"allow-worker-ambient-authority" = allow_worker_ambient_authority,
+});
+```
+
+This option only overrides the build gate; it does not remove, restrict, or
+OS-sandbox that authority. See [workers.md](workers.md).
+
 ## Allocator profile
 
 All mruby allocations flow through `mruby.alloc`, a Zig-side
@@ -117,6 +147,8 @@ const mruby = @import("mruby");
 comptime {
     if (!mruby.features.sandbox_supported)
         @compileError("this application requires the sandbox tier");
+    if (mruby.features.authority.has(.filesystem))
+        @compileError("this application does not admit filesystem authority");
 }
 
 // Works in comptime branches and ordinary runtime code alike.
@@ -131,12 +163,25 @@ if (mruby.features.hasGem("mruby-time")) {
 | --- | --- |
 | `gems`, `hasGem(name)` | The dependency-ordered gem selection; core mruby and the compiler are always present and not listed as gems |
 | `gem_set`, `custom_selection` | Requested preset (`"standard"`/`"minimal"`) and whether `-Dwith-gems`/`-Dwithout-gems` customized it |
+| `AuthorityKind`, `AuthoritySet`, `AuthoritySource`, `AuthorityManifest` | Types for inspecting the build's conservative authority vocabulary and source attribution |
+| `authority` | Aggregate linked authority plus entries for `mruby-core`, `mruby-compiler`, and every selected gem |
+| `authorityForGem(name)` | Authority for a selected gem, or `null` when that gem is not linked; use `authority.find` for core/compiler |
 | `mruby_version` | Version of the vendored mruby |
 | `rite_compatibility_fingerprint` (`_hex`, `epoch`, `rite_binary_version`, `rite_vm_version`) | The artifact compatibility identity this build admits |
 | `pointer_bits`, `endian` | Target constraints (the package requires 64-bit targets) |
 | `has_compiler`, `has_debug_hook` | Always true today: codegen and the sandbox's instruction hook are linked into every build; a future runtime-only profile would flip them |
 | `sandbox_supported` | Debug hook compiled in and the target satisfies the ABI constraint |
-| `worker_process_supported` | The target can run the bundled one-shot worker tier (currently 64-bit Linux and macOS) |
+| `worker_target_supported` | The target alone can host the worker (currently 64-bit Linux and macOS) |
+| `worker_profile_eligible` | The linked authority avoids filesystem, network, process, environment, and arbitrary native-host access |
+| `worker_ambient_authority_opt_in` | True when `-Dallow-worker-ambient-authority` is actively admitting an otherwise-ineligible profile; it records an acknowledgement, not confinement |
+| `worker_process_supported` | The worker artifact/controller are enabled: target support and either profile eligibility or the explicit opt-in |
+
+`AuthorityKind` contains `filesystem`, `network`, `process`, `environment`,
+`clock`, `entropy`, `dynamic_code`, `dynamic_dispatch`, `introspection`,
+`heap_enumeration`, `model_mutation`, `continuations`, `native_host`, and
+`host_output`. These values describe what linked package code can make
+available, not what a particular sandbox policy leaves reachable after
+sealing; see [sandboxing.md](sandboxing.md).
 
 `mruby.alloc.backingAllocationFailures()` exposes a saturating, monotonic
 process-wide diagnostic count of backing-allocator rejections. The worker

@@ -20,6 +20,7 @@
 //!                        examples.
 
 const std = @import("std");
+const authority = @import("build/authority.zig");
 const sources = @import("build/sources.zig");
 const gems_mod = @import("build/gems.zig");
 const gen = @import("build/gen.zig");
@@ -45,7 +46,7 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const sanitize_thread = b.option(bool, "sanitize-thread", "enable ThreadSanitizer") orelse false;
-    const worker_supported = switch (target.result.os.tag) {
+    const worker_target_supported = switch (target.result.os.tag) {
         .linux, .macos => target.result.ptrBitWidth() == 64,
         else => false,
     };
@@ -85,12 +86,26 @@ pub fn build(b: *std.Build) !void {
     const gem_set = explicit_gem_set orelse legacy_gem_set orelse "standard";
     const with_gems = b.option([]const u8, "with-gems", "comma-separated extra gems to enable on top of the gem set");
     const without_gems = b.option([]const u8, "without-gems", "comma-separated gems to remove from the gem set");
+    const allow_worker_ambient_authority = b.option(
+        bool,
+        "allow-worker-ambient-authority",
+        "build the generic worker even when linked gems expose host-access authority",
+    ) orelse false;
 
     const arena = b.graph.arena;
     const mruby_dep = b.dependency("mruby", .{});
     const root = mruby_dep.path("");
 
     const selected_gems = try selectGems(arena, gem_set, with_gems, without_gems);
+    var available_authority = authority.aggregate(&gems_mod.builtin_authority);
+    for (selected_gems) |gem| {
+        available_authority = available_authority.unionWith(gem.authority);
+    }
+    const worker_decision = authority.workerDecision(
+        available_authority,
+        worker_target_supported,
+        allow_worker_ambient_authority,
+    );
     var gem_defines: std.ArrayList([]const u8) = .empty;
     for (selected_gems) |g| {
         for (g.defines) |d| {
@@ -284,6 +299,12 @@ pub fn build(b: *std.Build) !void {
         .sanitize_thread = sanitize_thread,
     });
 
+    const authority_manifest_mod = b.createModule(.{
+        .root_source_file = b.path("build/authority.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mruby_mod = b.addModule("mruby", .{
         .root_source_file = b.path("src/mruby.zig"),
         .target = target,
@@ -291,6 +312,7 @@ pub fn build(b: *std.Build) !void {
         .sanitize_thread = sanitize_thread,
         .link_libc = true,
     });
+    mruby_mod.addImport("authority_manifest", authority_manifest_mod);
     mruby_mod.addImport("worker_protocol", worker_protocol_mod);
     const allocator_config = b.addOptions();
     allocator_config.addOption(bool, "use_arena", allocator_profile == .arena);
@@ -313,6 +335,35 @@ pub fn build(b: *std.Build) !void {
         var gem_names: std.ArrayList([]const u8) = .empty;
         for (selected_gems) |gem| try gem_names.append(arena, gem.name);
         build_features.addOption([]const []const u8, "gems", gem_names.items);
+        var authority_source_names: std.ArrayList([]const u8) = .empty;
+        var authority_source_bits: std.ArrayList(u16) = .empty;
+        for (gems_mod.builtin_authority) |source| {
+            try authority_source_names.append(arena, source.name);
+            try authority_source_bits.append(arena, source.authority.toBits());
+        }
+        for (selected_gems) |gem| {
+            try authority_source_names.append(arena, gem.name);
+            try authority_source_bits.append(arena, gem.authority.toBits());
+        }
+        build_features.addOption(
+            []const []const u8,
+            "authority_source_names",
+            authority_source_names.items,
+        );
+        build_features.addOption(
+            []const u16,
+            "authority_source_bits",
+            authority_source_bits.items,
+        );
+        build_features.addOption(u16, "authority_bits", available_authority.toBits());
+        build_features.addOption(bool, "worker_target_supported", worker_target_supported);
+        build_features.addOption(bool, "worker_profile_eligible", worker_decision.profile_eligible);
+        build_features.addOption(
+            bool,
+            "worker_ambient_authority_opt_in",
+            worker_decision.ambient_authority_opt_in,
+        );
+        build_features.addOption(bool, "worker_process_supported", worker_decision.enabled);
         build_features.addOption([]const u8, "gem_set", gem_set);
         build_features.addOption(
             bool,
@@ -337,7 +388,7 @@ pub fn build(b: *std.Build) !void {
     }
     // ABI shim: exposes mruby's macro-only inline APIs as plain functions.
     mruby_mod.addCSourceFile(.{ .file = b.path("src/shim.c"), .flags = shim_flags });
-    if (worker_supported) {
+    if (worker_decision.enabled) {
         mruby_mod.addCSourceFile(.{
             .file = b.path("src/worker_spawn.c"),
             .flags = if (target.result.os.tag == .macos)
@@ -366,7 +417,7 @@ pub fn build(b: *std.Build) !void {
     var worker_signal_fixture: ?*std.Build.Step.Compile = null;
     var worker_address_space_fixture: ?*std.Build.Step.Compile = null;
     var worker_sigchld_fixture: ?*std.Build.Step.Compile = null;
-    const worker_executable: ?*std.Build.Step.Compile = if (worker_supported) worker: {
+    const worker_executable: ?*std.Build.Step.Compile = if (worker_decision.enabled) worker: {
         const worker_mod = b.createModule(.{
             .root_source_file = b.path("tools/mruby_worker.zig"),
             .target = target,
@@ -483,6 +534,7 @@ pub fn build(b: *std.Build) !void {
         .sanitize_thread = sanitize_thread,
     });
     test_mod.addImport("mruby", mruby_mod);
+    test_mod.addImport("authority_manifest", authority_manifest_mod);
     const test_config = b.addOptions();
     test_config.addOption(bool, "has_core_language_suite", hasAllGemsExcept(selected_gems, &gems_mod.standard, &.{
         "mruby-enumerator",
@@ -529,6 +581,24 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "run unit and integration tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // Lock the downstream contract for consumers that inspect only
+    // `mruby.features`: libmruby's C objects must still receive the Zig-side
+    // allocator export even when no runtime API declaration is referenced.
+    const features_only_mod = b.createModule(.{
+        .root_source_file = b.path("tools/features_only_consumer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+    });
+    features_only_mod.addImport("mruby", mruby_mod);
+    const features_only_consumer = b.addExecutable(.{
+        .name = "features-only-consumer",
+        .root_module = features_only_mod,
+    });
+    check_step.dependOn(&features_only_consumer.step);
+    const run_features_only_consumer = b.addRunArtifact(features_only_consumer);
+    test_step.dependOn(&run_features_only_consumer.step);
+
     if (worker_mod_for_tests) |worker_mod| {
         const worker_tests = b.addTest(.{ .root_module = worker_mod });
         check_step.dependOn(&worker_tests.step);
@@ -559,6 +629,19 @@ pub fn build(b: *std.Build) !void {
     check_step.dependOn(&gem_tests.step);
     const run_gem_tests = b.addRunArtifact(gem_tests);
     test_step.dependOn(&run_gem_tests.step);
+
+    // The authority module is imported as a data dependency elsewhere, which
+    // does not collect its own test declarations. Keep its fail-closed set and
+    // duplicate-inventory checks as an explicit test root.
+    const authority_tests_mod = b.createModule(.{
+        .root_source_file = b.path("build/authority.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const authority_tests = b.addTest(.{ .root_module = authority_tests_mod });
+    check_step.dependOn(&authority_tests.step);
+    const run_authority_tests = b.addRunArtifact(authority_tests);
+    test_step.dependOn(&run_authority_tests.step);
 
     // Pure StateCapsule parser fuzz target. A normal `zig build test` runs the
     // stable corpus once; `zig build fuzz-state-capsule --fuzz=100K` enables
