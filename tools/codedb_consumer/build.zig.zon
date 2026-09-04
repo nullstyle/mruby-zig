@@ -1,0 +1,9 @@
+.{
+    .name = .codedb_consumer,
+    .version = "0.0.0",
+    .fingerprint = 0xadefeb6c413af2b2,
+    .paths = .{ "build.zig", "build.zig.zon", "main.zig", "billing.rb", "lib.rb" },
+    .dependencies = .{
+        .mruby_zig = .{ .path = "../.." },
+    },
+}

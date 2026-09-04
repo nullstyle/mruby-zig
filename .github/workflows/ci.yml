@@ -26,6 +26,75 @@ jobs:
       - run: mise x -- zig fmt --check .
       - run: mise x -- zig build test
       - run: mise x -- zig build test -Doptimize=ReleaseSafe
+      - name: CodeDB downstream consumer
+        run: >-
+          mise x -- zig build --build-file tools/codedb_consumer/build.zig test
+          --prefix "$RUNNER_TEMP/codedb-consumer"
+      - name: CodeDB declaration order reproducibility
+        run: |
+          mise x -- zig build --build-file tools/codedb_consumer/build.zig test \
+            -Dconsumer_reverse=true --cache-dir "$RUNNER_TEMP/codedb-consumer-reversed-cache" \
+            --prefix "$RUNNER_TEMP/codedb-consumer-reversed"
+          diff -ru "$RUNNER_TEMP/codedb-consumer/codedb" "$RUNNER_TEMP/codedb-consumer-reversed/codedb"
+      - name: CodeDB compile-time rejection
+        run: |
+          for mismatch in schema compatibility authority_profile authority_effective authority_tier; do
+            log="$RUNNER_TEMP/codedb-$mismatch.log"
+            if mise x -- zig build --build-file tools/codedb_consumer/build.zig test \
+                -Dconsumer_mismatch="$mismatch" --prefix "$RUNNER_TEMP/codedb-consumer" >"$log" 2>&1; then
+              cat "$log"
+              exit 1
+            fi
+            case "$mismatch" in
+              schema) expected="unsupported CodeDB manifest schema version" ;;
+              compatibility) expected="CodeDB manifest compiled for" ;;
+              authority_profile) expected="CodeDB authority profile does not match consuming build" ;;
+              authority_effective) expected="CodeDB effective authority does not match declaration" ;;
+              authority_tier) expected="CodeDB authority tier mask does not match its named tier" ;;
+            esac
+            grep -F "$expected" "$log"
+          done
+      - name: CodeDB explicit authority tiers
+        run: |
+          for authority_case in trusted_host custom_worker; do
+            mise x -- zig build --build-file tools/codedb_consumer/build.zig test \
+              -Dconsumer_authority_case="$authority_case" --prefix "$RUNNER_TEMP/codedb-$authority_case"
+          done
+      - name: CodeDB authority rejection
+        run: |
+          for authority_case in forbidden_host missing_host unknown_requirement unknown_host unknown_allowlist narrow_profile; do
+            log="$RUNNER_TEMP/codedb-authority-$authority_case.log"
+            if mise x -- zig build --build-file tools/codedb_consumer/build.zig test \
+                -Dconsumer_authority_case="$authority_case" --prefix "$RUNNER_TEMP/codedb-$authority_case" >"$log" 2>&1; then
+              cat "$log"
+              exit 1
+            fi
+            case "$authority_case" in
+              forbidden_host) expected='host host/filesystem has forbidden authority: filesystem' ;;
+              missing_host) expected='unknown host binding: host/undeclared' ;;
+              unknown_requirement) expected='artifact libraries/"shared" has unknown authority: unknown bits 0x8000' ;;
+              unknown_host) expected='host host/"clock" has unknown authority: unknown bits 0x8000' ;;
+              unknown_allowlist) expected='tier custom has unknown authority: unknown bits 0x8000' ;;
+              narrow_profile) expected='profile mruby-core has forbidden authority:' ;;
+            esac
+            grep -F "$expected" "$log"
+          done
+      - name: CodeDB graph rejection
+        run: |
+          for graph_error in missing duplicate cycle; do
+            log="$RUNNER_TEMP/codedb-graph-$graph_error.log"
+            if mise x -- zig build --build-file tools/codedb_consumer/build.zig test \
+                -Dconsumer_graph_error="$graph_error" --prefix "$RUNNER_TEMP/codedb-consumer" >"$log" 2>&1; then
+              cat "$log"
+              exit 1
+            fi
+            case "$graph_error" in
+              missing) expected='CodeDB: billing/"weekly": unknown dependency: missing/"module"' ;;
+              duplicate) expected='CodeDB: billing/"weekly": duplicate dependency: libraries/"shared"' ;;
+              cycle) expected='CodeDB: dependency cycle includes billing/"weekly" -> libraries/"shared"' ;;
+            esac
+            grep -F "$expected" "$log"
+          done
       - run: mise x -- zig build
       - run: |
           ./zig-out/bin/quickstart
@@ -37,6 +106,72 @@ jobs:
           if ./zig-out/bin/mruby-repl -e "raise 'expected failure'"; then
             exit 1
           fi
+
+  runtime-only:
+    name: runtime only (${{ matrix.os }}, ${{ matrix.gem_set }}, ${{ matrix.optimize }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        gem_set: [standard, minimal]
+        optimize: [Debug, ReleaseSafe]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+      - run: mise install
+      - name: Artifact-only runtime and worker
+        run: >-
+          mise x -- zig build test check install -Dno-compiler=true
+          -Dgem-set=${{ matrix.gem_set }} -Doptimize=${{ matrix.optimize }}
+          --prefix "$RUNNER_TEMP/runtime-only"
+      - name: CodeDB downstream runtime-only consumer
+        run: >-
+          mise x -- zig build --build-file tools/codedb_consumer/build.zig test
+          -Dno-compiler=true -Dgem-set=${{ matrix.gem_set }} -Doptimize=${{ matrix.optimize }}
+          --prefix "$RUNNER_TEMP/codedb-runtime-only"
+      - name: Inspect linked runtime and worker symbols
+        run: >-
+          sh tools/check_runtime_only_symbols.sh
+          "$RUNNER_TEMP/codedb-runtime-only/bin/codedb-consumer"
+          "$RUNNER_TEMP/runtime-only/bin/codedb-demo"
+          "$RUNNER_TEMP/runtime-only/bin/mruby-worker"
+      - name: Compiler profile changes identity with identical gems
+        if: matrix.gem_set == 'minimal' && matrix.optimize == 'ReleaseSafe'
+        run: |
+          mise x -- zig build --build-file tools/codedb_consumer/build.zig test \
+            -Dgem-set=minimal -Dwithout-gems=mruby-eval,mruby-binding -Doptimize=ReleaseSafe \
+            --prefix "$RUNNER_TEMP/codedb-compiler-empty-gems"
+          full="$RUNNER_TEMP/codedb-compiler-empty-gems/codedb/manifest.zig"
+          runtime="$RUNNER_TEMP/codedb-runtime-only/codedb/manifest.zig"
+          full_gems=$(sed -n '/^pub const gems:/,/^};/p' "$full")
+          runtime_gems=$(sed -n '/^pub const gems:/,/^};/p' "$runtime")
+          test -n "$full_gems"
+          test "$full_gems" = "$runtime_gems"
+          full_identity=$(sed -n '/^pub const compatibility:/p' "$full")
+          runtime_identity=$(sed -n '/^pub const compatibility:/p' "$runtime")
+          test -n "$full_identity"
+          test -n "$runtime_identity"
+          test "$full_identity" != "$runtime_identity"
+
+  packaged-consumer:
+    name: packaged consumer (${{ matrix.os }}, ${{ matrix.gem_set }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        gem_set: [standard, minimal]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+      - run: mise install
+      - name: Fetch archive and run relocated compiler-free deployment
+        run: mise x -- bash tools/test_codedb_package.sh ${{ matrix.gem_set }} ReleaseSafe
 
   cross:
     name: cross compile (${{ matrix.target }})
@@ -55,6 +190,8 @@ jobs:
           install: true
       - run: mise install
       - run: mise x -- zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+        continue-on-error: ${{ matrix.target == 'x86_64-windows-gnu' }}
+      - run: mise x -- zig build check -Dno-compiler=true -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
         continue-on-error: ${{ matrix.target == 'x86_64-windows-gnu' }}
 
   thread-sanitizer:
@@ -130,6 +267,10 @@ jobs:
           install: true
       - run: mise install
       - run: mise x -- zig build test -Dgem-set=${{ matrix.gem_set }}
+      - name: CodeDB authority metadata with selected gems
+        run: >-
+          mise x -- zig build --build-file tools/codedb_consumer/build.zig test
+          -Dgem-set=${{ matrix.gem_set }} --prefix "$RUNNER_TEMP/codedb-${{ matrix.gem_set }}"
       - if: matrix.gem_set == 'minimal'
         run: mise x -- zig build -Dgem-set=minimal
       - if: matrix.gem_set == 'minimal'

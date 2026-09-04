@@ -1,0 +1,16 @@
+.{
+    .name = .codedb_package_consumer,
+    .version = "0.0.0",
+    .fingerprint = 0x7c70fe48d551fcf9,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "config.rb",
+        "init.rb",
+        "job.rb",
+        "worker.rb",
+    },
+    // tools/test_codedb_package.sh fetches the archive into an external copy.
+    .dependencies = .{},
+}
