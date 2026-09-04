@@ -21,6 +21,8 @@ pub const Gem = struct {
     /// Conservative Ruby-visible authority exposed by this gem. Intentionally
     /// has no default: adding a catalog entry requires an explicit review.
     authority: authority_mod.Set,
+    /// Requires the target parser/code generator; omitted by runtime-only builds.
+    requires_compiler: bool = false,
     /// C sources, relative to the mruby dependency root.
     c_srcs: []const []const u8 = &.{},
     /// Ruby files, relative to the mruby dependency root; compiled to cdump
@@ -57,7 +59,7 @@ pub const standard = [_]Gem{
     .{ .name = "mruby-metaprog", .authority = auth(&.{ .dynamic_dispatch, .introspection, .model_mutation }), .c_srcs = &.{gemDir("mruby-metaprog") ++ "src/metaprog.c"} },
     .{ .name = "mruby-method", .authority = auth(&.{ .dynamic_dispatch, .introspection }), .c_srcs = &.{gemDir("mruby-method") ++ "src/method.c"}, .rb_files = &.{gemDir("mruby-method") ++ "mrblib/method.rb"}, .deps = &.{"mruby-proc-ext"} },
     .{ .name = "mruby-binding", .authority = auth(&.{.introspection}), .c_srcs = &.{gemDir("mruby-binding") ++ "src/binding.c"} },
-    .{ .name = "mruby-eval", .authority = auth(&.{.dynamic_code}), .c_srcs = &.{gemDir("mruby-eval") ++ "src/eval.c"}, .deps = &.{"mruby-binding"} },
+    .{ .name = "mruby-eval", .authority = auth(&.{.dynamic_code}), .requires_compiler = true, .c_srcs = &.{gemDir("mruby-eval") ++ "src/eval.c"}, .deps = &.{"mruby-binding"} },
     .{ .name = "mruby-compar-ext", .authority = .empty, .rb_files = &.{gemDir("mruby-compar-ext") ++ "mrblib/compar.rb"} },
     .{ .name = "mruby-enum-ext", .authority = .empty, .rb_files = &.{gemDir("mruby-enum-ext") ++ "mrblib/enum.rb"} },
     .{ .name = "mruby-string-ext", .authority = .empty, .c_srcs = &.{gemDir("mruby-string-ext") ++ "src/string.c"}, .rb_files = &.{gemDir("mruby-string-ext") ++ "mrblib/string.rb"} },
@@ -89,7 +91,7 @@ pub const standard = [_]Gem{
 /// extensions beyond core mruby (plus `mruby-eval`, which is tiny and
 /// commonly wanted even in constrained builds).
 pub const minimal = [_]Gem{
-    .{ .name = "mruby-eval", .authority = auth(&.{.dynamic_code}), .c_srcs = &.{gemDir("mruby-eval") ++ "src/eval.c"}, .deps = &.{"mruby-binding"} },
+    .{ .name = "mruby-eval", .authority = auth(&.{.dynamic_code}), .requires_compiler = true, .c_srcs = &.{gemDir("mruby-eval") ++ "src/eval.c"}, .deps = &.{"mruby-binding"} },
 };
 
 /// All gems known to the catalog, used to resolve `-Dwith-gems=...`.
@@ -106,6 +108,7 @@ pub const SelectionOptions = struct {
     gem_set: []const u8,
     with: ?[]const u8 = null,
     without: ?[]const u8 = null,
+    no_compiler: bool = false,
 };
 
 pub const SelectionFailure = struct {
@@ -119,6 +122,7 @@ pub const SelectionFailure = struct {
         unknown_gem,
         unknown_dependency,
         dependency_cycle,
+        compiler_required,
     };
 };
 
@@ -127,6 +131,7 @@ pub const SelectionError = std.mem.Allocator.Error || error{
     UnknownGem,
     UnknownDependency,
     DependencyCycle,
+    CompilerRequired,
 };
 
 /// Resolve one gem configuration into deterministic dependency order.
@@ -149,7 +154,10 @@ pub fn select(
 
     var selected_gems: std.ArrayList(Gem) = .empty;
     defer selected_gems.deinit(allocator);
-    for (base) |gem| try appendUnique(allocator, &selected_gems, gem);
+    for (base) |gem| {
+        if (options.no_compiler and compilerDependency(gem, 0) != null) continue;
+        try appendUnique(allocator, &selected_gems, gem);
+    }
 
     if (options.with) |csv| {
         var it = std.mem.splitScalar(u8, csv, ',');
@@ -160,6 +168,12 @@ pub fn select(
                 failure.* = .{ .kind = .unknown_gem, .name = name };
                 return error.UnknownGem;
             };
+            if (options.no_compiler) {
+                if (compilerDependency(gem, 0)) |required| {
+                    failure.* = .{ .kind = .compiler_required, .name = required, .dependent = gem.name };
+                    return error.CompilerRequired;
+                }
+            }
             try appendUnique(allocator, &selected_gems, gem);
         }
     }
@@ -228,6 +242,18 @@ pub fn select(
         try visit(allocator, selected_gems.items, index, marks, &ordered, failure);
     }
     return ordered.toOwnedSlice(allocator);
+}
+
+// Bound the walk even if a future catalog edit introduces a cycle. The
+// dependency-order validation below supplies the cycle diagnostic.
+fn compilerDependency(gem: Gem, depth: usize) ?[]const u8 {
+    if (gem.requires_compiler) return gem.name;
+    if (depth >= all.len) return null;
+    for (gem.deps) |name| {
+        const dependency = byName(name) orelse continue;
+        if (compilerDependency(dependency, depth + 1)) |required| return required;
+    }
+    return null;
 }
 
 const Visit = enum { unvisited, visiting, visited };
@@ -364,4 +390,50 @@ test "catalog authority is explicit and worker eligible" {
     try std.testing.expect(available.has(.heap_enumeration));
     try std.testing.expect(available.has(.host_output));
     try std.testing.expect(available.workerEligible());
+}
+
+test "runtime-only presets omit compiler consumers before dependency closure" {
+    var failure: SelectionFailure = .{};
+    const minimal_selected = try select(std.testing.allocator, .{
+        .gem_set = "minimal",
+        .no_compiler = true,
+    }, &failure);
+    defer std.testing.allocator.free(minimal_selected);
+    try std.testing.expectEqual(@as(usize, 0), minimal_selected.len);
+
+    const standard_selected = try select(std.testing.allocator, .{
+        .gem_set = "standard",
+        .no_compiler = true,
+    }, &failure);
+    defer std.testing.allocator.free(standard_selected);
+    try std.testing.expect(!containsGem(standard_selected, "mruby-eval"));
+    try std.testing.expect(containsGem(standard_selected, "mruby-binding"));
+    try std.testing.expect(containsGem(standard_selected, "mruby-random"));
+    for (standard_selected) |gem| try std.testing.expect(compilerDependency(gem, 0) == null);
+}
+
+test "runtime-only rejects explicit compiler consumers even when also excluded" {
+    var failure: SelectionFailure = .{};
+    try std.testing.expectError(error.CompilerRequired, select(std.testing.allocator, .{
+        .gem_set = "minimal",
+        .with = "mruby-eval",
+        .without = "mruby-eval",
+        .no_compiler = true,
+    }, &failure));
+    try std.testing.expectEqual(.compiler_required, failure.kind);
+    try std.testing.expectEqualStrings("mruby-eval", failure.name);
+    try std.testing.expectEqualStrings("mruby-eval", failure.dependent);
+}
+
+test "runtime-only keeps independent explicit gems and their dependencies" {
+    var failure: SelectionFailure = .{};
+    const selected = try select(std.testing.allocator, .{
+        .gem_set = "minimal",
+        .with = "mruby-method",
+        .no_compiler = true,
+    }, &failure);
+    defer std.testing.allocator.free(selected);
+    try std.testing.expectEqual(@as(usize, 2), selected.len);
+    try std.testing.expectEqualStrings("mruby-proc-ext", selected[0].name);
+    try std.testing.expectEqualStrings("mruby-method", selected[1].name);
 }

@@ -433,10 +433,17 @@ pub const mrz_sandbox_bootstrap = extern struct {
     hidden: ?*RClass,
     error_root: mrb_value,
     policy_exceptions: mrb_value,
+    random_srand: ?mrb_func_t,
 };
 pub extern fn mrz_protected_sandbox_bootstrap(
     mrb: *mrb_state,
     out: *mrz_sandbox_bootstrap,
+) bool;
+
+pub extern fn mrz_protected_random_seed(
+    mrb: *mrb_state,
+    reseed: mrb_func_t,
+    seed: u32,
 ) bool;
 
 pub const MRZ_COMPILE_OK: u8 = 0;

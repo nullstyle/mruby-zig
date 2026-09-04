@@ -41,8 +41,10 @@ const gas_mod = @import("gas.zig");
 const artifact_mod = @import("artifact.zig");
 const artifact_value = @import("artifact_value.zig");
 const artifact_config = @import("artifact_config");
+const codedb_mod = @import("codedb.zig");
 const arena_mod = @import("arena.zig");
 const authority = @import("authority_manifest");
+const features = @import("features.zig");
 
 pub const Vm = vm_mod.Vm;
 pub const Value = value_mod.Value;
@@ -63,6 +65,7 @@ pub const CompileRiteOptions = struct {
 };
 
 pub const CompileRiteError = std.mem.Allocator.Error || error{
+    CompilerUnavailable,
     CompileFailed,
     InvalidSource,
     InvalidSourceName,
@@ -321,6 +324,11 @@ const IsolateState = struct {
     /// state. It is deliberately non-blocking: accidental same-Isolate
     /// concurrency is reported to the caller instead of stalling.
     operation_lock: std.atomic.Mutex = .unlocked,
+    /// CodeDB's generation belongs to the isolate, so copying a public handle
+    /// cannot reset load-once state or replace a poisoned artifact set.
+    codedb_identity: ?*const anyopaque = null,
+    codedb_loaded: []bool = &.{},
+    codedb_poisoned: bool = false,
 
     // hook/runtime state (owned by the isolate's thread while running)
     termination_bits: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
@@ -363,6 +371,8 @@ const IsolateState = struct {
     /// Cached Time value returned by the non-dispatching `Time.now` callback.
     /// The hidden module's FROZEN_TIME constant keeps it rooted.
     frozen_time: c.mrb_value,
+    /// Original native reseeder captured before the trusted bootstrap window.
+    random_srand: ?c.mrb_func_t,
     /// Exception (as a raw value) behind the last failed run; funcalling
     /// with mrb->exc pending can clobber it, so it is stashed and the
     /// pending state cleared before classification.
@@ -417,6 +427,7 @@ const IsolateState = struct {
                 .observer = fetchHook,
             },
             .frozen_time = c.mrz_nil_value(),
+            .random_srand = bootstrap.random_srand,
             .last_exc = c.mrz_nil_value(),
             .error_root = bootstrap.error_root,
             .policy_exceptions = bootstrap.policy_exceptions,
@@ -446,6 +457,7 @@ const IsolateState = struct {
 
     pub fn deinit(iso: *IsolateState) void {
         iso.clearArtifactDiagnostic();
+        if (iso.codedb_loaded.len != 0) alloc_mod.gpa.free(iso.codedb_loaded);
         const attribution = alloc_mod.pushIsolate(&iso.cell);
         c.mrz_set_sandbox_context(iso.vm.mrb, null);
         iso.vm.deinit();
@@ -458,7 +470,9 @@ const IsolateState = struct {
     /// errors (`ScriptTerminated`, `DeadlineExceeded`, `GasExhausted`,
     /// `MemoryLimitExceeded`, `CallDepthExceeded`); ordinary script errors
     /// as `error.RubyException` (see `iso.lastError()`).
+    /// Runtime-only builds return `CompilerUnavailable` before admission.
     pub fn run(iso: *IsolateState, src: []const u8) !Value {
+        if (comptime !features.has_compiler) return error.CompilerUnavailable;
         return iso.enterExecution(struct {
             fn body(iso_: *IsolateState, src_: []const u8) !Value {
                 return iso_.vm.loadString(src_);
@@ -507,6 +521,79 @@ const IsolateState = struct {
         }
         return iso.enterOuterExecution(Body.load, payload.bytes) catch |err|
             return @errorCast(err);
+    }
+
+    /// Internal half of codedb.load. One lock and one outer execution cover
+    /// the entire dependency closure. Metadata/byte admission precedes all
+    /// guest execution and leaves an existing generation untouched on error.
+    pub fn loadCodeDB(
+        iso: *IsolateState,
+        identity: *const anyopaque,
+        entries: anytype,
+        name: []const u8,
+    ) codedb_mod.LoadError!bool {
+        const requested = for (entries, 0..) |entry, index| {
+            if (std.mem.eql(u8, entry.name, name)) break index;
+        } else return error.UnknownArtifact;
+        if (!entries[requested].entrypoint) return error.NotEntrypoint;
+        const admission = try iso.admitExecution();
+        if (admission == .nested) return error.IsolateThreadBusy;
+        defer iso.operation_lock.unlock();
+        if (iso.codedb_identity) |bound| {
+            if (bound != identity) return error.CodeDBManifestMismatch;
+            if (iso.codedb_poisoned) return error.CodeDBPoisoned;
+            if (iso.codedb_loaded[requested]) return false;
+        }
+
+        // Scratch remains host-owned, like artifact parser scratch. Only the
+        // loaded flags persist; no Ruby result is retained by the loader.
+        const needed = try alloc_mod.gpa.alloc(bool, entries.len);
+        defer alloc_mod.gpa.free(needed);
+        @memset(needed, false);
+        needed[requested] = true;
+        var reverse = requested + 1;
+        while (reverse != 0) {
+            reverse -= 1;
+            if (needed[reverse]) {
+                for (entries[reverse].dependencies) |dependency| needed[dependency] = true;
+            }
+        }
+        const payloads = try alloc_mod.gpa.alloc(?[]const u8, entries.len);
+        defer alloc_mod.gpa.free(payloads);
+        @memset(payloads, null);
+        for (entries, needed, 0..) |entry, required, index| {
+            if (!required or (iso.codedb_identity != null and iso.codedb_loaded[index])) continue;
+            const payload = try artifact_mod.validateRite(.{ .bytes = entry.bytes }, .{
+                .compatibility = artifact_config.rite_compatibility_fingerprint,
+                .application = iso.artifact_acceptance.application,
+                .max_encoded_bytes = iso.artifact_acceptance.limits.max_rite_bytes,
+            });
+            payloads[index] = payload.bytes;
+        }
+        if (iso.codedb_identity == null) {
+            const loaded = try alloc_mod.gpa.alloc(bool, entries.len);
+            @memset(loaded, false);
+            iso.codedb_loaded = loaded;
+            iso.codedb_identity = identity;
+        }
+        _ = iso.enterOuterExecution(struct {
+            fn body(state: *IsolateState, images: []const ?[]const u8) !Value {
+                for (images, 0..) |maybe_image, index| {
+                    const image = maybe_image orelse continue;
+                    const scope = state.vm.arenaScope();
+                    defer scope.restore();
+                    _ = try state.vm.loadIrep(image);
+                    state.codedb_loaded[index] = true;
+                }
+                return state.vm.nilValue();
+            }
+        }.body, @as([]const ?[]const u8, payloads)) catch |err| {
+            // Include policy failures arbitrated AFTER the final initializer,
+            // not just exceptions reported by loadIrep itself.
+            iso.codedb_poisoned = true;
+            return @errorCast(err);
+        };
+        return true;
     }
 
     /// Call a Ruby method under the policy (same error mapping as `run`).
@@ -1154,13 +1241,13 @@ const IsolateState = struct {
             )) return error.RubyException;
         }
         if (caps.random_seed) |seed| {
-            var buf: [64]u8 = undefined;
             const upstream_seed: u32 = @truncate(seed);
-            const src = std.fmt.bufPrint(&buf, "srand({d})", .{upstream_seed}) catch unreachable;
             // Fail loudly (prepare maps this to CapabilityApplicationFailed) if
             // mruby-random is absent: silently skipping srand would leave the
             // isolate non-deterministic while the host believes the pin applied.
-            _ = try iso.vm.loadString(src);
+            const reseed = iso.random_srand orelse return error.RubyException;
+            if (!c.mrz_protected_random_seed(m, reseed, upstream_seed))
+                return error.RubyException;
             try maskMethods(iso, &authority.random_reseed_methods);
         }
         if (caps.clock_epoch_s) |epoch| {
@@ -1427,6 +1514,7 @@ const SandboxBootstrap = struct {
     hidden: *c.RClass,
     error_root: c.mrb_value,
     policy_exceptions: c.mrb_value,
+    random_srand: ?c.mrb_func_t,
 };
 
 /// All sandbox-specific class/root construction can allocate and raise. The C
@@ -1439,6 +1527,7 @@ fn bootstrapSandbox(vm: *Vm) !SandboxBootstrap {
         .hidden = context.hidden orelse return error.OutOfMemory,
         .error_root = context.error_root,
         .policy_exceptions = context.policy_exceptions,
+        .random_srand = context.random_srand,
     };
 }
 
@@ -1488,6 +1577,7 @@ fn compileRaw(
     source_name: ?[]const u8,
     dump_flags: u8,
 ) CompileRiteError!RawRite {
+    if (comptime !features.has_compiler) return error.CompilerUnavailable;
     const vm = Vm.init() catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.CompileFailed,
@@ -1532,6 +1622,7 @@ fn compileRaw(
 
 /// Deprecated compatibility operation: compile `src` to unframed RITE bytes.
 /// It omits mruby-zig's compatibility/application checks; use `compileRite`.
+/// Runtime-only builds return `error.CompilerUnavailable`.
 pub fn compile(src: []const u8) ![]u8 {
     var raw = try compileRaw(src, null, 0);
     defer raw.deinit();
@@ -1539,6 +1630,8 @@ pub fn compile(src: []const u8) ![]u8 {
 }
 
 /// Compile source into a typed, caller-owned RITE artifact.
+/// Returns `CompilerUnavailable` with `-Dno-compiler`; use build-time CodeDB.
+/// Runtime-only builds return `error.CompilerUnavailable`.
 pub fn compileRite(
     allocator: std.mem.Allocator,
     src: []const u8,
@@ -1591,6 +1684,7 @@ pub const Isolate = struct {
     /// errors (`ScriptTerminated`, `DeadlineExceeded`, `GasExhausted`,
     /// `MemoryLimitExceeded`, `CallDepthExceeded`); ordinary script errors
     /// as `error.RubyException` (see `lastError`).
+    /// Runtime-only builds return `error.CompilerUnavailable` before admission.
     pub fn run(iso: Isolate, src: []const u8) !Value {
         return iso.internal.run(src);
     }
@@ -1604,6 +1698,30 @@ pub const Isolate = struct {
     /// Validate and execute a typed RITE image.
     pub fn runRite(iso: Isolate, image: artifact_mod.RiteImageView) RunRiteError!Value {
         return iso.internal.runRite(image);
+    }
+
+    /// Look up and execute a build-compiled CodeDB entry. Generated manifest
+    /// schema/build identity is checked at compile time; each execution still
+    /// validates its envelope, application identity, and policy limits.
+    /// An unknown name returns `error.UnknownArtifact` without entering Ruby.
+    pub fn runArtifact(
+        iso: Isolate,
+        comptime manifest: type,
+        name: []const u8,
+    ) @import("codedb.zig").RunError!Value {
+        return @import("codedb.zig").run(iso, manifest, name);
+    }
+
+    /// Initialize a CodeDB entrypoint and its dependencies once. All modules
+    /// in this call share the policy's execution allowance. Returns false for
+    /// an already-loaded entrypoint. Failed initialization poisons this
+    /// isolate's loader; it cannot be reset or rebound to another manifest.
+    pub fn loadArtifact(
+        iso: Isolate,
+        comptime manifest: type,
+        name: []const u8,
+    ) codedb_mod.LoadError!bool {
+        return codedb_mod.load(iso, manifest, name);
     }
 
     /// Call a Ruby method under the policy (same error mapping as `run`).

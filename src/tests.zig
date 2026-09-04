@@ -50,7 +50,7 @@ test "features: generated manifest matches the build" {
         try std.testing.expect(!features.hasGem("mruby-objectspace"));
     }
 
-    // The compiler and debug hook are always linked; the sandbox is usable.
+    // This source-driven suite uses a compiler-enabled build; both are linked.
     try std.testing.expect(features.has_compiler);
     try std.testing.expect(features.has_debug_hook);
     try std.testing.expect(features.sandbox_supported);
@@ -3305,7 +3305,7 @@ test "sandbox: deterministic RNG and frozen clock" {
     }
 }
 
-test "sandbox: capability bytecode follows the selected gas scope" {
+test "sandbox: native capability setup does not charge bytecode gas" {
     if (!test_config.has_random) return error.SkipZigTest;
 
     const renewable = try spawnSealed(.{
@@ -3315,8 +3315,8 @@ test "sandbox: capability bytecode follows the selected gas scope" {
     defer renewable.deinit();
     _ = try renewable.run("1");
     const renewable_stats = renewable.stats();
-    // The trusted one-time srand setup executes before generation 1.
-    try std.testing.expect(renewable_stats.instructions > renewable_stats.gas.?.observed_instructions);
+    // Native seeding executes no Ruby instructions before generation 1.
+    try std.testing.expectEqual(@as(u128, renewable_stats.instructions), renewable_stats.gas.?.observed_instructions);
     try std.testing.expectEqual(@as(u64, 1), renewable_stats.gas.?.generation);
 
     const lifetime = try spawnSealed(.{
@@ -3326,7 +3326,7 @@ test "sandbox: capability bytecode follows the selected gas scope" {
     defer lifetime.deinit();
     _ = try lifetime.run("1");
     const lifetime_stats = lifetime.stats();
-    // A lifetime meter is active at spawn, so the same setup is charged.
+    // A lifetime meter observes only the subsequently executed Ruby too.
     try std.testing.expectEqual(
         @as(u128, lifetime_stats.instructions),
         lifetime_stats.gas.?.observed_instructions,

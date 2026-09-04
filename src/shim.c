@@ -20,8 +20,10 @@
 #include <mruby/hash.h>
 #include <mruby/string.h>
 #include <mruby/proc.h>
+#ifndef MRZ_NO_COMPILER
 #include <mruby/compile.h>
 #include <mruby/dump.h>
+#endif
 #include <mruby/data.h>
 #include <mruby/throw.h>
 #include <mruby/variable.h>
@@ -110,6 +112,7 @@ mrz_gc_unregister(mrb_state *mrb, mrb_value value)
   mrb_gc_unregister(mrb, value);
 }
 
+#ifndef MRZ_NO_COMPILER
 struct mrz_load_string_context {
   const char *source;
   size_t source_length;
@@ -164,6 +167,7 @@ mrz_protected_load_string(mrb_state *mrb,
   }
   return success;
 }
+#endif
 
 struct mrz_load_irep_context {
   const uint8_t *bytes;
@@ -1008,6 +1012,7 @@ mrz_protected_freeze(mrb_state *mrb, mrb_value value)
   return mrz_protect_result(mrb, mrz_freeze_body, &context, NULL);
 }
 
+#ifndef MRZ_NO_COMPILER
 enum mrz_compile_status {
   MRZ_COMPILE_OK = 0,
   MRZ_COMPILE_FAILED = 1,
@@ -1097,6 +1102,7 @@ mrz_protected_compile(mrb_state *mrb,
   if (out_length != NULL) *out_length = context.length;
   return context.status;
 }
+#endif
 
 struct mrz_exception_metadata {
   mrb_value message;
@@ -1183,6 +1189,7 @@ struct mrz_sandbox_bootstrap {
   struct RClass *hidden;
   mrb_value error_root;
   mrb_value policy_exceptions;
+  mrb_func_t random_srand;
 };
 
 static mrb_value
@@ -1203,6 +1210,14 @@ mrz_sandbox_bootstrap_body(mrb_state *mrb, void *data)
   bootstrap->error_root = mrz_error_root_new(mrb);
   bootstrap->policy_exceptions =
     mrz_policy_exceptions_new(mrb, bootstrap->hidden);
+  /* Capture the linked native implementation before exposing the trusted
+   * bootstrap VM. Sealing must not dispatch to a Ruby override of srand. */
+  struct RClass *kernel = mrb->kernel_module;
+  mrb_method_t reseed = mrb_method_search_vm(
+    mrb, &kernel, mrb_intern_lit(mrb, "srand"));
+  if (MRB_METHOD_CFUNC_P(reseed)) {
+    bootstrap->random_srand = MRB_METHOD_CFUNC(reseed);
+  }
   return mrb_nil_value();
 }
 
@@ -1219,6 +1234,37 @@ mrz_protected_sandbox_bootstrap(mrb_state *mrb,
   if (result.hidden == NULL) return FALSE;
   if (out != NULL) *out = result;
   return TRUE;
+}
+
+struct mrz_random_seed_context {
+  mrb_func_t reseed;
+  uint32_t seed;
+};
+
+static mrb_value
+mrz_random_seed_body(mrb_state *mrb, void *data)
+{
+  struct mrz_random_seed_context *context =
+    (struct mrz_random_seed_context*)data;
+  /* A native Proc supplies the call frame required by upstream mrb_get_args
+   * without compiling source or looking up a guest-replaceable method. */
+  struct RProc *proc = mrb_proc_new_cfunc(mrb, context->reseed);
+  mrb_value seed = mrb_int_value(mrb, (mrb_int)context->seed);
+  return mrb_yield_with_class(
+    mrb, mrb_obj_value(proc), 1, &seed, mrb_top_self(mrb), mrb->kernel_module);
+}
+
+mrb_bool
+mrz_protected_random_seed(mrb_state *mrb, mrb_func_t reseed, uint32_t seed)
+{
+  struct mrz_random_seed_context context = { reseed, seed };
+  int arena = mrb_gc_arena_save(mrb);
+  mrb_bool success =
+    mrz_protect_result(mrb, mrz_random_seed_body, &context, NULL);
+  /* The return value is only the previous integer seed. The pending exception
+   * remains rooted by mrb->exc if the native call raised. */
+  mrb_gc_arena_restore(mrb, arena);
+  return success;
 }
 
 struct mrz_sandbox_context {
@@ -1258,7 +1304,9 @@ mrz_set_sandbox_context(mrb_state *mrb, struct mrz_sandbox_context *context)
 const mrb_irep *mrz_proc_irep(const struct RProc *p) { return p->body.irep; }
 
 /* parse error count */
+#ifndef MRZ_NO_COMPILER
 int mrz_parse_nerr(const struct mrb_parser_state *p) { return (int)p->nerr; }
+#endif
 
 /* Would an exception raised at this program counter be caught by any
  * catch handler of this irep? Mirrors catch_handler_find's coverage rule

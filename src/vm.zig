@@ -8,6 +8,7 @@ const class_mod = @import("class.zig");
 const arena_mod = @import("arena.zig");
 const convert = @import("convert.zig");
 const alloc_mod = @import("alloc.zig");
+const features = @import("features.zig");
 
 pub const Value = value_mod.Value;
 pub const Array = value_mod.Array;
@@ -137,6 +138,8 @@ pub const Vm = struct {
     ///
     /// Source containing an interior NUL is rejected rather than silently
     /// evaluating only the prefix visible to mruby's lexer.
+    /// Returns `error.CompilerUnavailable` in a `-Dno-compiler` build.
+    /// Runtime-only builds return `error.CompilerUnavailable`.
     pub fn loadString(vm: *Vm, src: []const u8) !Value {
         return vm.loadStringWithOptions(src, .{});
     }
@@ -147,6 +150,7 @@ pub const Vm = struct {
         src: []const u8,
         options: LoadOptions,
     ) !Value {
+        if (comptime !features.has_compiler) return error.CompilerUnavailable;
         if (std.mem.indexOfScalar(u8, src, 0) != null) return error.InvalidSource;
         if (options.source_name) |source_name| {
             if (source_name.len == 0 or

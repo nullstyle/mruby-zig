@@ -25,6 +25,17 @@ const sources = @import("build/sources.zig");
 const gems_mod = @import("build/gems.zig");
 const gen = @import("build/gen.zig");
 
+pub const CodeDB = @import("build/codedb.zig");
+
+/// Compile application Ruby for the exact target/gem profile of `dependency`.
+/// Import the returned manifest beside dependency.module("mruby").
+pub fn addCodeDB(b: *std.Build, dependency: *std.Build.Dependency, options: CodeDB.Options) !CodeDB.Bundle {
+    return CodeDB.add(b, .{
+        .mrbc = dependency.namedLazyPath("codedb-mrbc"),
+        .envelope = dependency.namedLazyPath("codedb-envelope"),
+    }, options);
+}
+
 const mruby_version = "4.0.0";
 const rite_binary_version = "04.00";
 const rite_vm_version = "0400";
@@ -45,6 +56,7 @@ const hash_symbol_patch_marker = "mruby-hash-symbol-name-hash=v1";
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const no_compiler = b.option(bool, "no-compiler", "omit the target Ruby parser/code generator; retain build-time mrbc") orelse false;
     const sanitize_thread = b.option(bool, "sanitize-thread", "enable ThreadSanitizer") orelse false;
     const sanitize_c = if (b.option(bool, "sanitize-c", "enable C undefined-behavior detection in unsafe builds") orelse false)
         std.zig.SanitizeC.full
@@ -100,8 +112,12 @@ pub fn build(b: *std.Build) !void {
     const mruby_dep = b.dependency("mruby", .{});
     const root = mruby_dep.path("");
 
-    const selected_gems = try selectGems(arena, gem_set, with_gems, without_gems);
-    var available_authority = authority.aggregate(&gems_mod.builtin_authority);
+    const selected_gems = try selectGems(arena, gem_set, with_gems, without_gems, no_compiler);
+    const builtin_authority: []const authority.Source = if (no_compiler)
+        gems_mod.builtin_authority[0..1]
+    else
+        &gems_mod.builtin_authority;
+    var available_authority = authority.aggregate(builtin_authority);
     for (selected_gems) |gem| {
         available_authority = available_authority.unionWith(gem.authority);
     }
@@ -237,7 +253,7 @@ pub fn build(b: *std.Build) !void {
             });
         }
     }
-    try addTreeFiles(arena, &lib_scan, root, &sources.compiler_srcs, "compiler");
+    if (!no_compiler) try addTreeFiles(arena, &lib_scan, root, &sources.compiler_srcs, "compiler");
     var gem_include_dirs: std.ArrayList(std.Build.LazyPath) = .empty;
     for (selected_gems) |g| {
         for (g.c_srcs) |s| {
@@ -259,6 +275,7 @@ pub fn build(b: *std.Build) !void {
         var d: std.ArrayList([]const u8) = .empty;
         try d.appendSlice(arena, gem_defines.items);
         try d.append(arena, "-DMRB_USE_DEBUG_HOOK");
+        if (no_compiler) try d.append(arena, "-DMRZ_NO_COMPILER");
         try d.appendSlice(arena, portable_container_flags);
         try d.appendSlice(arena, ro_data_flags);
         break :defines d.items;
@@ -277,6 +294,7 @@ pub fn build(b: *std.Build) !void {
         // Enables mrb->code_fetch_hook (NULL-guarded per-instruction call
         // site) used by the sandboxing layer for limits and termination.
         try f.append(arena, "-DMRB_USE_DEBUG_HOOK");
+        if (no_compiler) try f.append(arena, "-DMRZ_NO_COMPILER");
         try f.appendSlice(arena, portable_container_flags);
         try f.append(arena, no_c_fuzz_coverage);
         try f.appendSlice(arena, ro_data_flags);
@@ -287,6 +305,7 @@ pub fn build(b: *std.Build) !void {
     const shim_flags = flags: {
         var f: std.ArrayList([]const u8) = .empty;
         try f.appendSlice(arena, &.{ "-Wall", "-Wextra", "-DMRB_USE_DEBUG_HOOK" });
+        if (no_compiler) try f.append(arena, "-DMRZ_NO_COMPILER");
         try f.appendSlice(arena, portable_container_flags);
         try f.append(arena, no_c_fuzz_coverage);
         try f.appendSlice(arena, ro_data_flags);
@@ -331,26 +350,27 @@ pub fn build(b: *std.Build) !void {
         selected_gems,
         mruby_dep.builder.pkg_hash,
         lib_presym_dir,
+        no_compiler,
     );
     mruby_mod.addImport("artifact_config", artifact_config);
     // Comptime feature manifest: everything here is known at configure time
     // (gem selection resolves above), so plain build options suffice and
     // consumers get correct build-graph dependencies through the module.
+    var authority_source_names: std.ArrayList([]const u8) = .empty;
+    var authority_source_bits: std.ArrayList(u16) = .empty;
+    for (builtin_authority) |source| {
+        try authority_source_names.append(arena, source.name);
+        try authority_source_bits.append(arena, source.authority.toBits());
+    }
+    for (selected_gems) |gem| {
+        try authority_source_names.append(arena, gem.name);
+        try authority_source_bits.append(arena, gem.authority.toBits());
+    }
     const build_features = b.addOptions();
     {
         var gem_names: std.ArrayList([]const u8) = .empty;
         for (selected_gems) |gem| try gem_names.append(arena, gem.name);
         build_features.addOption([]const []const u8, "gems", gem_names.items);
-        var authority_source_names: std.ArrayList([]const u8) = .empty;
-        var authority_source_bits: std.ArrayList(u16) = .empty;
-        for (gems_mod.builtin_authority) |source| {
-            try authority_source_names.append(arena, source.name);
-            try authority_source_bits.append(arena, source.authority.toBits());
-        }
-        for (selected_gems) |gem| {
-            try authority_source_names.append(arena, gem.name);
-            try authority_source_bits.append(arena, gem.authority.toBits());
-        }
         build_features.addOption(
             []const []const u8,
             "authority_source_names",
@@ -371,6 +391,7 @@ pub fn build(b: *std.Build) !void {
         );
         build_features.addOption(bool, "worker_process_supported", worker_decision.enabled);
         build_features.addOption([]const u8, "gem_set", gem_set);
+        build_features.addOption(bool, "has_compiler", !no_compiler);
         build_features.addOption(
             bool,
             "custom_selection",
@@ -384,7 +405,7 @@ pub fn build(b: *std.Build) !void {
     for (sources.core_srcs) |path| {
         if (!std.mem.eql(u8, path, "src/hash.c")) try lib_files.append(arena, path);
     }
-    try lib_files.appendSlice(arena, &sources.compiler_srcs);
+    if (!no_compiler) try lib_files.appendSlice(arena, &sources.compiler_srcs);
     for (selected_gems) |g| try lib_files.appendSlice(arena, g.c_srcs);
     mruby_mod.addCSourceFiles(.{ .root = root, .files = lib_files.items, .flags = lib_flags });
     mruby_mod.addCSourceFile(.{ .file = patched_hash, .flags = lib_flags });
@@ -414,7 +435,7 @@ pub fn build(b: *std.Build) !void {
 
     const check_step = b.step(
         "check",
-        "compile all tests, tools, and examples without running them",
+        "compile supported tests, tools, and examples for the selected profile",
     );
 
     // One-shot process-isolated RITE worker. The controller takes this exact
@@ -523,78 +544,84 @@ pub fn build(b: *std.Build) !void {
         break :worker executable;
     } else null;
 
-    // REPL tool.
-    const repl_mod = b.createModule(.{
-        .root_source_file = b.path("tools/repl.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = sanitize_thread,
-        .sanitize_c = sanitize_c,
-    });
-    repl_mod.addImport("mruby", mruby_mod);
-    const repl = b.addExecutable(.{ .name = "mruby-repl", .root_module = repl_mod });
-    check_step.dependOn(&repl.step);
-    b.installArtifact(repl);
-    const run_repl = b.addRunArtifact(repl);
-    run_repl.step.dependOn(b.getInstallStep());
-    const repl_step = b.step("run-repl", "interactive mruby REPL");
-    repl_step.dependOn(&run_repl.step);
+    if (!no_compiler) {
+        // REPL tool.
+        const repl_mod = b.createModule(.{
+            .root_source_file = b.path("tools/repl.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        repl_mod.addImport("mruby", mruby_mod);
+        const repl = b.addExecutable(.{ .name = "mruby-repl", .root_module = repl_mod });
+        check_step.dependOn(&repl.step);
+        b.installArtifact(repl);
+        const run_repl = b.addRunArtifact(repl);
+        run_repl.step.dependOn(b.getInstallStep());
+        const repl_step = b.step("run-repl", "interactive mruby REPL");
+        repl_step.dependOn(&run_repl.step);
+    } else {
+        unsupportedCompilerStep(b, "run-repl", "interactive mruby REPL");
+    }
 
-    // Tests.
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = sanitize_thread,
-        .sanitize_c = sanitize_c,
-    });
-    test_mod.addImport("mruby", mruby_mod);
-    test_mod.addImport("authority_manifest", authority_manifest_mod);
-    const test_config = b.addOptions();
-    test_config.addOption(bool, "has_core_language_suite", hasAllGemsExcept(selected_gems, &gems_mod.standard, &.{
-        "mruby-enumerator",
-        "mruby-enum-lazy",
-        "mruby-set",
-        "mruby-pack",
-    }));
-    test_config.addOption(bool, "has_numerics_suite", hasNamedGems(selected_gems, &.{
-        "mruby-eval",
-        "mruby-numeric-ext",
-        "mruby-string-ext",
-        "mruby-math",
-    }));
-    test_config.addOption(bool, "has_string_ext", hasGem(selected_gems, "mruby-string-ext"));
-    test_config.addOption(bool, "has_math", hasGem(selected_gems, "mruby-math"));
-    test_config.addOption(bool, "has_random", hasGem(selected_gems, "mruby-random"));
-    test_config.addOption(bool, "has_time", hasGem(selected_gems, "mruby-time"));
-    test_config.addOption(bool, "has_object_space", hasGem(selected_gems, "mruby-objectspace"));
-    test_config.addOption(bool, "sanitize_thread", sanitize_thread);
-    if (worker_executable) |executable| {
-        test_config.addOptionPath("worker_executable", executable.getEmittedBin());
-    } else {
-        test_config.addOption([]const u8, "worker_executable", "");
+    const test_step = b.step("test", "run unit and integration tests for the selected profile");
+    if (!no_compiler) {
+        // Tests.
+        const test_mod = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        test_mod.addImport("mruby", mruby_mod);
+        test_mod.addImport("authority_manifest", authority_manifest_mod);
+        const test_config = b.addOptions();
+        test_config.addOption(bool, "has_core_language_suite", hasAllGemsExcept(selected_gems, &gems_mod.standard, &.{
+            "mruby-enumerator",
+            "mruby-enum-lazy",
+            "mruby-set",
+            "mruby-pack",
+        }));
+        test_config.addOption(bool, "has_numerics_suite", hasNamedGems(selected_gems, &.{
+            "mruby-eval",
+            "mruby-numeric-ext",
+            "mruby-string-ext",
+            "mruby-math",
+        }));
+        test_config.addOption(bool, "has_string_ext", hasGem(selected_gems, "mruby-string-ext"));
+        test_config.addOption(bool, "has_math", hasGem(selected_gems, "mruby-math"));
+        test_config.addOption(bool, "has_random", hasGem(selected_gems, "mruby-random"));
+        test_config.addOption(bool, "has_time", hasGem(selected_gems, "mruby-time"));
+        test_config.addOption(bool, "has_object_space", hasGem(selected_gems, "mruby-objectspace"));
+        test_config.addOption(bool, "sanitize_thread", sanitize_thread);
+        if (worker_executable) |executable| {
+            test_config.addOptionPath("worker_executable", executable.getEmittedBin());
+        } else {
+            test_config.addOption([]const u8, "worker_executable", "");
+        }
+        if (worker_descendant_fixture) |fixture| {
+            test_config.addOptionPath("worker_descendant_fixture", fixture.getEmittedBin());
+        } else {
+            test_config.addOption([]const u8, "worker_descendant_fixture", "");
+        }
+        if (worker_signal_fixture) |fixture| {
+            test_config.addOptionPath("worker_signal_fixture", fixture.getEmittedBin());
+        } else {
+            test_config.addOption([]const u8, "worker_signal_fixture", "");
+        }
+        if (worker_address_space_fixture) |fixture| {
+            test_config.addOptionPath("worker_address_space_fixture", fixture.getEmittedBin());
+        } else {
+            test_config.addOption([]const u8, "worker_address_space_fixture", "");
+        }
+        test_mod.addOptions("test_config", test_config);
+        const unit_tests = b.addTest(.{ .root_module = test_mod });
+        check_step.dependOn(&unit_tests.step);
+        const run_unit_tests = b.addRunArtifact(unit_tests);
+        test_step.dependOn(&run_unit_tests.step);
     }
-    if (worker_descendant_fixture) |fixture| {
-        test_config.addOptionPath("worker_descendant_fixture", fixture.getEmittedBin());
-    } else {
-        test_config.addOption([]const u8, "worker_descendant_fixture", "");
-    }
-    if (worker_signal_fixture) |fixture| {
-        test_config.addOptionPath("worker_signal_fixture", fixture.getEmittedBin());
-    } else {
-        test_config.addOption([]const u8, "worker_signal_fixture", "");
-    }
-    if (worker_address_space_fixture) |fixture| {
-        test_config.addOptionPath("worker_address_space_fixture", fixture.getEmittedBin());
-    } else {
-        test_config.addOption([]const u8, "worker_address_space_fixture", "");
-    }
-    test_mod.addOptions("test_config", test_config);
-    const unit_tests = b.addTest(.{ .root_module = test_mod });
-    check_step.dependOn(&unit_tests.step);
-    const run_unit_tests = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "run unit and integration tests");
-    test_step.dependOn(&run_unit_tests.step);
 
     // Lock the downstream contract for consumers that inspect only
     // `mruby.features`: libmruby's C objects must still receive the Zig-side
@@ -700,159 +727,355 @@ pub fn build(b: *std.Build) !void {
     );
     fuzz_state_materialize_step.dependOn(&run_state_materialize_fuzz_tests.step);
 
-    // The integration suite above roots at src/tests.zig and pulls in the
-    // library as an imported module, so Zig never collects the `test` blocks
-    // that live *inside* the mruby module (src/convert.zig, src/alloc.zig,
-    // ...). Run those with the module itself as the test root; src/mruby.zig's
-    // aggregator (`_ = @import(...)`) reaches every test-bearing file.
-    const mod_tests = b.addTest(.{ .root_module = mruby_mod });
-    check_step.dependOn(&mod_tests.step);
-    const run_mod_tests = b.addRunArtifact(mod_tests);
-    test_step.dependOn(&run_mod_tests.step);
+    if (!no_compiler) {
+        // The integration suite above roots at src/tests.zig and pulls in the
+        // library as an imported module, so Zig never collects the `test` blocks
+        // that live *inside* the mruby module (src/convert.zig, src/alloc.zig,
+        // ...). Run those with the module itself as the test root; src/mruby.zig's
+        // aggregator (`_ = @import(...)`) reaches every test-bearing file.
+        const mod_tests = b.addTest(.{ .root_module = mruby_mod });
+        check_step.dependOn(&mod_tests.step);
+        const run_mod_tests = b.addRunArtifact(mod_tests);
+        test_step.dependOn(&run_mod_tests.step);
+    }
+
+    // Preserve compiler-independent module coverage when the source-driven
+    // mruby module test root is excluded from a runtime-only build.
+    if (no_compiler) {
+        for ([_][]const u8{ "src/artifact.zig", "src/alloc.zig" }) |path| {
+            const pure_mod = b.createModule(.{
+                .root_source_file = b.path(path),
+                .target = target,
+                .optimize = optimize,
+                .sanitize_thread = sanitize_thread,
+                .sanitize_c = sanitize_c,
+                .link_libc = true,
+            });
+            pure_mod.addOptions("allocator_config", allocator_config);
+            const pure_tests = b.addTest(.{ .root_module = pure_mod });
+            check_step.dependOn(&pure_tests.step);
+            const run_pure_tests = b.addRunArtifact(pure_tests);
+            test_step.dependOn(&run_pure_tests.step);
+        }
+    }
 
     const worker_protocol_tests = b.addTest(.{ .root_module = worker_protocol_mod });
     check_step.dependOn(&worker_protocol_tests.step);
     const run_worker_protocol_tests = b.addRunArtifact(worker_protocol_tests);
     test_step.dependOn(&run_worker_protocol_tests.step);
 
-    // A real producer and consumer executable exchange the encoded capsule
-    // through captured stdout/stdin. They are separately linked OS processes;
-    // the consumer restores into a new Isolate and checks the complete graph.
-    const capsule_producer_mod = b.createModule(.{
-        .root_source_file = b.path("tools/state_capsule_process_producer.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = sanitize_thread,
-        .sanitize_c = sanitize_c,
-    });
-    capsule_producer_mod.addImport("mruby", mruby_mod);
-    const capsule_producer = b.addExecutable(.{
-        .name = "state-capsule-process-producer",
-        .root_module = capsule_producer_mod,
-    });
-    check_step.dependOn(&capsule_producer.step);
-    const run_capsule_producer = b.addRunArtifact(capsule_producer);
-    const transferred_capsule = run_capsule_producer.captureStdOut(.{
-        .basename = "state-capsule.bin",
-    });
-
-    const capsule_consumer_mod = b.createModule(.{
-        .root_source_file = b.path("tools/state_capsule_process_consumer.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = sanitize_thread,
-        .sanitize_c = sanitize_c,
-    });
-    capsule_consumer_mod.addImport("mruby", mruby_mod);
-    const capsule_consumer = b.addExecutable(.{
-        .name = "state-capsule-process-consumer",
-        .root_module = capsule_consumer_mod,
-    });
-    check_step.dependOn(&capsule_consumer.step);
-    const run_capsule_consumer = b.addRunArtifact(capsule_consumer);
-    run_capsule_consumer.setStdIn(.{ .lazy_path = transferred_capsule });
-    test_step.dependOn(&run_capsule_consumer.step);
-    const process_fixture_step = b.step(
-        "test-state-capsule-process",
-        "transfer a StateCapsule between producer and consumer processes",
-    );
-    process_fixture_step.dependOn(&run_capsule_consumer.step);
-
-    // Examples.
-    const ex_names = [_][]const u8{ "quickstart", "host_functions", "exceptions", "sandbox" };
-    for (ex_names) |ex_name| {
-        const ex_mod = b.createModule(.{
-            .root_source_file = b.path(b.fmt("examples/{s}.zig", .{ex_name})),
+    if (!no_compiler) {
+        // A real producer and consumer executable exchange the encoded capsule
+        // through captured stdout/stdin. They are separately linked OS processes;
+        // the consumer restores into a new Isolate and checks the complete graph.
+        const capsule_producer_mod = b.createModule(.{
+            .root_source_file = b.path("tools/state_capsule_process_producer.zig"),
             .target = target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
             .sanitize_c = sanitize_c,
         });
-        ex_mod.addImport("mruby", mruby_mod);
-        const ex = b.addExecutable(.{ .name = ex_name, .root_module = ex_mod });
-        check_step.dependOn(&ex.step);
-        b.installArtifact(ex);
+        capsule_producer_mod.addImport("mruby", mruby_mod);
+        const capsule_producer = b.addExecutable(.{
+            .name = "state-capsule-process-producer",
+            .root_module = capsule_producer_mod,
+        });
+        check_step.dependOn(&capsule_producer.step);
+        const run_capsule_producer = b.addRunArtifact(capsule_producer);
+        const transferred_capsule = run_capsule_producer.captureStdOut(.{
+            .basename = "state-capsule.bin",
+        });
 
-        const run_cmd = b.addRunArtifact(ex);
-        run_cmd.step.dependOn(b.getInstallStep());
-        const run_step = b.step(b.fmt("run-{s}", .{ex_name}), b.fmt("run the {s} example", .{ex_name}));
-        run_step.dependOn(&run_cmd.step);
+        const capsule_consumer_mod = b.createModule(.{
+            .root_source_file = b.path("tools/state_capsule_process_consumer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        capsule_consumer_mod.addImport("mruby", mruby_mod);
+        const capsule_consumer = b.addExecutable(.{
+            .name = "state-capsule-process-consumer",
+            .root_module = capsule_consumer_mod,
+        });
+        check_step.dependOn(&capsule_consumer.step);
+        const run_capsule_consumer = b.addRunArtifact(capsule_consumer);
+        run_capsule_consumer.setStdIn(.{ .lazy_path = transferred_capsule });
+        test_step.dependOn(&run_capsule_consumer.step);
+        const process_fixture_step = b.step(
+            "test-state-capsule-process",
+            "transfer a StateCapsule between producer and consumer processes",
+        );
+        process_fixture_step.dependOn(&run_capsule_consumer.step);
+    } else {
+        unsupportedCompilerStep(b, "test-state-capsule-process", "transfer a source-produced StateCapsule between processes");
     }
 
-    // CodeDB phase 1: compile application Ruby at build time with the host
-    // mrbc (two passes; rite_envelope gates determinism), wrap into typed
-    // envelopes, and emit an embeddable manifest module.
-    const codedb_sources = [_][]const u8{ "accumulate", "dispatch" };
+    if (!no_compiler) {
+        // Examples.
+        const ex_names = [_][]const u8{ "quickstart", "host_functions", "exceptions", "sandbox" };
+        for (ex_names) |ex_name| {
+            const ex_mod = b.createModule(.{
+                .root_source_file = b.path(b.fmt("examples/{s}.zig", .{ex_name})),
+                .target = target,
+                .optimize = optimize,
+                .sanitize_thread = sanitize_thread,
+                .sanitize_c = sanitize_c,
+            });
+            ex_mod.addImport("mruby", mruby_mod);
+            const ex = b.addExecutable(.{ .name = ex_name, .root_module = ex_mod });
+            check_step.dependOn(&ex.step);
+            b.installArtifact(ex);
+
+            const run_cmd = b.addRunArtifact(ex);
+            run_cmd.step.dependOn(b.getInstallStep());
+            const run_step = b.step(b.fmt("run-{s}", .{ex_name}), b.fmt("run the {s} example", .{ex_name}));
+            run_step.dependOn(&run_cmd.step);
+        }
+    } else {
+        for ([_][]const u8{ "quickstart", "host_functions", "exceptions", "sandbox" }) |name| {
+            unsupportedCompilerStep(b, b.fmt("run-{s}", .{name}), b.fmt("run the {s} example", .{name}));
+        }
+    }
+
+    // Share configured host tools with downstream build scripts. Named lazy
+    // paths do not install host executables into the target deployment.
     const artifact_lib_mod = b.createModule(.{
         .root_source_file = b.path("src/artifact.zig"),
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     });
     const rite_envelope = hostTool(b, "tools/rite_envelope.zig");
+    const codedb_graph_mod = b.createModule(.{
+        .root_source_file = b.path("build/codedb_graph.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
     rite_envelope.root_module.addImport("artifact", artifact_lib_mod);
     rite_envelope.root_module.addImport("artifact_config", artifact_config);
-    const envelope_run = b.addRunArtifact(rite_envelope);
-    const codedb_dir = envelope_run.addOutputDirectoryArg("codedb");
-    for (codedb_sources) |name| {
-        const rb = b.path(b.fmt("examples/codedb/{s}.rb", .{name}));
-        const mrbc_a = b.addRunArtifact(mrbc);
-        mrbc_a.addArg("-g");
-        mrbc_a.addArg("-o");
-        const pass_a = mrbc_a.addOutputFileArg(b.fmt("{s}_a.mrb", .{name}));
-        mrbc_a.addFileArg(rb);
-        const mrbc_b = b.addRunArtifact(mrbc);
-        mrbc_b.addArg("-g");
-        mrbc_b.addArg("-o");
-        const pass_b = mrbc_b.addOutputFileArg(b.fmt("{s}_b.mrb", .{name}));
-        mrbc_b.addFileArg(rb);
-        envelope_run.addArg(name);
-        envelope_run.addFileArg(pass_a);
-        envelope_run.addFileArg(pass_b);
-    }
-    const codedb_manifest_mod = b.createModule(.{
-        .root_source_file = codedb_dir.path(b, "manifest.zig"),
-        .target = target,
-        .optimize = optimize,
+    rite_envelope.root_module.addImport("codedb_graph", codedb_graph_mod);
+    const codedb_authority_mod = b.createModule(.{
+        .root_source_file = b.path("build/authority.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
     });
+    rite_envelope.root_module.addImport("authority_manifest", codedb_authority_mod);
+    const codedb_features = b.addOptions();
+    codedb_features.addOption([]const []const u8, "authority_source_names", authority_source_names.items);
+    codedb_features.addOption([]const u16, "authority_source_bits", authority_source_bits.items);
+    codedb_features.addOption([]const u8, "gem_set", gem_set);
+    var codedb_gems: std.ArrayList([]const u8) = .empty;
+    for (selected_gems) |gem| try codedb_gems.append(arena, gem.name);
+    codedb_features.addOption([]const []const u8, "gems", codedb_gems.items);
+    const codedb_features_mod = codedb_features.createModule();
+    rite_envelope.root_module.addImport("codedb_features", codedb_features_mod);
+    b.addNamedLazyPath("codedb-mrbc", mrbc.getEmittedBin());
+    b.addNamedLazyPath("codedb-envelope", rite_envelope.getEmittedBin());
+    const codedb_tools: CodeDB.Tools = .{
+        .mrbc = mrbc.getEmittedBin(),
+        .envelope = rite_envelope.getEmittedBin(),
+    };
+    // Package examples/tests must work with every selectable linked profile.
+    // Applications default to the stricter worker tier in addCodeDB.
+    const codedb_bundle = try CodeDB.add(b, codedb_tools, .{ .tier = .trusted, .sources = &.{
+        .{ .name = "accumulate", .source = b.path("examples/codedb/accumulate.rb") },
+        .{ .name = "dispatch", .source = b.path("examples/codedb/dispatch.rb") },
+        .{ .name = "invoice", .source = b.path("examples/codedb/invoice.rb"), .source_name = "billing/invoice.rb", .dependencies = &.{"billing"}, .entrypoint = false },
+        .{ .name = "billing", .source = b.path("examples/codedb/billing.rb"), .dependencies = &.{"discounts"} },
+        .{ .name = "discounts", .source = b.path("examples/codedb/discounts.rb"), .entrypoint = false },
+    } });
     const codedb_demo_mod = b.createModule(.{
         .root_source_file = b.path("examples/codedb_demo.zig"),
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
     });
     codedb_demo_mod.addImport("mruby", mruby_mod);
-    codedb_demo_mod.addAnonymousImport("codedb_manifest", .{
-        .root_source_file = codedb_dir.path(b, "manifest.zig"),
-    });
+    codedb_demo_mod.addImport("codedb_manifest", codedb_bundle.manifest);
     const codedb_demo = b.addExecutable(.{ .name = "codedb-demo", .root_module = codedb_demo_mod });
     check_step.dependOn(&codedb_demo.step);
     b.installArtifact(codedb_demo);
     const run_codedb_demo = b.addRunArtifact(codedb_demo);
-    run_codedb_demo.step.dependOn(b.getInstallStep());
     const codedb_step = b.step("run-codedb-demo", "run the CodeDB build-time compilation demo");
     codedb_step.dependOn(&run_codedb_demo.step);
-    _ = codedb_manifest_mod;
+    const codedb_test_step = b.step("test-codedb", "test CodeDB generation, metadata, and policy admission");
+    if (!no_compiler) {
+        var test_sources: std.ArrayList(CodeDB.Source) = .empty;
+        for ([_][]const u8{ "answer", "source", "trace", "loop" }) |name| {
+            try test_sources.append(arena, .{
+                .name = name,
+                .source = b.path(b.fmt("src/tests_codedb/{s}.rb", .{name})),
+                .source_name = b.fmt("tests/{s}.rb", .{name}),
+            });
+        }
+        const test_bundle = try CodeDB.add(b, codedb_tools, .{ .tier = .trusted, .sources = test_sources.items });
+        const app_bundle = try CodeDB.add(b, codedb_tools, .{ .tier = .trusted, .sources = &.{.{
+            .name = "answer",
+            .source = b.path("src/tests_codedb/answer.rb"),
+            .source_name = "tests/answer.rb",
+            .application = @splat(0x42),
+        }} });
+        const graph_definitions = [_]struct { name: []const u8, dependencies: []const []const u8 = &.{}, entrypoint: bool = false }{
+            .{ .name = "main", .dependencies = &.{ "right", "left" }, .entrypoint = true },
+            .{ .name = "left", .dependencies = &.{"base"} },
+            .{ .name = "right", .dependencies = &.{"base"} },
+            .{ .name = "base" },
+            .{ .name = "secondary", .dependencies = &.{"base"}, .entrypoint = true },
+            .{ .name = "unused" },
+            .{ .name = "failure", .dependencies = &.{"base"} },
+            .{ .name = "failed_root", .dependencies = &.{"failure"}, .entrypoint = true },
+            .{ .name = "gas_base" },
+            .{ .name = "gas_main", .dependencies = &.{"gas_base"}, .entrypoint = true },
+            .{ .name = "gate", .entrypoint = true },
+        };
+        var graph_sources: std.ArrayList(CodeDB.Source) = .empty;
+        for (graph_definitions) |definition| try graph_sources.append(arena, .{
+            .name = definition.name,
+            .source = b.path(b.fmt("src/tests_codedb/graph_{s}.rb", .{definition.name})),
+            .source_name = b.fmt("graph/{s}.rb", .{definition.name}),
+            .dependencies = definition.dependencies,
+            .entrypoint = definition.entrypoint,
+            .host_bindings = if (std.mem.eql(u8, definition.name, "gate")) &.{"CodeDBGate.call"} else &.{},
+        });
+        const graph_bundle = try CodeDB.add(b, codedb_tools, .{
+            .tier = .trusted,
+            .sources = graph_sources.items,
+            // This test callback only coordinates admission/termination; it exposes
+            // no host assets or arbitrary native operation to Ruby.
+            .host_bindings = &.{.{ .name = "CodeDBGate.call", .authority = .empty }},
+        });
+        const other_graph_bundle = try CodeDB.add(b, codedb_tools, .{ .tier = .trusted, .sources = &.{.{
+            .name = "main",
+            .source = b.path("src/tests_codedb/answer.rb"),
+        }} });
+        const codedb_tests_mod = b.createModule(.{
+            .root_source_file = b.path("src/codedb_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        codedb_tests_mod.addImport("mruby", mruby_mod);
+        codedb_tests_mod.addImport("codedb_manifest", test_bundle.manifest);
+        codedb_tests_mod.addImport("codedb_app_manifest", app_bundle.manifest);
+        codedb_tests_mod.addImport("codedb_graph_manifest", graph_bundle.manifest);
+        codedb_tests_mod.addImport("codedb_graph_other_manifest", other_graph_bundle.manifest);
+        const codedb_tests = b.addTest(.{ .root_module = codedb_tests_mod });
+        check_step.dependOn(&codedb_tests.step);
+        const run_codedb_tests = b.addRunArtifact(codedb_tests);
+        codedb_test_step.dependOn(&run_codedb_tests.step);
+    }
 
-    // Benchmarks.
-    const bench_mod = b.createModule(.{
-        .root_source_file = b.path("tools/bench.zig"),
+    var runtime_sources: std.ArrayList(CodeDB.Source) = .empty;
+    for ([_][]const u8{ "answer", "loop", "random", "reseed", "eval", "init", "job", "depth", "memory", "ensure_loop", "input", "raise" }) |name| {
+        try runtime_sources.append(arena, .{
+            .name = name,
+            .source = b.path(b.fmt("src/tests_runtime_only/{s}.rb", .{name})),
+            .source_name = b.fmt("runtime/{s}.rb", .{name}),
+            .entrypoint = !std.mem.eql(u8, name, "init"),
+            .dependencies = if (std.mem.eql(u8, name, "job")) &.{"init"} else &.{},
+        });
+    }
+    const runtime_bundle = try CodeDB.add(b, codedb_tools, .{ .tier = .trusted, .sources = runtime_sources.items });
+    const runtime_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime_only_tests.zig"),
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
         .sanitize_c = sanitize_c,
     });
-    bench_mod.addImport("mruby", mruby_mod);
-    const bench = b.addExecutable(.{ .name = "mruby-bench", .root_module = bench_mod });
-    check_step.dependOn(&bench.step);
-    b.installArtifact(bench);
-    const run_bench_cmd = b.addRunArtifact(bench);
-    run_bench_cmd.step.dependOn(b.getInstallStep());
-    const bench_step = b.step("run-bench", "run the runtime benchmarks");
-    bench_step.dependOn(&run_bench_cmd.step);
+    runtime_tests_mod.addImport("mruby", mruby_mod);
+    runtime_tests_mod.addImport("codedb_runtime_manifest", runtime_bundle.manifest);
+    const runtime_config = b.addOptions();
+    runtime_config.addOption(bool, "expected_no_compiler", no_compiler);
+    if (worker_executable) |executable| {
+        runtime_config.addOptionPath("worker_executable", executable.getEmittedBin());
+    } else {
+        runtime_config.addOption([]const u8, "worker_executable", "");
+    }
+    runtime_tests_mod.addOptions("runtime_only_config", runtime_config);
+    const runtime_tests = b.addTest(.{ .root_module = runtime_tests_mod });
+    check_step.dependOn(&runtime_tests.step);
+    const run_runtime_tests = b.addRunArtifact(runtime_tests);
+    const runtime_test_step = b.step("test-runtime-only", "test artifact-only execution with the selected compiler profile");
+    runtime_test_step.dependOn(&run_runtime_tests.step);
+    codedb_test_step.dependOn(runtime_test_step);
+    codedb_test_step.dependOn(&run_codedb_demo.step);
+    test_step.dependOn(codedb_test_step);
+
+    const envelope_tests_mod = b.createModule(.{
+        .root_source_file = b.path("tools/rite_envelope.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    envelope_tests_mod.addImport("artifact", artifact_lib_mod);
+    envelope_tests_mod.addImport("artifact_config", artifact_config);
+    envelope_tests_mod.addImport("codedb_graph", codedb_graph_mod);
+    envelope_tests_mod.addImport("authority_manifest", codedb_authority_mod);
+    envelope_tests_mod.addImport("codedb_features", codedb_features_mod);
+    const envelope_tests = b.addTest(.{ .root_module = envelope_tests_mod });
+    check_step.dependOn(&envelope_tests.step);
+    const run_envelope_tests = b.addRunArtifact(envelope_tests);
+    codedb_test_step.dependOn(&run_envelope_tests.step);
+
+    const codedb_build_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("build/codedb.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    check_step.dependOn(&codedb_build_tests.step);
+    const run_codedb_build_tests = b.addRunArtifact(codedb_build_tests);
+    codedb_test_step.dependOn(&run_codedb_build_tests.step);
+
+    const graph_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("build/codedb_graph.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    check_step.dependOn(&graph_tests.step);
+    const run_graph_tests = b.addRunArtifact(graph_tests);
+    codedb_test_step.dependOn(&run_graph_tests.step);
+
+    const codedb_authority_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("build/codedb_authority.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    check_step.dependOn(&codedb_authority_tests.step);
+    const run_codedb_authority_tests = b.addRunArtifact(codedb_authority_tests);
+    codedb_test_step.dependOn(&run_codedb_authority_tests.step);
+
+    if (!no_compiler) {
+        // Benchmarks.
+        const bench_mod = b.createModule(.{
+            .root_source_file = b.path("tools/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        bench_mod.addImport("mruby", mruby_mod);
+        const bench = b.addExecutable(.{ .name = "mruby-bench", .root_module = bench_mod });
+        check_step.dependOn(&bench.step);
+        b.installArtifact(bench);
+        const run_bench_cmd = b.addRunArtifact(bench);
+        run_bench_cmd.step.dependOn(b.getInstallStep());
+        const bench_step = b.step("run-bench", "run the runtime benchmarks");
+        bench_step.dependOn(&run_bench_cmd.step);
+    } else {
+        unsupportedCompilerStep(b, "run-bench", "run source-driven runtime benchmarks");
+    }
 }
 
 // --------------------------------------------------------------------------
 // helpers
+
+fn unsupportedCompilerStep(b: *std.Build, name: []const u8, description: []const u8) void {
+    const step = b.step(name, description);
+    const failure = b.addFail(b.fmt("{s} requires the target Ruby compiler; omit -Dno-compiler", .{name}));
+    step.dependOn(&failure.step);
+}
 
 const ScanInput = struct {
     lp: std.Build.LazyPath,
@@ -880,6 +1103,7 @@ fn artifactConfigModule(
     selected_gems: []const gems_mod.Gem,
     mruby_package_hash: []const u8,
     final_presym_dir: std.Build.LazyPath,
+    no_compiler: bool,
 ) !*std.Build.Module {
     const pointer_bits = target.ptrBitWidth();
     if (pointer_bits != 32 and pointer_bits != 64) {
@@ -888,6 +1112,7 @@ fn artifactConfigModule(
 
     var semantic_defines: std.ArrayList([]const u8) = .empty;
     try semantic_defines.append(arena, "MRB_USE_DEBUG_HOOK");
+    if (no_compiler) try semantic_defines.append(arena, "MRZ_NO_COMPILER");
     try semantic_defines.appendSlice(arena, &.{
         "MRB_STR_LENGTH_MAX=0",
         "MRB_ARY_LENGTH_MAX=0",
@@ -962,12 +1187,14 @@ fn selectGems(
     gem_set: []const u8,
     with: ?[]const u8,
     without: ?[]const u8,
+    no_compiler: bool,
 ) ![]const gems_mod.Gem {
     var failure: gems_mod.SelectionFailure = .{};
     return gems_mod.select(arena, .{
         .gem_set = gem_set,
         .with = with,
         .without = without,
+        .no_compiler = no_compiler,
     }, &failure) catch |err| {
         switch (failure.kind) {
             .unknown_gem_set => std.debug.print(
@@ -985,6 +1212,10 @@ fn selectGems(
             .dependency_cycle => std.debug.print(
                 "error: gem dependency cycle includes {s}\n",
                 .{failure.name},
+            ),
+            .compiler_required => std.debug.print(
+                "error: -Dwith-gems={s} requires compiler-dependent gem {s}, incompatible with -Dno-compiler\n",
+                .{ failure.dependent, failure.name },
             ),
             .none => {},
         }

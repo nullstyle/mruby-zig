@@ -20,7 +20,8 @@
 //!
 //! The manifest is generated per build: `-Dgem-set`, `-Dwith-gems`, and
 //! `-Dwithout-gems` change `gems`/`gem_set`/`custom_selection`, and the
-//! compatibility identity follows the presym table and target traits.
+//! compiler profile is exposed as `has_compiler`, and the compatibility
+//! identity follows the compiler profile, presym table, and target traits.
 
 const std = @import("std");
 
@@ -34,8 +35,8 @@ pub const AuthoritySource = authority_types.Source;
 pub const AuthorityManifest = authority_types.Manifest;
 
 /// Gems linked into this build, in dependency-respecting initialization
-/// order (dependencies first). Core mruby and the compiler are always
-/// present and are not listed as gems.
+/// order (dependencies first). Core mruby and the optional target compiler
+/// are not listed as gems.
 pub const gems: []const []const u8 = config.gems;
 
 /// Whether `name` is part of this build's gem selection. Callable at
@@ -50,8 +51,8 @@ pub fn hasGem(name: []const u8) bool {
 /// Requested preset: "standard" or "minimal".
 pub const gem_set: []const u8 = config.gem_set;
 
-/// True when `-Dwith-gems` or `-Dwithout-gems` customized the selection,
-/// meaning `gem_set` alone does not describe the linked gems.
+/// True when `-Dwith-gems` or `-Dwithout-gems` customized the selection.
+/// The `has_compiler` profile also affects which preset gems are linked.
 pub const custom_selection: bool = config.custom_selection;
 
 const authority_sources = blk: {
@@ -114,9 +115,9 @@ pub const endian: std.builtin.Endian = @import("builtin").target.cpu.arch.endian
 pub const has_debug_hook: bool = true;
 
 /// The mruby compiler (parser + codegen) is linked in, so `Vm.loadString`
-/// and the RITE compilers are available. Always true today; a future
-/// runtime-only profile would set this false.
-pub const has_compiler: bool = true;
+/// and the RITE compilers are available. False with `-Dno-compiler`; the
+/// build-time host compiler remains available to generate CodeDB artifacts.
+pub const has_compiler: bool = config.has_compiler;
 
 /// Whether the sandboxing tier is usable in this build: the debug hook
 /// must be compiled in and the target must satisfy the ABI constraint.

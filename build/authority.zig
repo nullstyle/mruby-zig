@@ -8,6 +8,8 @@
 
 const std = @import("std");
 
+pub const CodeDB = @import("codedb_authority.zig");
+
 /// Authority a linked source can expose to Ruby code. These are conservative
 /// labels, not claims that the corresponding capability is automatically
 /// granted by every policy.
