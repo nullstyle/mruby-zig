@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+Generated comptime feature manifest:
+
+- Added `mruby.features`, generated per build from the resolved gem
+  selection and target: `gems`/`hasGem` (dependency-ordered selection),
+  `gem_set`/`custom_selection`, `mruby_version`, the RITE compatibility
+  identity (`rite_compatibility_fingerprint` and hex/epoch/version
+  re-exports), `pointer_bits`/`endian` target constraints, and
+  `has_compiler`/`has_debug_hook`/`sandbox_supported` availability flags.
+  Applications can use ordinary `comptime` branches instead of duplicating
+  build knowledge or discovering features at runtime.
+- Manifest tests cross-check `hasGem` against the profile-derived test
+  flags across the standard, minimal, and customized gem selections.
+
 Deny-by-default sandbox policy with explicit trust presets:
 
 - `Policy.capabilities` is now deny-by-default: the zero value strips `eval`,

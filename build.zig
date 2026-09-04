@@ -291,6 +291,24 @@ pub fn build(b: *std.Build) !void {
         lib_presym_dir,
     );
     mruby_mod.addImport("artifact_config", artifact_config);
+    // Comptime feature manifest: everything here is known at configure time
+    // (gem selection resolves above), so plain build options suffice and
+    // consumers get correct build-graph dependencies through the module.
+    const build_features = b.addOptions();
+    {
+        var gem_names: std.ArrayList([]const u8) = .empty;
+        for (selected_gems) |gem| try gem_names.append(arena, gem.name);
+        build_features.addOption([]const []const u8, "gems", gem_names.items);
+        build_features.addOption([]const u8, "gem_set", gem_set);
+        build_features.addOption(
+            bool,
+            "custom_selection",
+            with_gems != null or without_gems != null,
+        );
+        build_features.addOption([]const u8, "mruby_version", mruby_version);
+        build_features.addOption(u16, "pointer_bits", target.result.ptrBitWidth());
+    }
+    mruby_mod.addOptions("build_features", build_features);
     var lib_files: std.ArrayList([]const u8) = .empty;
     for (sources.core_srcs) |path| {
         if (!std.mem.eql(u8, path, "src/hash.c")) try lib_files.append(arena, path);

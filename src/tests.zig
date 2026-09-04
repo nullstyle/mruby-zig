@@ -8,6 +8,62 @@ test {
     _ = mruby;
 }
 
+test "features: generated manifest matches the build" {
+    const features = mruby.features;
+
+    // The selection lists its gems, in order, without duplicates, and
+    // hasGem agrees with list membership.
+    try std.testing.expect(features.gems.len > 0);
+    for (features.gems, 0..) |name, i| {
+        try std.testing.expect(name.len > 0);
+        try std.testing.expect(features.hasGem(name));
+        for (features.gems[0..i]) |earlier| {
+            try std.testing.expect(!std.mem.eql(u8, earlier, name));
+        }
+    }
+    try std.testing.expect(!features.hasGem("mruby-not-a-gem"));
+
+    // Gem-derived test_config flags must agree with the manifest across
+    // every gem profile this suite runs under.
+    try std.testing.expectEqual(test_config.has_object_space, features.hasGem("mruby-objectspace"));
+    try std.testing.expectEqual(test_config.has_random, features.hasGem("mruby-random"));
+    try std.testing.expectEqual(test_config.has_time, features.hasGem("mruby-time"));
+    try std.testing.expectEqual(test_config.has_string_ext, features.hasGem("mruby-string-ext"));
+    try std.testing.expectEqual(test_config.has_math, features.hasGem("mruby-math"));
+
+    // Both shipped presets include mruby-eval; the minimal preset is its
+    // dependency closure (mruby-binding + mruby-eval) and nothing else.
+    try std.testing.expect(features.hasGem("mruby-eval"));
+    try std.testing.expect(features.hasGem("mruby-binding"));
+    if (std.mem.eql(u8, features.gem_set, "minimal") and !features.custom_selection) {
+        try std.testing.expectEqual(@as(usize, 2), features.gems.len);
+        try std.testing.expect(!features.hasGem("mruby-objectspace"));
+    }
+
+    // The compiler and debug hook are always linked; the sandbox is usable.
+    try std.testing.expect(features.has_compiler);
+    try std.testing.expect(features.has_debug_hook);
+    try std.testing.expect(features.sandbox_supported);
+    try std.testing.expectEqual(@as(u16, 64), features.pointer_bits);
+
+    // Identity surfaces are consistent with the artifact config.
+    try std.testing.expectEqual(
+        @as(usize, features.rite_compatibility_fingerprint_hex.len / 2),
+        features.rite_compatibility_fingerprint.len,
+    );
+    try std.testing.expect(features.rite_compatibility_epoch > 0);
+    try std.testing.expect(features.mruby_version.len > 0);
+    try std.testing.expect(features.rite_binary_version.len > 0);
+    try std.testing.expect(features.rite_vm_version.len > 0);
+}
+
+test "features: manifest is usable in comptime branches" {
+    const present = comptime mruby.features.hasGem("mruby-eval");
+    const absent = comptime !mruby.features.hasGem("mruby-not-a-gem");
+    try std.testing.expect(present and absent);
+    comptime std.debug.assert(mruby.features.sandbox_supported);
+}
+
 // ---- ruby integration suite ----------------------------------------------
 
 const ruby_suites = .{

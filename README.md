@@ -303,6 +303,38 @@ Note that without `mruby-bigint`, integer *literals* beyond the int32 pool
 range raise `RangeError` at load time (upstream 4.0 behavior); computed
 values up to ±2^63 work fine.
 
+## Feature manifest
+
+`mruby.features` is generated per build from the resolved gem selection
+and target, so applications branch at compile time instead of duplicating
+build knowledge or probing at runtime:
+
+```zig
+const mruby = @import("mruby");
+
+comptime {
+    if (!mruby.features.sandbox_supported)
+        @compileError("this application requires the sandbox tier");
+}
+
+// Works in comptime branches and ordinary runtime code alike.
+if (mruby.features.hasGem("mruby-time")) {
+    _ = try vm.loadString("t = Time.now.to_i");
+} else {
+    _ = try vm.loadString("t = 0");
+}
+```
+
+| Member | Meaning |
+| --- | --- |
+| `gems`, `hasGem(name)` | The dependency-ordered gem selection; core mruby and the compiler are always present and not listed as gems |
+| `gem_set`, `custom_selection` | Requested preset (`"standard"`/`"minimal"`) and whether `-Dwith-gems`/`-Dwithout-gems` customized it |
+| `mruby_version` | Version of the vendored mruby |
+| `rite_compatibility_fingerprint` (`_hex`, `epoch`, `rite_binary_version`, `rite_vm_version`) | The artifact compatibility identity this build admits |
+| `pointer_bits`, `endian` | Target constraints (the package requires 64-bit targets) |
+| `has_compiler`, `has_debug_hook` | Always true today: codegen and the sandbox's instruction hook are linked into every build; a future runtime-only profile would flip them |
+| `sandbox_supported` | Debug hook compiled in and the target satisfies the ABI constraint |
+
 ## Sandboxing
 
 `mruby.sandbox.Isolate` wraps a private `Vm` (its own heap, symbols, and
