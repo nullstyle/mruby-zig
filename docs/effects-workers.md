@@ -148,6 +148,17 @@ Linux installs a parent-death signal before exec and checks the original broker
 identity, covering broker death during startup. The host must not use competing child
 reapers or change its SIGCHLD disposition while a worker is active.
 
+All four platform combinations have passed the confined-worker suite
+(`test-effects-worker`, including the seccomp/close_range confinement probes)
+and the durable recovery suite locally: Linux aarch64 in a container and Linux
+x86_64 in a QEMU TCG virtual machine (Alpine, 6.12 kernel, pinned toolchain),
+plus native macOS aarch64. Emulated x86_64 userspace on an aarch64 kernel is
+not a valid combination: the seccomp filter checks the audit architecture, and
+Rosetta-style translation previously failed descriptor closure with `ENOSYS`.
+GitHub Actions `ubuntu-latest` (x86_64) and `macos-latest` (aarch64) run these
+suites on every push. The VM run covers syscall semantics, not x86_64-specific
+performance.
+
 Defaults are 30 seconds for the complete record-plus-verification wall budget,
 30 CPU seconds per child, and 256 MiB of combined sent/received bytes per child.
 The protocol caps a frame body at 64 MiB and wall budgets at ten minutes.
