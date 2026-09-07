@@ -173,9 +173,16 @@ sidecar files individually. See SQLite's [WAL documentation](https://www.sqlite.
 This remains a small application example. Ruby receives bounded domain
 operations; trusted host adapters own the SQL and local-recipient payloads.
 Source schema 3 intentionally rejects earlier schema-1 and schema-2 ledgers
-with `UnsupportedDurableSchema` instead of migrating them. Use a fresh
-directory for the typed example and retain old ledgers with their original
-application. Schema migration, downgrades, replicated acceptance, production
-delivery, retention, signed receipts, and operational reconciliation remain
+with `UnsupportedDurableSchema` instead of migrating them in place. Schema-2
+ledgers have an explicit offline path: the installed
+[migrator](migrate.zig) validates everything under an operator-named
+application and builds a fresh schema-3 ledger beside the untouched source:
+
+```sh
+./zig-out/bin/effects-durable-migrate ./old-schema2.sqlite ./migrated.sqlite inventory/v1
+```
+
+Schema-1 ledgers stay read-only-rejected. Downgrades, replicated acceptance,
+production delivery, signed receipts, and operational reconciliation remain
 application responsibilities. The earlier [inventory example](../inventory/README.md) keeps
 its separate disposable in-memory workflow.

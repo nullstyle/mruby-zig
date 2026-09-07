@@ -166,6 +166,12 @@ pub const Statement = struct {
         if (value.len > max_value_bytes) return error.DatabaseValueTooLarge;
         try check(sqlite3_bind_blob(self.handle, try self.bindIndex(index), if (value.len == 0) "" else value.ptr, @intCast(value.len), transient));
     }
+    /// Rebind a statement that reached `.done` for another row. Only valid
+    /// after a completed step; binds from the previous row are cleared.
+    pub fn reset(self: *Statement) void {
+        _ = sqlite3_reset(self.handle);
+        self.state = .ready;
+    }
     pub fn step(self: *Statement) Error!Step {
         if (self.state == .done or self.state == .failed) return error.DatabaseStatementState;
         switch (sqlite3_step(self.handle)) {
@@ -257,6 +263,7 @@ extern "c" fn sqlite3_limit(*sqlite3, c_int, c_int) c_int;
 extern "c" fn sqlite3_exec(*sqlite3, [*:0]const u8, ExecCallback, ?*anyopaque, ?*?[*:0]u8) c_int;
 extern "c" fn sqlite3_prepare_v2(*sqlite3, [*]const u8, c_int, *?*sqlite3_stmt, *?[*]const u8) c_int;
 extern "c" fn sqlite3_finalize(*sqlite3_stmt) c_int;
+extern "c" fn sqlite3_reset(*sqlite3_stmt) c_int;
 extern "c" fn sqlite3_step(*sqlite3_stmt) c_int;
 extern "c" fn sqlite3_bind_parameter_count(*sqlite3_stmt) c_int;
 extern "c" fn sqlite3_bind_int64(*sqlite3_stmt, c_int, i64) c_int;

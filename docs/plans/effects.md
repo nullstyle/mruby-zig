@@ -446,6 +446,21 @@ execute again. Native x86_64 confined workers are now locally validated as
 well (QEMU VM, Alpine 6.12 kernel, pinned toolchain); all four supported
 platform combinations have passed the confined-worker suite.
 
+## Ledger-migration milestone
+
+Schema-2 ledgers now have one explicit, offline way forward instead of
+permanent rejection. The installed `effects-durable-migrate` reads a
+schema-2 source ledger, validates the accepted state and every receipt,
+terminal graph, and effect trace under an operator-named application's
+contracts, and builds a fresh schema-3 ledger beside it: namespace and role
+carry over, every historical turn gains a version record pinned to the named
+application (provenance is an explicit input, never inferred), and
+admissions, reservations, outbox delivery flags, stock, and retry identity
+survive bit for bit. A rejected migration creates no target at all, and the
+source is never written; cutover is an explicit operator action. Schema-1
+ledgers remain read-only-rejected — their SQL-shaped domain predates the
+typed contracts and is archived rather than reinterpreted.
+
 ## How it meets the consensus prototype later
 
 `bugnest-1` reported that a turn runs against a private SQLite snapshot before
