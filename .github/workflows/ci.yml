@@ -233,10 +233,16 @@ jobs:
         run: >-
           "$RUNNER_TEMP/effects-strict/bin/effects-reservation"
           "$RUNNER_TEMP/effects-strict/bin/effects-reservation-child"
-      - name: Installed durable turn and recovery demo
-        run: >-
-          "$RUNNER_TEMP/effects-strict/bin/effects-durable"
-          "$RUNNER_TEMP/effects-strict/bin/effects-durable-child"
+      - name: Installed durable turn, upgrade and recovery demo
+        run: |
+          "$RUNNER_TEMP/effects-strict/bin/effects-durable" \
+            "$RUNNER_TEMP/effects-strict/bin/effects-durable-child" \
+            "$RUNNER_TEMP/effects-strict/bin/effects-durable-child-v2" \
+            "$RUNNER_TEMP/durable-demo"
+          "$RUNNER_TEMP/effects-strict/bin/effects-durable" \
+            "$RUNNER_TEMP/effects-strict/bin/effects-durable-child" \
+            "$RUNNER_TEMP/effects-strict/bin/effects-durable-child-v2" \
+            "$RUNNER_TEMP/durable-demo"
       - name: Installed inert receipt inspector
         run: |
           mise x -- zig build make-effects-inspect-fixture -Deffects-strict=true -Doptimize=${{ matrix.optimize }} -- "$RUNNER_TEMP/inspection.receipt"
