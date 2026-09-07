@@ -6,7 +6,7 @@
 //! This application adapter is intentionally separate from the VM library.
 const std = @import("std");
 const mruby = @import("mruby");
-const applications = @import("durable_applications");
+pub const applications = @import("durable_applications");
 pub const contract = applications.versions[0].contract;
 pub const sql = @import("sql.zig");
 pub const delivery = @import("delivery.zig");
@@ -500,7 +500,7 @@ pub const Host = struct {
         if (self.in_use or !self.db.autocommit()) return error.HostBusy;
         self.in_use = true;
     }
-    fn rollback(self: *Host) void {
+    pub fn rollback(self: *Host) void {
         if (!self.db.autocommit()) self.db.exec("ROLLBACK") catch {
             self.poisoned = true;
         };
@@ -1016,7 +1016,7 @@ fn field(value: data.Ref, name: []const u8) !data.Ref {
     return (try value.get(name)) orelse error.InvalidTurnResult;
 }
 /// Whole-turn shape of an application ordinal from this build's table.
-fn shapeAt(ordinal: usize) *const Turn.Contract {
+pub fn shapeAt(ordinal: usize) *const Turn.Contract {
     var shape: ?*const Turn.Contract = null;
     inline for (applications.versions, 0..) |app, index| {
         if (index == ordinal) shape = app.turn_shape;
@@ -1053,7 +1053,7 @@ fn identifyApplication(comptime app: applications.Descriptor, namespace: []const
         .application = application.finalResult(),
     };
 }
-fn validateValue(shape: *const Turn.Contract, value: data.Ref, comptime side: anytype, diagnostic: ?*Turn.Diagnostic) !void {
+pub fn validateValue(shape: *const Turn.Contract, value: data.Ref, comptime side: anytype, diagnostic: ?*Turn.Diagnostic) !void {
     if (shape.validate(side, value)) |mismatch| {
         if (diagnostic) |output| output.* = .{ .kind = .contract, .origin = .broker, .phase = switch (side) {
             .input, .state => .setup,

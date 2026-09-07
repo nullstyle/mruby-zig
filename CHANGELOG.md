@@ -4,6 +4,14 @@
 
 Experimental explicit effects (see docs/effects.md):
 
+- Schema-2 durable ledgers gain an explicit offline migration path: the
+  installed `effects-durable-migrate` validates the accepted state and every
+  receipt under an operator-named application and writes a fresh schema-3
+  ledger beside the untouched source, carrying namespace, admissions, turns
+  (with newly pinned version provenance), reservations, outbox flags, stock,
+  and exact retry identity. Rejected migrations create no target; schema-1
+  ledgers remain read-only-rejected. See docs/effects-durable.md.
+
 - The durable example gains explicit retention: `Host.prune` archives
   acknowledged turns below a revision bound to a write-ahead JSON archive
   (ID, revision, pinned application identity, base64 receipt) and removes

@@ -335,11 +335,29 @@ in SQLite's [threading contract](https://www.sqlite.org/threadsafe.html).
 The typed example uses source ledger schema **3**, which adds the pinned
 application identity, per-turn version records, and the upgrade journal.
 Opening a schema-1 or schema-2 ledger returns `UnsupportedDurableSchema` and
-preserves it; no automatic migration is
-performed. Use a fresh dedicated directory for this example, retaining old
-ledgers with their original application for recovery. Exactly one upgrade path
-(`inventory/v1` → `inventory/v2`) is demonstrated; downgrades, multi-version
-fan-out beyond two build-time-known versions, and migration of older ledger
-schemas remain unsupported. There is no ledger retention, migration
-implementation, background dispatcher,
-replicated commit protocol, or production transport in this example.
+preserves it; migration is never automatic. Exactly one upgrade path
+(`inventory/v1` → `inventory/v2`) is demonstrated; downgrades and multi-version
+fan-out beyond two build-time-known versions remain unsupported. There is no
+background dispatcher, replicated commit protocol, or production transport in
+this example.
+
+Schema-2 ledgers have one explicit, offline way forward: the installed
+`effects-durable-migrate` tool builds a fresh schema-3 ledger beside the
+source, which is only ever read:
+
+```sh
+./zig-out/bin/effects-durable-migrate ./old-schema2.sqlite ./migrated.sqlite inventory/v1
+```
+
+The operator names the application every historical turn is pinned to —
+version provenance is an explicit input, never inferred, because schema-2
+ledgers predate per-turn version records. The accepted state and every
+receipt, terminal graph, and effect trace are validated under that
+application's contracts before the target is created, so a rejected
+migration leaves no target ledger at all. The source keeps its namespace and
+role; admissions, turns (now with version records), reservations, outbox
+delivery flags, stock, and the accepted state carry over byte for byte, and
+retry identity survives: a migrated committed request reuses its original
+receipt and replays bit for bit. Schema-1 ledgers remain permanently
+read-only-rejected; their SQL-shaped domain model predates the typed turn
+contracts and is archived rather than reinterpreted.
