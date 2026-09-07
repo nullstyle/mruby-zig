@@ -179,7 +179,8 @@ For a contained worker with native adapters retained in the host, run
 `mise x -- zig build run-effects-worker -Deffects-strict=true` and see
 [effects-workers.md](effects-workers.md).
 The [durable host guide](effects-durable.md) covers atomic persistence, stable
-request IDs, process-crash recovery, and deferred local delivery.
+request IDs, process-crash recovery, deferred local delivery, and controlled
+application upgrades with historical replay.
 Use `mise x -- zig build run-effects-inspect-demo` to inspect a constructed
 receipt without executing Ruby. [Diagnostics and inspection](effects-diagnostics.md)
 covers worker failures, source locations, and safe JSON reports.
