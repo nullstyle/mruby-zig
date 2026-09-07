@@ -4,6 +4,14 @@
 
 Experimental explicit effects (see docs/effects.md):
 
+- The durable example gains explicit retention: `Host.prune` archives
+  acknowledged turns below a revision bound to a write-ahead JSON archive
+  (ID, revision, pinned application identity, base64 receipt) and removes
+  their rows in one transaction. Pruning refuses undelivered intents, batches
+  at most 256 receipts, leaves zero-turn archives untouched, and never prunes
+  immutable admissions, so pruned IDs can only stale or conflict, never
+  re-execute. See docs/effects-durable.md.
+
 - The durable example now pins an explicit application identity in its ledger
   and demonstrates one controlled upgrade from `inventory/v1` to `inventory/v2`
   (state gains an explicit OutOfStock rejection counter). `Host.open` takes one
