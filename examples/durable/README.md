@@ -157,6 +157,39 @@ preparation, commit, recipient commit, and delivery
 acknowledgement, plus retry identity and competing writers. These tests exercise
 process-crash recovery; they do not simulate power loss or faulty storage.
 
+## HTTP delivery
+
+The local recipient above demonstrates the deduplication contract over a
+second SQLite database. [http_delivery.zig](http_delivery.zig) and
+[http_recipient.zig](http_recipient.zig) add a production-transport adapter
+example with the same contract: the installed `effects-durable-http-recipient`
+binary serves the identical durable recipient logic behind loopback HTTP as a
+test double for a real recipient service, and `http_delivery.dispatch` is the
+client side.
+
+```sh
+./zig-out/bin/effects-durable-http-recipient ./recipient.sqlite
+```
+
+The double binds an ephemeral loopback port, prints one `LISTENING <port>`
+line on stdout once its database is initialized, and serves until killed.
+Each delivery is `POST /<destination>` with the stable intent ID in an
+explicit `Idempotency-Key` header and the exact outbox payload bytes as the
+request body. The dispatcher delivers up to 64 pending committed intents per
+call and acknowledges the source only after a 200 response, in its own
+transaction, exactly like the local path — including the crash window: a
+dispatcher that dies after the recipient commits but before the source
+acknowledgement re-sends the identical bytes, and the recipient's stored key
+prevents a second notification.
+
+This establishes retryable delivery with transport-specific deduplication
+for recipients that durably record the idempotency key. It does not make
+HTTP delivery exactly-once: a service that ignores the key sees duplicates,
+and the example itself has no TLS, authentication, rate limiting, or
+timeouts. The tests cover byte-identical transport, the crash window,
+key-reuse conflicts (409), and fail-closed behavior while the recipient is
+down; they run as part of `test-effects-durable`.
+
 ## Storage and scope
 
 Both databases require WAL mode and `synchronous=FULL`; macOS also enables

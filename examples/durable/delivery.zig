@@ -86,7 +86,10 @@ pub fn deliverOne(allocator: std.mem.Allocator, source: *sql.Db, recipient: *sql
     return true;
 }
 
-fn acknowledge(source: *sql.Db, pending: Pending) !void {
+/// Acknowledge one delivered intent in its own source transaction, matching
+/// the complete immutable row. A concurrent matching acknowledgement is fine;
+/// changed bytes receive nothing. Shared by both dispatcher transports.
+pub fn acknowledge(source: *sql.Db, pending: Pending) !void {
     try source.exec("BEGIN IMMEDIATE");
     acknowledgeTransaction(source, pending) catch |err| return rollbackError(source, err);
 }
@@ -115,17 +118,20 @@ pub fn requireRole(db: *sql.Db, expected: []const u8) !void {
     if (try statement.step() != .done) return error.DatabaseRoleMismatch;
 }
 
-const Pending = struct {
+/// One pending committed intent loaded from the source outbox, owned by the
+/// caller's allocator. Shared by the local and HTTP dispatchers so both
+/// transports acknowledge the exact same immutable row.
+pub const Pending = struct {
     id: []u8,
     turn_id: []u8,
     sequence: i64,
     destination: []u8,
     payload: []u8,
 
-    fn intent(self: Pending) Intent {
+    pub fn intent(self: Pending) Intent {
         return .{ .id = self.id, .destination = self.destination, .payload = self.payload };
     }
-    fn deinit(self: *Pending, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Pending, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.turn_id);
         allocator.free(self.destination);
@@ -134,7 +140,9 @@ const Pending = struct {
     }
 };
 
-fn loadOne(allocator: std.mem.Allocator, db: *sql.Db) !?Pending {
+/// Load the oldest undelivered committed intent, if any. One definition of
+/// pending intent order and bounds serves every dispatcher transport.
+pub fn loadOne(allocator: std.mem.Allocator, db: *sql.Db) !?Pending {
     var query = try db.prepare("SELECT o.intent_id,o.turn_id,o.sequence,o.destination,o.payload FROM outbox AS o JOIN turns AS t ON t.turn_id=o.turn_id WHERE o.delivered=0 ORDER BY o.turn_id,o.sequence,o.intent_id LIMIT 1");
     defer query.deinit();
     if (try query.step() == .done) return null;
