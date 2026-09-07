@@ -4,6 +4,16 @@
 
 Experimental explicit effects (see docs/effects.md):
 
+- Durable ledgers now keep a tamper-evident history chain: every committed
+  turn and published upgrade appends a hash-chained row binding the previous
+  digest, event identity, request fingerprint, revision, and a content digest.
+  `Host.verifyChain` recomputes and cross-checks the chain (rewritten content
+  fails with `ChainRewritten`, reordered or deleted history with
+  `ChainBroken`), chain rows survive pruning, and migrated schema-2 ledgers
+  are chained from genesis. The chain is keyless by design; anchor the
+  returned head digest externally to detect truncation. See
+  docs/effects-durable.md.
+
 - Schema-2 durable ledgers gain an explicit offline migration path: the
   installed `effects-durable-migrate` validates the accepted state and every
   receipt under an operator-named application and writes a fresh schema-3

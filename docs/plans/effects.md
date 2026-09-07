@@ -461,6 +461,21 @@ source is never written; cutover is an explicit operator action. Schema-1
 ledgers remain read-only-rejected — their SQL-shaped domain predates the
 typed contracts and is archived rather than reinterpreted.
 
+## History-chain milestone
+
+Every revision event now appends to an append-only hash chain inside its
+committing transaction: turn commits chain a subject digest of their receipt
+bytes, upgrades chain a digest of their published state, and each link binds
+the previous digest, event kind, record ID, request fingerprint, and
+revision. `Host.verifyChain` recomputes every link from a zero genesis,
+requires contiguous revisions, and cross-checks live rows, distinguishing
+`ChainRewritten` (content changed) from `ChainBroken` (history reordered or
+removed). Chain rows are exempt from pruning, migrated schema-2 ledgers are
+chained across their full history, and the head digest is returned for
+external anchoring. This is deliberately keyless tamper-evidence inside the
+trusted-storage model — signatures remain a separate decision for when
+receipts must convince a third party.
+
 ## How it meets the consensus prototype later
 
 `bugnest-1` reported that a turn runs against a private SQLite snapshot before

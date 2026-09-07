@@ -70,6 +70,7 @@ fn buildSchemaTwoSource(paths: *const Paths) ![]u8 {
     }
     var db = try host_module.sql.Db.open(allocator, paths.source);
     defer db.close();
+    try db.exec("DROP TABLE history_chain");
     try db.exec("DROP TABLE turn_versions");
     try db.exec("DROP TABLE upgrades");
     try db.exec("UPDATE durable_metadata SET value='2' WHERE key='schema'");

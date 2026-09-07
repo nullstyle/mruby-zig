@@ -806,7 +806,7 @@ test "schema one and two durable ledgers are rejected unchanged without implicit
         defer db.close();
         try std.testing.expectEqual(@as(i64, 77), try db.scalar("SELECT quantity FROM legacy_inventory WHERE sku='legacy-widget'"));
         try std.testing.expectEqual(@as(i64, 1), try db.scalar("SELECT count(*) FROM durable_metadata WHERE key='schema'"));
-        try std.testing.expectEqual(@as(i64, 0), try db.scalar("SELECT count(*) FROM sqlite_schema WHERE name IN('current_state','stock','reservations','turns','turn_versions','upgrades','outbox','admissions')"));
+        try std.testing.expectEqual(@as(i64, 0), try db.scalar("SELECT count(*) FROM sqlite_schema WHERE name IN('current_state','stock','reservations','turns','turn_versions','upgrades','history_chain','outbox','admissions')"));
     }
 }
 

@@ -93,6 +93,36 @@ pub fn migrate(allocator: std.mem.Allocator, source_path: []const u8, target_pat
     }
     try copyReservations(owned, &source, &target, &copied);
     try copyOutbox(owned, &source, &target, &copied);
+    // Every migrated turn is chained in revision order from genesis, so the
+    // target ledger's tamper-evident history covers its whole past.
+    {
+        var query = try source.prepare("SELECT turn_id,request_hash,receipt,revision FROM turns ORDER BY revision");
+        defer query.deinit();
+        var insert = try target.db.prepare("INSERT INTO history_chain(revision,kind,record_id,request_hash,subject,prev,digest) VALUES(?,0,?,?,?,?,?)");
+        defer insert.deinit();
+        var prev: [32]u8 = @splat(0);
+        var expected_revision: i64 = 0;
+        while (try query.step() == .row) {
+            const record_id = try query.copyText(owned, 0, 128);
+            const request_hash = (try query.copyBlob(owned, 1, 32))[0..32].*;
+            const receipt = try query.copyBlob(owned, 2, contract.max_receipt_bytes);
+            const revision = try query.int(3);
+            if (revision != expected_revision + 1) return error.InvalidDurableState;
+            var subject: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(receipt, &subject, .{});
+            const digest = host_module.chainDigest(&prev, 0, record_id, &request_hash, revision, &subject);
+            try insert.bindInt(1, revision);
+            try insert.bindText(2, record_id);
+            try insert.bindBlob(3, &request_hash);
+            try insert.bindBlob(4, &subject);
+            try insert.bindBlob(5, &prev);
+            try insert.bindBlob(6, &digest);
+            try done(&insert);
+            insert.reset();
+            prev = digest;
+            expected_revision = revision;
+        }
+    }
     {
         const identity_text = std.fmt.bytesToHex(identity, .lower);
         var update = try target.db.prepare("UPDATE durable_metadata SET value=? WHERE key='application'");
@@ -158,7 +188,7 @@ fn validateSource(source: *sql.Db) !void {
         if (try query.step() != .done) return error.InvalidDurableState;
     }
     // A ledger claiming schema 2 must not already carry versioned tables.
-    if (try source.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('turn_versions','upgrades')") != 0) return error.UnsupportedDurableSchema;
+    if (try source.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('turn_versions','upgrades','history_chain')") != 0) return error.UnsupportedDurableSchema;
     for ([_][]const u8{ "admissions", "current_state", "stock", "turns", "reservations", "outbox" }) |table| {
         var query = try source.prepare("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name=?");
         defer query.deinit();

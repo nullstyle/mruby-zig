@@ -69,7 +69,7 @@ notifications cannot authorize additional work.
 
 [Host](../examples/durable/host.zig) hides request admission, transaction
 ownership, worker verification, persistence, retention, and recovery behind
-seven operations:
+eight operations:
 
 | Operation | Behavior |
 | --- | --- |
@@ -77,6 +77,7 @@ seven operations:
 | `execute(.{ .turn_id, .expected_revision, .input })` | Return the original committed result, or prepare, verify, and atomically commit a new turn under the active application. |
 | `upgrade(.{ .upgrade_id, .expected_revision, .target })` | Publish one explicit application upgrade atomically; retries resolve the original decision. |
 | `prune(.{ .before_revision, .archive_path })` | Archive acknowledged turns below a revision to a write-ahead file and remove them in one transaction. |
+| `verifyChain()` | Walk the tamper-evident history chain and return its head for external anchoring. |
 | `status()` | Read a consistent snapshot of the active application, state, and row counts. |
 | `replay(turn_id)` | Verify a historical receipt using its original application, state/input, and worker, with no adapters. |
 | `dispatch(recipient_path)` | Deliver up to 64 pending committed intents and acknowledge them. |
@@ -231,6 +232,30 @@ execute again: same-version retries stale out on the kept admission, and
 cross-version retries conflict on its fingerprint. Pruned receipts leave
 replay (`UnknownTurn`) but remain recoverable from the archive, which is the
 audit record for the removed business rows.
+
+## Tamper-evident history
+
+Every revision-publishing event — each committed turn and each published
+upgrade — appends one row to an append-only `history_chain` table inside the
+same transaction. Each row chains the previous row's digest to its own inputs:
+event kind, record ID, request fingerprint, revision, and a subject digest of
+the event's content (receipt bytes for turns, published state bytes for
+upgrades). `verifyChain()` recomputes every digest, checks the links from a
+zero genesis, requires contiguous revisions, and cross-checks every entry
+whose live row still exists. Rewriting a receipt or a request fingerprint
+fails with `ChainRewritten`; reordering, inserting, or removing history fails
+with `ChainBroken`. Chain rows are never pruned, so restating or backdating
+history after retention still breaks a link.
+
+This is keyless tamper-*evidence* within the documented trust model, not a
+signature: the database and host are trusted, and an attacker who rewrites
+the whole ledger can recompute its chain. The protection is real against
+partial or inconsistent tampering, and becomes binding when the returned
+`ChainSummary.head_digest` is exported and anchored outside the ledger;
+truncating the tail of a chain is otherwise undetectable. Migrated schema-2
+ledgers are chained from genesis across their entire history, and ledgers
+created by pre-chain schema-3 builds carry an empty chain until their next
+event. Receipt signatures remain a separate, future decision.
 
 ## Recovery rules
 

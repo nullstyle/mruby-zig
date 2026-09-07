@@ -116,6 +116,16 @@ intents keep their IDs and remain deliverable. Unknown pinned identities,
 other numeric profiles, schema-1/2 ledgers, downgrades, and further upgrade
 directions fail closed; there is no automatic migration.
 
+## Tamper-evident history
+
+Every committed turn and published upgrade appends a hash-chained row in the
+same transaction, binding the previous digest to the event's identity and a
+digest of its content. `host.verifyChain()` recomputes and cross-checks the
+whole chain: rewritten receipts or fingerprints fail with `ChainRewritten`,
+and reordered or deleted history fails with `ChainBroken`. Chain rows survive
+pruning. The chain is keyless tamper-evidence — anchor the returned head
+digest outside the ledger to also detect truncation.
+
 ## Retention
 
 `Host.prune(.{ .before_revision, .archive_path })` archives and removes
