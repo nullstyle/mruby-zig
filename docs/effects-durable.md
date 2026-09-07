@@ -68,13 +68,15 @@ notifications cannot authorize additional work.
 ## The host interface
 
 [Host](../examples/durable/host.zig) hides request admission, transaction
-ownership, worker verification, persistence, and recovery behind six operations:
+ownership, worker verification, persistence, retention, and recovery behind
+seven operations:
 
 | Operation | Behavior |
 | --- | --- |
 | `Host.open(allocator, database_path, worker_executables, options)` | Open or initialize the source database and validate its role, namespace, and pinned application identity. `worker_executables` holds one confined worker per application version, ordered like the build's application table. |
 | `execute(.{ .turn_id, .expected_revision, .input })` | Return the original committed result, or prepare, verify, and atomically commit a new turn under the active application. |
 | `upgrade(.{ .upgrade_id, .expected_revision, .target })` | Publish one explicit application upgrade atomically; retries resolve the original decision. |
+| `prune(.{ .before_revision, .archive_path })` | Archive acknowledged turns below a revision to a write-ahead file and remove them in one transaction. |
 | `status()` | Read a consistent snapshot of the active application, state, and row counts. |
 | `replay(turn_id)` | Verify a historical receipt using its original application, state/input, and worker, with no adapters. |
 | `dispatch(recipient_path)` | Deliver up to 64 pending committed intents and acknowledge them. |
@@ -211,6 +213,25 @@ dispatches to that version's bundle, contracts, and worker executable, so a
 v1 receipt still replays on v1 after the ledger upgraded. Existing receipts,
 admissions, outbox rows, and notification identities are never rewritten.
 
+## Retention
+
+`prune` removes committed turns with `revision` strictly below an explicit
+bound, together with their version, reservation, and outbox rows. Before any
+deletion it writes a write-ahead archive — one JSON line per pruned turn with
+its ID, revision, pinned application identity, and base64 receipt — and
+atomically replaces the target file, so a crash before the database commit
+leaves an archive whose entries simply get rewritten by the retry. Pruning is
+refused with `UndeliveredIntents` while any affected turn still has a pending
+intent, with `PruneBatchLimit` beyond 256 receipts per call (callers loop over
+longer histories), and with `IoUnavailable` when the host was opened without
+threaded I/O. A zero-turn prune changes nothing, including an existing archive.
+
+Immutable admissions are never pruned. A pruned turn ID can therefore never
+execute again: same-version retries stale out on the kept admission, and
+cross-version retries conflict on its fingerprint. Pruned receipts leave
+replay (`UnknownTurn`) but remain recoverable from the archive, which is the
+audit record for the removed business rows.
+
 ## Recovery rules
 
 | Outcome | Caller action |
@@ -220,6 +241,9 @@ admissions, outbox rows, and notification identities are never rewritten.
 | `StaleState` | Read current state and submit a deliberate new request with a new ID. Published upgrades also advance the revision. |
 | `UpgradeIdConflict` | Preserve the original upgrade request. Use a new ID for a different upgrade expectation. |
 | `UnsupportedApplicationUpgrade` / `UnknownApplication` | The requested direction or pinned application is not one this build supports; no automatic migration or downgrade exists. |
+| `UndeliveredIntents` | Deliver and acknowledge pending intents, then retry the prune. |
+| `PruneBatchLimit` / `ArchiveLimit` | Prune a smaller revision window; loop over longer histories. |
+| `IoUnavailable` | Open the host with threaded I/O before pruning. |
 | `DatabaseBusy` | Retry the same request when the competing writer finishes. |
 | `CommitIndeterminate` | Close and reopen the host, then retry the exact original request or upgrade. |
 | `DatabaseNeedsRecovery` or `HostNeedsRecovery` | Close and reopen before attempting further work. |

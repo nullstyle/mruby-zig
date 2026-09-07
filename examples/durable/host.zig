@@ -37,6 +37,20 @@ pub const UpgradeResult = struct {
     reused: bool,
     application: []const u8,
 };
+/// Explicit retention request. Committed turns with `revision` strictly below
+/// `before_revision` are archived and removed together with their version,
+/// reservation, and outbox rows. Their immutable admissions stay bound, so
+/// retrying a pruned ID fails closed with `StaleState` instead of executing
+/// again. Requires `Options.io`; a zero-turn prune leaves the archive path
+/// untouched.
+pub const PruneRequest = struct {
+    before_revision: i64,
+    archive_path: []const u8,
+};
+pub const PruneResult = struct {
+    /// Number of committed turns archived and removed by this call.
+    pruned: usize,
+};
 pub const Options = struct {
     /// Stable logical database namespace; reuse across copies means they are
     /// the same logical source. Independent sources need different namespaces.
@@ -45,6 +59,9 @@ pub const Options = struct {
     process: Worker.ProcessLimits = .{},
     diagnostic: ?*Turn.Diagnostic = null,
     fault: Fault = .none,
+    /// Threaded host I/O used only by retention archiving. Pruning requires
+    /// it; every other operation works without it.
+    io: ?std.Io = null,
 };
 pub const Status = struct {
     application: []const u8,
@@ -103,6 +120,7 @@ pub const Host = struct {
     apps: [applications.count]ApplicationIdentity,
     diagnostic: ?*Turn.Diagnostic,
     fault: Fault,
+    io: ?std.Io = null,
     in_use: bool = false,
     poisoned: bool = false,
 
@@ -128,7 +146,7 @@ pub const Host = struct {
         inline for (applications.versions, 0..) |app, index| {
             apps[index] = try identifyApplication(app, namespace);
         }
-        var host: Host = .{ .allocator = allocator, .db = db, .executables = executables, .namespace = namespace, .checkpoint = options.checkpoint, .process = options.process, .apps = apps, .diagnostic = options.diagnostic, .fault = options.fault };
+        var host: Host = .{ .allocator = allocator, .db = db, .executables = executables, .namespace = namespace, .checkpoint = options.checkpoint, .process = options.process, .apps = apps, .diagnostic = options.diagnostic, .fault = options.fault, .io = options.io };
         try host.initialize();
         return host;
     }
@@ -297,6 +315,112 @@ pub const Host = struct {
         };
         self.checkpoint.reach(.after_upgrade_commit);
         return .{ .revision = next_revision, .reused = false, .application = applications.labelAt(target) };
+    }
+
+    /// Archive and remove acknowledged history below an explicit revision.
+    /// One transaction deletes version, reservation, outbox, and turn rows
+    /// after a write-ahead archive replaces the target file atomically. The
+    /// immutable admissions stay bound, so a pruned ID can only ever fail
+    /// closed (`StaleState` or `TurnIdConflict`), never re-execute. A
+    /// zero-turn prune touches nothing, including the archive path.
+    pub fn prune(self: *Host, request: PruneRequest) !PruneResult {
+        if (self.diagnostic) |diagnostic| diagnostic.* = .{};
+        return self.pruneInner(request) catch |err| {
+            hostError(self.diagnostic, err);
+            return err;
+        };
+    }
+    fn pruneInner(self: *Host, request: PruneRequest) !PruneResult {
+        try self.enter();
+        defer self.in_use = false;
+        if (request.before_revision <= 0) return error.InvalidRevision;
+        if (request.archive_path.len == 0 or request.archive_path.len > sql.max_path_bytes or
+            std.mem.indexOfScalar(u8, request.archive_path, 0) != null) return error.InvalidName;
+        const io = self.io orelse return error.IoUnavailable;
+        try self.db.exec("BEGIN IMMEDIATE");
+        defer if (!self.poisoned) self.rollback();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        // Count first: an empty prune must not rewrite a previous archive,
+        // and one call carries a bounded batch of receipts.
+        const total: usize = blk: {
+            var query = try self.db.prepare("SELECT count(*) FROM turns WHERE revision<?");
+            defer query.deinit();
+            try query.bindInt(1, request.before_revision);
+            if (try query.step() != .row) return error.InvalidDurableState;
+            const count = try query.int(0);
+            if (count < 0 or try query.step() != .done) return error.InvalidDurableState;
+            break :blk @intCast(count);
+        };
+        if (total == 0) return .{ .pruned = 0 };
+        if (total > max_prune_batch) return error.PruneBatchLimit;
+        // Pending intents must be delivered and acknowledged before their
+        // turn's receipt leaves the ledger.
+        {
+            var query = try self.db.prepare("SELECT count(*) FROM outbox WHERE delivered=0 AND turn_id IN (SELECT turn_id FROM turns WHERE revision<?)");
+            defer query.deinit();
+            try query.bindInt(1, request.before_revision);
+            if (try query.step() != .row) return error.InvalidDurableState;
+            const pending = try query.int(0);
+            if (pending != 0 or try query.step() != .done) return error.UndeliveredIntents;
+        }
+        // Write-ahead archive: one self-describing JSON line per pruned turn
+        // with its receipt bytes and pinned application identity.
+        var buffer: std.Io.Writer.Allocating = .init(owned);
+        defer buffer.deinit();
+        const encoder = std.base64.standard.Encoder;
+        {
+            var query = try self.db.prepare("SELECT t.turn_id,t.revision,v.application,t.receipt FROM turns t JOIN turn_versions v ON v.turn_id=t.turn_id WHERE t.revision<? ORDER BY t.revision");
+            defer query.deinit();
+            try query.bindInt(1, request.before_revision);
+            var written: usize = 0;
+            while (try query.step() == .row) {
+                const turn_id = try query.copyText(owned, 0, 128);
+                const revision = try query.int(1);
+                const application = try query.copyBlob(owned, 2, 32);
+                const receipt = try query.copyBlob(owned, 3, contract.max_receipt_bytes);
+                const encoded = try owned.alloc(u8, encoder.calcSize(receipt.len));
+                _ = encoder.encode(encoded, receipt);
+                try buffer.writer.writeAll("{\"turn_id\":");
+                try jsonText(&buffer.writer, turn_id);
+                try buffer.writer.print(",\"revision\":{d},\"application\":", .{revision});
+                try jsonText(&buffer.writer, &std.fmt.bytesToHex(application[0..32].*, .lower));
+                try buffer.writer.print(",\"receipt\":\"", .{});
+                try buffer.writer.writeAll(encoded);
+                try buffer.writer.writeAll("\"}\n");
+                written += 1;
+            }
+            if (written != total) return error.InvalidDurableState;
+        }
+        const archive = buffer.writer.buffer[0..buffer.writer.end];
+        if (archive.len > max_archive_bytes) return error.ArchiveLimit;
+        {
+            var file = try std.Io.Dir.cwd().createFileAtomic(io, request.archive_path, .{ .replace = true });
+            errdefer file.deinit(io);
+            try file.file.writeStreamingAll(io, archive);
+            try file.replace(io);
+            file.deinit(io);
+        }
+        // Children first; deferred foreign keys tolerate either order, but the
+        // turn row is the anchor every other row references.
+        try self.execPrune("DELETE FROM turn_versions WHERE turn_id IN (SELECT turn_id FROM turns WHERE revision<?)", request.before_revision);
+        try self.execPrune("DELETE FROM reservations WHERE turn_id IN (SELECT turn_id FROM turns WHERE revision<?)", request.before_revision);
+        try self.execPrune("DELETE FROM outbox WHERE turn_id IN (SELECT turn_id FROM turns WHERE revision<?)", request.before_revision);
+        try self.execPrune("DELETE FROM turns WHERE revision<?", request.before_revision);
+        self.db.exec("COMMIT") catch {
+            // The archive is deliberately write-ahead: reopening and retrying
+            // rewrites it for the same still-present set.
+            self.poisoned = true;
+            return error.CommitIndeterminate;
+        };
+        return .{ .pruned = total };
+    }
+    fn execPrune(self: *Host, comptime query_text: []const u8, before_revision: i64) !void {
+        var query = try self.db.prepare(query_text);
+        defer query.deinit();
+        try query.bindInt(1, before_revision);
+        try done(&query);
     }
 
     pub fn status(self: *Host) !Status {
@@ -966,6 +1090,26 @@ fn verifiedCopy(allocator: std.mem.Allocator, bytes: []const u8, shape: *const T
     errdefer allocator.free(terminal_bytes);
     return .{ .allocator = allocator, .terminal_capsule = .{ .encoded = terminal_bytes }, .receipt_bytes = try allocator.dupe(u8, bytes), .max_terminal_bytes = contract.max_bytes };
 }
+/// One retention call archives at most this many receipts, bounding memory
+/// and the atomic file write. Callers loop for longer histories.
+const max_prune_batch: usize = 256;
+const max_archive_bytes: usize = 16 * 1024 * 1024;
+
+/// JSON string with the same conservative escaping as the diagnostic writer.
+fn jsonText(writer: *std.Io.Writer, bytes: []const u8) !void {
+    const hex = "0123456789abcdef";
+    try writer.writeByte('"');
+    for (bytes) |byte| switch (byte) {
+        '"', '\\' => {
+            try writer.writeByte('\\');
+            try writer.writeByte(byte);
+        },
+        0x20...0x21, 0x23...0x5b, 0x5d...0x7e => try writer.writeByte(byte),
+        else => try writer.writeAll(&.{ '\\', 'u', '0', '0', hex[byte >> 4], hex[byte & 15] }),
+    };
+    try writer.writeByte('"');
+}
+
 fn validName(name: []const u8) !void {
     if (name.len == 0 or name.len > 128 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidName;
 }

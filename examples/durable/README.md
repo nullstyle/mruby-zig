@@ -116,6 +116,17 @@ intents keep their IDs and remain deliverable. Unknown pinned identities,
 other numeric profiles, schema-1/2 ledgers, downgrades, and further upgrade
 directions fail closed; there is no automatic migration.
 
+## Retention
+
+`Host.prune(.{ .before_revision, .archive_path })` archives and removes
+acknowledged turn history below an explicit revision: every pruned turn's ID,
+revision, pinned application, and receipt are written to a write-ahead JSON
+archive first, then its turn/version/reservation/outbox rows are deleted in
+one transaction. Pruning refuses turns with pending intents and keeps every
+immutable admission, so a pruned request ID can only stale out or conflict —
+it can never execute twice. Pruned receipts replay no longer but stay
+recoverable from the archive file.
+
 ## Delivery and crash boundaries
 
 Delivery uses a second local SQLite database as a recipient simulation. Each

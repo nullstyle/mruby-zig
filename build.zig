@@ -2223,6 +2223,24 @@ fn addDurableExample(
     const upgrade_tests = b.addTest(.{ .root_module = upgrade_tests_module });
     check_step.dependOn(&upgrade_tests.step);
     test_step.dependOn(&b.addRunArtifact(upgrade_tests).step);
+    const retention_tests_module = b.createModule(.{
+        .root_source_file = b.path("examples/durable/retention_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    retention_tests_module.addImport("mruby", mruby_mod);
+    retention_tests_module.addImport("durable_host", host_module);
+    retention_tests_module.addImport("durable_contract", contract_module);
+    retention_tests_module.addOptions("durable_test_config", config);
+    retention_tests_module.addCSourceFile(.{
+        .file = b.path("examples/durable/crash_supervisor.c"),
+        .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
+    });
+    const retention_tests = b.addTest(.{ .root_module = retention_tests_module });
+    check_step.dependOn(&retention_tests.step);
+    test_step.dependOn(&b.addRunArtifact(retention_tests).step);
     // The delivery root also discovers sql.zig's focused storage tests. Keep
     // these explicit; tests in a named dependency module are not test roots.
     const storage_module = b.createModule(.{

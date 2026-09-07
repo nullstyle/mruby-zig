@@ -429,6 +429,23 @@ two build-time-known versions, and background upgrade automation remain
 explicitly unsupported. See
 [the durable guide](../effects-durable.md#application-identity-and-upgrades).
 
+## Retention milestone
+
+Pruning is now an explicit, bounded host operation instead of deferred
+forever. `Host.prune` takes a revision bound and an archive path: turns
+strictly below the bound are archived as self-describing JSON lines (ID,
+revision, pinned application identity, base64 receipt) through an atomic
+file replace, then removed with their version, reservation, and outbox rows
+in one transaction. The archive is deliberately write-ahead, so an
+indeterminate COMMIT resolves on retry by rewriting the same archive for the
+still-present rows. Pruning refuses pending intents, bounds a batch to 256
+receipts, and never touches a zero-turn archive. Admissions are immutable and
+never pruned, which is what keeps pruned IDs fail-closed: same-version
+retries stale out, cross-version retries conflict, and no pruned turn can
+execute again. Native x86_64 confined workers are now locally validated as
+well (QEMU VM, Alpine 6.12 kernel, pinned toolchain); all four supported
+platform combinations have passed the confined-worker suite.
+
 ## How it meets the consensus prototype later
 
 `bugnest-1` reported that a turn runs against a private SQLite snapshot before
