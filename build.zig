@@ -2285,6 +2285,48 @@ fn addDurableExample(
     const chain_tests = b.addTest(.{ .root_module = chain_tests_module });
     check_step.dependOn(&chain_tests.step);
     test_step.dependOn(&b.addRunArtifact(chain_tests).step);
+    // Production-delivery adapter example: a loopback HTTP recipient test
+    // double and a dispatcher client that carries the stable intent ID as an
+    // explicit idempotency key. The embedding library stays transport-free.
+    const http_recipient_module = b.createModule(.{
+        .root_source_file = b.path("examples/durable/http_recipient.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    http_recipient_module.addImport("mruby", mruby_mod);
+    http_recipient_module.addImport("durable_host", host_module);
+    const http_recipient = b.addExecutable(.{ .name = "effects-durable-http-recipient", .root_module = http_recipient_module });
+    check_step.dependOn(&http_recipient.step);
+    b.installArtifact(http_recipient);
+    config.addOptionPath("http_recipient_executable", http_recipient.getEmittedBin());
+    const http_delivery_module = b.createModule(.{
+        .root_source_file = b.path("examples/durable/http_delivery.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    http_delivery_module.addImport("durable_host", host_module);
+    http_delivery_module.addImport("durable_contract", contract_module);
+    const http_delivery_tests_module = b.createModule(.{
+        .root_source_file = b.path("examples/durable/http_delivery_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    http_delivery_tests_module.addImport("mruby", mruby_mod);
+    http_delivery_tests_module.addImport("durable_host", host_module);
+    http_delivery_tests_module.addImport("durable_contract", contract_module);
+    http_delivery_tests_module.addImport("durable_http", http_delivery_module);
+    http_delivery_tests_module.addOptions("durable_test_config", config);
+    const http_delivery_tests = b.addTest(.{ .root_module = http_delivery_tests_module });
+    check_step.dependOn(&http_delivery_tests.step);
+    test_step.dependOn(&b.addRunArtifact(http_delivery_tests).step);
     // The delivery root also discovers sql.zig's focused storage tests. Keep
     // these explicit; tests in a named dependency module are not test roots.
     const storage_module = b.createModule(.{

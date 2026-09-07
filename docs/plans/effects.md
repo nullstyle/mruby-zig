@@ -476,6 +476,26 @@ external anchoring. This is deliberately keyless tamper-evidence inside the
 trusted-storage model — signatures remain a separate decision for when
 receipts must convince a third party.
 
+## HTTP-delivery milestone
+
+Delivery now has a production-transport adapter example without changing the
+trust model or moving transport into the library. The installed
+`effects-durable-http-recipient` runs the identical durable recipient
+transaction behind loopback HTTP as a test double, and the example dispatcher
+client sends each pending committed intent as `POST /<destination>` with the
+stable intent ID in an explicit `Idempotency-Key` header and the outbox
+payload as the exact request body, then acknowledges the source only after
+the recipient's committed 200. The batch bound, checkpoints, and
+acknowledgement transaction match the local SQLite dispatcher, so the
+crash window between recipient commit and source acknowledgement resolves
+the same way: an identical re-send that the recipient's stored key
+deduplicates. The suite spawns the double as a real child process and also
+covers byte-identical transport, key-reuse conflicts, and fail-closed
+delivery while the recipient is down. The stated limit is deliberate: this
+is at-least-once delivery with transport-specific deduplication — recipients
+must durably record the key, and services that ignore it observe duplicates.
+The example ships no TLS, authentication, or timeouts.
+
 ## How it meets the consensus prototype later
 
 `bugnest-1` reported that a turn runs against a private SQLite snapshot before

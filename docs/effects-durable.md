@@ -313,6 +313,32 @@ retryable delivery with recipient deduplication; arbitrary network services
 require their own durable idempotency contract. A generic HTTP call or email
 send does not inherit this guarantee.
 
+## HTTP delivery example
+
+The [HTTP delivery example](../examples/durable/README.md#http-delivery) is
+a production-transport adapter with the same shape: the installed
+`effects-durable-http-recipient` binary runs the identical durable recipient
+contract behind a loopback HTTP server (a test double for a real recipient
+service), and `http_delivery.dispatch` is a client that delivers up to 64
+pending committed intents per call. Each request is
+`POST /<destination>` with the stable intent ID as an explicit
+`Idempotency-Key` header and the outbox payload blob as the exact request
+body, byte for byte; the recipient commits before responding, and only a 200
+response acknowledges the source. A dispatcher that dies between the
+recipient's commit and the source acknowledgement re-sends the identical
+bytes on retry, and the recipient's stored key prevents a second effect —
+the same three delivery checkpoints as the local path cover that window.
+
+What this establishes is retryable delivery with transport-specific
+deduplication for recipients that durably record the idempotency key with
+the payload. It is not exactly-once delivery: an HTTP service that ignores
+the key observes duplicates, and a recipient that acknowledges before
+committing can lose an intent. The example also has no TLS, authentication,
+rate limiting, or request timeouts, maps destinations to URL path segments
+(so destinations must be path-safe), and trusts the recipient's 200 as
+proof of its commit. The embedding library remains transport-free; both
+pieces live in the durable example.
+
 ## Evidence and limits
 
 The integration tests kill and reap real host processes at admission, transaction
@@ -330,7 +356,11 @@ COMMIT through an authorizer, corrupts the pinned application identity, and
 exercises unknown targets, reversed direction, stale revisions, committed
 upgrade retries, request identity across the upgrade, per-version replay
 routing with a missing v2 executable, pending v1 intent delivery, and an
-upgrade serializing against a paused turn's open business transaction.
+upgrade serializing against a paused turn's open business transaction. The
+HTTP delivery suite spawns the recipient double as a real child process and
+covers byte-identical transport under the idempotency key, the crash window
+between send and acknowledgement, key-reuse conflicts, and delivery that
+fails closed while the recipient is down and resumes after it restarts.
 
 These are process-crash tests. They do not simulate power loss, storage firmware
 failures, or a malicious host. Native adapters, SQLite, the filesystem, and the
@@ -363,8 +393,9 @@ Opening a schema-1 or schema-2 ledger returns `UnsupportedDurableSchema` and
 preserves it; migration is never automatic. Exactly one upgrade path
 (`inventory/v1` → `inventory/v2`) is demonstrated; downgrades and multi-version
 fan-out beyond two build-time-known versions remain unsupported. There is no
-background dispatcher, replicated commit protocol, or production transport in
-this example.
+background dispatcher or replicated commit protocol in this example; the
+HTTP delivery adapter above is example code with no TLS, authentication, or
+timeouts, not a production transport service.
 
 Schema-2 ledgers have one explicit, offline way forward: the installed
 `effects-durable-migrate` tool builds a fresh schema-3 ledger beside the
