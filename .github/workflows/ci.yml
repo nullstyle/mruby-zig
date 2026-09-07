@@ -26,6 +26,8 @@ jobs:
       - run: mise x -- zig fmt --check .
       - run: mise x -- zig build test
       - run: mise x -- zig build test -Doptimize=ReleaseSafe
+      - name: Optional SQLite effects workflow
+        run: mise x -- zig build test-effects-inventory -Dsqlite-effects=true -Doptimize=ReleaseSafe
       - name: Bounded live materialization fuzzing
         id: materialize_fuzz
         run: |
@@ -149,6 +151,11 @@ jobs:
           mise x -- zig build --build-file tools/codedb_consumer/build.zig test
           -Dno-compiler=true -Dgem-set=${{ matrix.gem_set }} -Doptimize=${{ matrix.optimize }}
           --prefix "$RUNNER_TEMP/codedb-runtime-only"
+      - name: Optional SQLite effects without the runtime compiler
+        if: matrix.optimize == 'ReleaseSafe'
+        run: >-
+          mise x -- zig build test-effects-inventory -Dsqlite-effects=true -Dno-compiler=true
+          -Dgem-set=${{ matrix.gem_set }} -Doptimize=${{ matrix.optimize }}
       - name: Inspect linked runtime and worker symbols
         run: >-
           sh tools/check_runtime_only_symbols.sh
@@ -191,6 +198,129 @@ jobs:
             .zig-cache/f/
             .zig-cache/v/
             .zig-cache/tmp/libfuzzer.log
+
+  effects-strict:
+    name: strict effects (${{ matrix.os }}, ${{ matrix.optimize }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        optimize: [Debug, ReleaseSafe]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+      - run: mise install
+      - name: Strict bootstrap, native catalogue, turns, worker broker and durable recovery
+        run: >-
+          mise x -- zig build test check install -Deffects-strict=true -Dsqlite-effects=true
+          -Doptimize=${{ matrix.optimize }} --prefix "$RUNNER_TEMP/effects-strict"
+      - name: Fresh strict turn demo without SQLite
+        run: >-
+          mise x -- zig build run-effects-turn -Deffects-strict=true
+          -Doptimize=${{ matrix.optimize }}
+      - name: Confined worker demo without SQLite
+        run: >-
+          mise x -- zig build run-effects-worker -Deffects-strict=true
+          -Doptimize=${{ matrix.optimize }}
+      - name: Installed worker and host integration
+        run: >-
+          "$RUNNER_TEMP/effects-strict/bin/effects-worker"
+          "$RUNNER_TEMP/effects-strict/bin/effects-worker-child"
+      - name: Installed typed reservation operations
+        run: >-
+          "$RUNNER_TEMP/effects-strict/bin/effects-reservation"
+          "$RUNNER_TEMP/effects-strict/bin/effects-reservation-child"
+      - name: Installed durable turn and recovery demo
+        run: >-
+          "$RUNNER_TEMP/effects-strict/bin/effects-durable"
+          "$RUNNER_TEMP/effects-strict/bin/effects-durable-child"
+      - name: Installed inert receipt inspector
+        run: |
+          mise x -- zig build make-effects-inspect-fixture -Deffects-strict=true -Doptimize=${{ matrix.optimize }} -- "$RUNNER_TEMP/inspection.receipt"
+          "$RUNNER_TEMP/effects-strict/bin/mruby-effects-inspect" "$RUNNER_TEMP/inspection.receipt" > "$RUNNER_TEMP/inspection.json"
+          grep -F '"verification":"structure-and-checksums-only"' "$RUNNER_TEMP/inspection.json"
+          grep -F '"preview_bytes":"OutOfStock"' "$RUNNER_TEMP/inspection.json"
+      - name: Reject incompatible strict profile options
+        run: |
+          for incompatible in no-compiler=false gem-set=standard with-gems=mruby-time allow-worker-ambient-authority=true; do
+            log="$RUNNER_TEMP/strict-option.log"
+            if mise x -- zig build check -Deffects-strict=true "-D$incompatible" >"$log" 2>&1; then
+              cat "$log"
+              exit 1
+            fi
+            grep -F -- '-Deffects-strict=true requires' "$log"
+          done
+      - name: Strict inventory replay and measurements
+        if: matrix.optimize == 'ReleaseSafe'
+        run: "$RUNNER_TEMP/effects-strict/bin/effects-inventory"
+
+  effects-integer64:
+    name: integer effects (${{ matrix.os }}, ${{ matrix.optimize }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        optimize: [Debug, ReleaseSafe]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+      - run: mise install
+      - name: Integer arithmetic, Float rejection, worker replay and durable recovery
+        run: >-
+          mise x -- zig build test check install -Deffects-strict=true -Deffects-integer64=true
+          -Dsqlite-effects=true -Doptimize=${{ matrix.optimize }} --prefix "$RUNNER_TEMP/effects-integer64"
+      - name: Retain canonical integer results and error classes
+        run: |
+          "$RUNNER_TEMP/effects-integer64/bin/effects-integer64" > "$RUNNER_TEMP/integer64-corpus.txt" 2>&1
+          test -s "$RUNNER_TEMP/integer64-corpus.txt"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: integer64-corpus-${{ matrix.os }}-${{ matrix.optimize }}
+          retention-days: 14
+          path: ${{ runner.temp }}/integer64-corpus.txt
+      - name: Reject incompatible integer profile options
+        if: matrix.optimize == 'Debug'
+        run: |
+          log="$RUNNER_TEMP/integer64-option.log"
+          if mise x -- zig build check -Deffects-integer64=true >"$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          grep -F -- '-Deffects-integer64=true requires -Deffects-strict=true and a 64-bit target' "$log"
+          if mise x -- zig build check -Deffects-strict=true -Deffects-integer64=true \
+              -Dtarget=x86-linux-musl >"$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          grep -F -- '-Deffects-integer64=true requires -Deffects-strict=true and a 64-bit target' "$log"
+
+  effects-integer64-corpus:
+    name: integer corpus equivalence
+    needs: effects-integer64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: integer64-corpus-*
+          path: ${{ runner.temp }}/integer64-corpora
+          merge-multiple: false
+      - name: Compare canonical effects, terminal values and error classes
+        run: |
+          baseline="$RUNNER_TEMP/integer64-corpora/integer64-corpus-ubuntu-latest-Debug/integer64-corpus.txt"
+          test -s "$baseline"
+          for os in ubuntu-latest macos-latest; do
+            for optimize in Debug ReleaseSafe; do
+              corpus="$RUNNER_TEMP/integer64-corpora/integer64-corpus-$os-$optimize/integer64-corpus.txt"
+              test -s "$corpus"
+              cmp "$baseline" "$corpus"
+            done
+          done
 
   packaged-consumer:
     name: packaged consumer (${{ matrix.os }}, ${{ matrix.gem_set }})

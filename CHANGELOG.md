@@ -2,6 +2,147 @@
 
 ## Unreleased
 
+Experimental explicit effects (see docs/effects.md):
+
+- The durable example now pins an explicit application identity in its ledger
+  and demonstrates one controlled upgrade from `inventory/v1` to `inventory/v2`
+  (state gains an explicit OutOfStock rejection counter). `Host.open` takes one
+  confined worker per build-time-known application version; `Host.upgrade`
+  publishes the new state, revision, active identity, and provenance in one
+  transaction, resolves retries and lost replies from the committed upgrade
+  record, and never rewrites receipts, admissions, outbox rows, or notification
+  identities. Historical replay dispatches each turn to its original bundle,
+  contracts, and worker. Opening a different application, label, or numeric
+  profile fails closed at open; source ledger schema is now 3, and schema-1
+  and schema-2 ledgers are rejected unchanged without migration. See
+  docs/effects-durable.md.
+
+- The durable example now exposes typed `Stock.reserve` and
+  `Notifications.reservation_created` operations. Host-owned SQL, payloads, and
+  business invariants bind every successful turn to its admitted request.
+  Whole-turn/numeric input validation precedes durable admission, contract
+  digests bind retry fingerprints, and terminal validation also covers cached
+  replies. Crash recovery includes partial writes inside a domain operation.
+  Source schema 2 rejects schema-1 ledgers without changing them; migration
+  remains explicit. See docs/effects-durable.md.
+
+- Opt-in `-Deffects-integer64=true` requires strict mode and a 64-bit target,
+  compiling Ruby without Float and with fixed signed 64-bit integers. Float
+  literals always fail parsing. Out-of-range integer literals fail compilation
+  when they would emit a value; unused or unreachable literals may be eliminated.
+  Overflowing arithmetic raises ordinary rescuable Ruby errors. Checked parsing,
+  rounding, shifts, and full-width comparisons share the pinned numeric policy. Runtime admission
+  rejects Float anywhere in state, input, effect data, or terminal graphs;
+  invalid adapter outcomes discard staged work. VM-free structural codecs
+  preserve Float artifacts for inspection. Profile identity prevents mixing
+  incompatible CodeDB/RITE artifacts, workers, and receipts; integer-only
+  StateCapsules remain transferable. `run-effects-integer64` emits actual canonical
+  effect and terminal capsules plus error classes for platform comparison.
+  See docs/effects-integer64.md for guarantees and remaining trust limits.
+- All strict profiles fix full-width integer sort comparison and reserve enough
+  space to format the minimum signed integer in base two, with regressions in
+  both ordinary strict and integer64 builds.
+
+- Whole-turn contracts constrain starting state, input, result, and next state.
+  Admission snapshots and validates contracts before VM/transaction startup;
+  terminal failures discard staged work. Runtime/broker validation, receipt
+  identity, worker handshake, and owned diagnostics share the same shapes.
+  The reservation example exercises both operation and whole-turn contracts.
+- Effects examples explicitly re-raise caught exceptions with `raise error`.
+  Regression tests preserve rejection identity, message, code, and ensure
+  behavior during record/replay; general bare `raise` retains mruby's documented
+  semantics.
+- Optional shared operation contracts validate arguments before adapters and
+  results/rejections before acceptance in live, record, and replay execution.
+  The worker broker independently validates requests and full receipt records.
+  Schema digests bind replay/application identity; mismatches remain fatal after
+  Ruby rescue and include owned side/path/kind diagnostics. The first domain
+  example, `run-effects-reservation -Deffects-strict=true`, stages stock, state,
+  and notification intents under explicit commit without a SQL dependency.
+- Strict workers transport bounded owned diagnostics through private protocol
+  1.3: Ruby exception metadata, native debug locations, denied operations,
+  adapter failures, and replay mismatches. The broker supplies trusted origin
+  and phase labels. Inert capture and byte-escaped JSON formatting invoke no
+  Ruby methods; the existing execution errors and commit rules are unchanged.
+- `mruby-effects-inspect` and `effect.Inspection` validate stored receipt graphs
+  and produce bounded JSON summaries without linking a Ruby VM or running
+  adapters. `test-effects-inspect` exercises the library and CLI in ordinary
+  and strict builds. Stored receipt formats are unchanged.
+- `run-effects-durable` / `test-effects-durable` add a disk-backed reference
+  host for strict workers. Durable ID admission prevents conflicting reuse;
+  a single business transaction retains SQL changes, next Ruby state, the
+  verified receipt, and outbox. Committed retries return the original result
+  without workers or callbacks. A separate local recipient deduplicates stable
+  intents; real SIGKILL tests cover preparation, commit, and delivery recovery.
+  Requires `-Deffects-strict=true -Dsqlite-effects=true`; see
+  docs/effects-durable.md for the persistence contract and process-crash scope.
+- The optional SQLite dependency is pinned to 3.51.3, including the WAL reset
+  corruption fix needed by the durable example. Ordinary library builds do not
+  link it. Durable connections require WAL/FULL and validate source/recipient
+  roles, namespaces, and file aliases.
+- `mruby.strict.Worker` keeps Ruby in a dedicated OS-contained process and
+  data-only effect adapters in the host. The broker checks every RPC and final
+  receipt against its own reserved journal, then requires a second fresh replay
+  before returning `Turn.Prepared`. Linux seccomp/macOS Seatbelt deny ambient
+  access; private socket transport, wall/CPU limits and clean reap fail closed.
+  `addEffectWorker` builds one application worker from its CodeDB manifest and
+  shared contract. `run-effects-worker` / `test-effects-worker` exercise it.
+
+- `mruby.strict.Turn` prepares one fresh VM invocation from explicit state/input
+  capsules and accepts only data-only bindings. It records an owned receipt
+  containing the effect trace and joint `[result,next_state]` graph; replay has
+  no handler/transaction hooks and checks both, including cross-root aliases.
+- `effect.DataHandler` / `DataOutcome` and data capsule helpers remove Vm/Value
+  from the new handler interface. Tree encoding, owned document reads, and
+  subgraph extraction preserve inert value semantics. Legacy handlers remain
+  available, and empty catalogues now support pure turns.
+- Prepared turns expose explicit commit/discard. Abandonment and preparation
+  failure discard provisional work; uncertain commits require reconciliation
+  and never trigger an automatic retry or rollback. `run-effects-turn` and
+  `test-effects-turn` exercise the complete workflow without SQLite.
+- Opt-in `-Deffects-strict=true` selects a core-only runtime without a target
+  compiler. A source-pinned native catalogue checks all VM native dispatches by
+  implementation identity; primitive checks deny output, warnings, address
+  observations, debug operations, and unapproved lifecycle/finalizer callbacks.
+  Native violations remain fatal through Ruby rescue and invalidate recordings.
+- `mruby.strict.Program` installs Effects before bounded CodeDB initialization,
+  forbids performed effects during initialization, and derives replay identity
+  from actual artifacts and dependency metadata. Unknown ordinary host bindings
+  are rejected. The SQLite example and strict CI exercise this profile in Debug
+  and ReleaseSafe. The lower-level Program interface retains trusted VM-capable
+  handlers and host starting-state attestations.
+- `mruby.effect.install` registers inert Ruby request constructors and
+  synchronous `Effect.perform` dispatch with separate immutable host grants.
+  Request payloads are owned snapshots; handlers are replaceable without
+  changing application Ruby. The optional ambient profile masks audited
+  clock, random, and output entry points.
+- Bounded owned transcripts record operation arguments/results and replay
+  them without live handlers. Actual entry code, operation/runtime contracts,
+  and host-supplied input identities gate replay; mismatches and rescued
+  dispatch failures cannot produce valid traces. Isolate execution owns
+  cleanup, termination checks, and `takeEffectTrace` transfer.
+- `Isolate.callWithEffects` admits object-method execution with explicit code,
+  bootstrap, starting-state, and logical receiver identities. The runtime
+  binds the actual method and snapshotted arguments; invalid inputs or replay
+  identity mismatches preserve the previous trace and gas generation.
+- Outcome handlers can report `Effect::Rejected` with a code and message;
+  Ruby can rescue it, and replay reproduces that branch. Raw handler failures
+  remain fatal. Trace format 1.1 records outcome tags and reads format 1.0.
+  Returned values and rejection payloads are detached snapshots in all modes.
+  `effectDiagnostic` provides bounded, owned first-mismatch details.
+- Protected native operations now also catch allocation failures in mruby's
+  result-rooting postlude, keeping full-arena OOM unwinding inside C.
+- `run-effects-demo` and `test-effects` cover a live clock, fixed test
+  handlers, captured outgoing intents, and replay after VM destruction.
+  The CodeDB demo and pure transcript tests also run with `-Dno-compiler`.
+  This first slice does not provide durable delivery, arbitrary method-effect
+  inference, or resumable continuations.
+- Optional `run-effects-inventory` / `test-effects-inventory` targets use
+  `-Dsqlite-effects=true` for a pinned SQLite fixture with private transactions,
+  read-only inspection grants, recoverable stock rejection, inert outbox
+  intents, fresh-VM replay, and live/record measurements. They also support
+  `-Dno-compiler`; ordinary library builds do not link SQLite.
+
 CodeDB phases 1–5 (see docs/artifacts.md and docs/plans/codedb.md):
 
 - Application Ruby is now a build-time input: the host mrbc from the

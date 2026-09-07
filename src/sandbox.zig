@@ -45,6 +45,8 @@ const codedb_mod = @import("codedb.zig");
 const arena_mod = @import("arena.zig");
 const authority = @import("authority_manifest");
 const features = @import("features.zig");
+const effect_mod = @import("effect.zig");
+const convert_mod = @import("convert.zig");
 
 pub const Vm = vm_mod.Vm;
 pub const Value = value_mod.Value;
@@ -79,7 +81,10 @@ pub const HostOperationError = error{
 
 pub const RootError = HostOperationError || arena_mod.RootError;
 
-pub const RunRiteError = artifact_mod.RiteValidationError || error{
+pub const RunRiteError = artifact_mod.RiteValidationError || effect_mod.ExecutionError || error{
+    NativeEffectViolation,
+    StrictAttemptActive,
+    StrictProfileRequired,
     IsolatePreparing,
     IsolateThreadBusy,
     RubyException,
@@ -107,6 +112,7 @@ pub const ValueCodecError = artifact_mod.FramingError || error{
     UnsupportedContainerState,
     UnsupportedHashKey,
     NumericOutOfRange,
+    NumericPolicyViolation,
     CapsuleLimitExceeded,
     SchemaMismatch,
     IsolatePreparing,
@@ -477,7 +483,7 @@ const IsolateState = struct {
             fn body(iso_: *IsolateState, src_: []const u8) !Value {
                 return iso_.vm.loadString(src_);
             }
-        }.body, src);
+        }.body, src, iso.effectCodeIdentity("source", src));
     }
 
     /// Deprecated compatibility operation: run an unframed snapshot produced
@@ -492,7 +498,7 @@ const IsolateState = struct {
                 // value and poisoning the next run.
                 return iso_.vm.loadIrep(image_);
             }
-        }.body, image);
+        }.body, image, iso.effectCodeIdentity("irep", image));
     }
 
     /// Validate and execute a typed RITE image. Framing and compatibility
@@ -519,7 +525,7 @@ const IsolateState = struct {
         if (admission == .nested) {
             return Body.load(iso, payload.bytes) catch |err| return @errorCast(err);
         }
-        return iso.enterOuterExecution(Body.load, payload.bytes) catch |err|
+        return iso.enterOuterExecution(Body.load, payload.bytes, iso.effectCodeIdentity("rite", image.bytes), null) catch |err|
             return @errorCast(err);
     }
 
@@ -531,6 +537,28 @@ const IsolateState = struct {
         identity: *const anyopaque,
         entries: anytype,
         name: []const u8,
+    ) codedb_mod.LoadError!bool {
+        return iso.loadCodeDBMode(identity, entries, name, false);
+    }
+
+    /// The same dependency loader under a no-effects initialization phase.
+    /// Used by strict.Program after native restrictions are already active.
+    pub fn initializeCodeDB(
+        iso: *IsolateState,
+        identity: *const anyopaque,
+        entries: anytype,
+        name: []const u8,
+    ) codedb_mod.LoadError!bool {
+        if (comptime !features.effects_strict) return error.StrictProfileRequired;
+        return iso.loadCodeDBMode(identity, entries, name, true);
+    }
+
+    fn loadCodeDBMode(
+        iso: *IsolateState,
+        identity: *const anyopaque,
+        entries: anytype,
+        name: []const u8,
+        comptime initializing: bool,
     ) codedb_mod.LoadError!bool {
         const requested = for (entries, 0..) |entry, index| {
             if (std.mem.eql(u8, entry.name, name)) break index;
@@ -576,7 +604,7 @@ const IsolateState = struct {
             iso.codedb_loaded = loaded;
             iso.codedb_identity = identity;
         }
-        _ = iso.enterOuterExecution(struct {
+        _ = iso.enterOuterPhase(struct {
             fn body(state: *IsolateState, images: []const ?[]const u8) !Value {
                 for (images, 0..) |maybe_image, index| {
                     const image = maybe_image orelse continue;
@@ -587,9 +615,10 @@ const IsolateState = struct {
                 }
                 return state.vm.nilValue();
             }
-        }.body, @as([]const ?[]const u8, payloads)) catch |err| {
+        }.body, @as([]const ?[]const u8, payloads), null, null, initializing) catch |err| {
             // Include policy failures arbitrated AFTER the final initializer,
-            // not just exceptions reported by loadIrep itself.
+            // not just exceptions reported by loadIrep itself. This existing
+            // contract also includes trace admission rejection before Ruby.
             iso.codedb_poisoned = true;
             return @errorCast(err);
         };
@@ -602,7 +631,146 @@ const IsolateState = struct {
             fn body(iso_: *IsolateState, ctx: anytype) !Value {
                 return iso_.vm.call(ctx.recv, ctx.name, ctx.args);
             }
-        }.body, .{ .recv = recv, .name = name, .args = args });
+        }.body, .{ .recv = recv, .name = name, .args = args }, null);
+    }
+
+    /// Admit an identified outer method call. Snapshot conversion is inert and
+    /// attributed, and completes before trace admission or gas renewal.
+    pub fn callWithEffects(
+        iso: *IsolateState,
+        recv: Value,
+        name: []const u8,
+        args: anytype,
+        invocation: effect_mod.Invocation,
+    ) !Value {
+        const admission = try iso.admitExecution();
+        if (admission == .nested) return error.IsolateThreadBusy;
+        defer iso.operation_lock.unlock();
+
+        const effects = iso.vm.effects orelse return error.EffectNotInstalled;
+        const max_bytes = @min(effects.limits.max_request_bytes, effects.limits.max_bytes);
+        try invocation.validate(name, max_bytes);
+        try recv.ensureOwnedBy(iso.vm.mrb);
+
+        // On rejection discard every temporary arena root. On success the
+        // returned value and its input snapshot follow Vm.call's arena lifetime;
+        // the caller can bound repeated calls with an outer arena scope.
+        const scope = iso.vm.arenaScope();
+        errdefer scope.restore();
+        var snapshot = blk: {
+            iso.phase = .preparing;
+            defer iso.phase = .idle;
+            const attribution = alloc_mod.pushIsolate(&iso.cell);
+            defer alloc_mod.restoreIsolate(attribution);
+            try iso.rejectHostMemoryLimit();
+            var prepared = iso.snapshotInvocationArguments(args, max_bytes) catch |err| {
+                iso.rejectHostMemoryLimit() catch |limit_err| return limit_err;
+                // Protected value construction can set a pending exception.
+                // It belongs to this rejected host operation, not a later run.
+                iso.vm.clearError();
+                return err;
+            };
+            errdefer prepared.capsule.deinit(alloc_mod.gpa);
+            try iso.rejectHostMemoryLimit();
+            break :blk prepared;
+        };
+        defer snapshot.capsule.deinit(alloc_mod.gpa);
+        const code_identity = invocation.codeIdentity(name);
+        const input_identity = invocation.inputIdentity(effects.input_identity, snapshot.capsule.encoded);
+
+        return iso.enterOuterExecution(struct {
+            fn body(state: *IsolateState, ctx: anytype) !Value {
+                var result: c.mrb_value = undefined;
+                // An empty tuple's array can be comptime-known. Keep a runtime
+                // address for the C call even when argc is zero.
+                var argv = ctx.argv;
+                if (!c.mrz_protected_funcall_with_block(
+                    state.vm.mrb,
+                    ctx.recv.v,
+                    ctx.name.ptr,
+                    ctx.name.len,
+                    @intCast(ctx.argv.len),
+                    &argv,
+                    c.mrz_nil_value(),
+                    &result,
+                )) return error.RubyException;
+                return .{ .mrb = state.vm.mrb, .v = result };
+            }
+        }.body, .{ .recv = recv, .name = name, .argv = snapshot.argv }, code_identity, input_identity);
+    }
+
+    fn SnapshotArguments(comptime count: usize) type {
+        return struct {
+            argv: [count]c.mrb_value,
+            capsule: artifact_mod.StateCapsule,
+        };
+    }
+
+    fn snapshotInvocationArguments(
+        iso: *IsolateState,
+        args: anytype,
+        max_bytes: usize,
+    ) !SnapshotArguments(@typeInfo(@TypeOf(args)).@"struct".field_types.len) {
+        const count = comptime @typeInfo(@TypeOf(args)).@"struct".field_types.len;
+        _ = std.math.cast(c.mrb_int, count) orelse return error.TooManyArguments;
+        if (count > max_bytes) return error.EffectLimitExceeded;
+        const limits: artifact_mod.CapsuleLimits = .{
+            .max_encoded_bytes = max_bytes,
+            .max_nodes = @min(max_bytes, 16_384),
+            .max_total_edges = @min(max_bytes, 65_536),
+            .max_depth = 64,
+            .max_string_bytes = max_bytes,
+            .max_symbol_bytes = max_bytes,
+        };
+        var values: [count]Value = undefined;
+        inline for (0..count) |index| {
+            values[index] = try invocationArgument(iso.vm.mrb, args[index], max_bytes);
+        }
+        const original = try iso.vm.array(&values);
+        var capsule = artifact_value.exportValue(alloc_mod.gpa, iso.vm.mrb, original.asValue().v, .{
+            .limits = limits,
+        }, null) catch |err| switch (err) {
+            error.ArtifactLimitExceeded, error.CapsuleLimitExceeded => return error.EffectLimitExceeded,
+            else => return err,
+        };
+        errdefer capsule.deinit(alloc_mod.gpa);
+        var graph = try artifact_value.parse(alloc_mod.gpa, capsule.view(), .{ .limits = limits, .allow_float = !features.effects_integer64 }, null);
+        defer graph.deinit(alloc_mod.gpa);
+        const materialized = switch (artifact_value.materialize(iso.vm.mrb, &graph)) {
+            .ok => |result| result.value,
+            .out_of_memory => return error.OutOfMemory,
+            .invalid, .unexpected => return error.ArtifactConstructionFailed,
+        };
+        const snapshot = try (Value{ .mrb = iso.vm.mrb, .v = materialized }).asArray();
+        var result: SnapshotArguments(count) = .{ .argv = undefined, .capsule = capsule };
+        inline for (0..count) |index| result.argv[index] = (try snapshot.get(index)).v;
+        return result;
+    }
+
+    fn invocationArgument(mrb: *c.mrb_state, value: anytype, max_bytes: usize) !Value {
+        const T = @TypeOf(value);
+        // The ordinary low-level converter accepts raw C values. Identified
+        // entry cannot: those values carry no VM ownership evidence.
+        if (T == c.mrb_value) return error.UnsupportedValue;
+        if (T == Value or T == Array or T == Hash) return convert_mod.toValue(mrb, value);
+        switch (@typeInfo(T)) {
+            .optional => return if (value) |inner|
+                invocationArgument(mrb, inner, max_bytes)
+            else
+                Value.nil(mrb),
+            .pointer => |pointer| switch (pointer.size) {
+                .slice => if (pointer.child == u8 and value.len > max_bytes)
+                    return error.EffectLimitExceeded,
+                .one => switch (@typeInfo(pointer.child)) {
+                    .array => |array| if (array.child == u8 and array.len > max_bytes)
+                        return error.EffectLimitExceeded,
+                    else => {},
+                },
+                else => {},
+            },
+            else => {},
+        }
+        return convert_mod.toValue(mrb, value);
     }
 
     /// End the bootstrap window explicitly: apply the policy's capabilities
@@ -688,6 +856,7 @@ const IsolateState = struct {
         var failure: artifact_value.Failure = .{};
         var graph = artifact_value.parse(alloc_mod.gpa, capsule, .{
             .limits = limits,
+            .allow_float = !features.effects_integer64,
             .accepted_schema = options.accepted_schema,
         }, &failure) catch |err| {
             iso.recordArtifactFailure(err, &failure);
@@ -822,6 +991,7 @@ const IsolateState = struct {
             .unsupported_hash_key => .unsupported_hash_key,
             .unsupported_container_state => .unsupported_container_state,
             .duplicate_hash_key => .duplicate_hash_key,
+            .numeric_policy_violation => .unsupported_value,
         };
         const error_kind = diagnosticKindForArtifactError(err);
         // A codec refinement (notably duplicate_hash_key) is more actionable
@@ -857,6 +1027,7 @@ const IsolateState = struct {
             error.UnsupportedContainerState => .unsupported_container_state,
             error.UnsupportedHashKey => .unsupported_hash_key,
             error.NumericOutOfRange => .numeric_out_of_range,
+            error.NumericPolicyViolation => .unsupported_value,
             error.SchemaMismatch => .schema_mismatch,
             error.ArtifactConstructionFailed => .construction_failed,
             else => null,
@@ -968,14 +1139,40 @@ const IsolateState = struct {
         };
     }
 
-    fn enterExecution(iso: *IsolateState, comptime body: anytype, ctx: anytype) !Value {
+    fn enterExecution(
+        iso: *IsolateState,
+        comptime body: anytype,
+        ctx: anytype,
+        code_identity: ?[32]u8,
+    ) !Value {
         const admission = try iso.admitExecution();
         if (admission == .nested) return body(iso, ctx);
         defer iso.operation_lock.unlock();
-        return iso.enterOuterExecution(body, ctx);
+        return iso.enterOuterExecution(body, ctx, code_identity, null);
     }
 
-    fn enterOuterExecution(iso: *IsolateState, comptime body: anytype, ctx: anytype) !Value {
+    fn enterOuterExecution(
+        iso: *IsolateState,
+        comptime body: anytype,
+        ctx: anytype,
+        code_identity: ?[32]u8,
+        input_identity: ?[32]u8,
+    ) !Value {
+        return iso.enterOuterPhase(body, ctx, code_identity, input_identity, false);
+    }
+
+    fn enterOuterPhase(
+        iso: *IsolateState,
+        comptime body: anytype,
+        ctx: anytype,
+        code_identity: ?[32]u8,
+        input_identity: ?[32]u8,
+        comptime initializing: bool,
+    ) !Value {
+        // Trace admission is inert. A rejected identity must preserve both a
+        // retained trace and the prior gas generation without entering Ruby.
+        if (!initializing) if (iso.vm.effects) |state| try state.validateExecution(code_identity, input_identity);
+        if (initializing and iso.vm.effects == null) return error.EffectNotInstalled;
         iso.clearErrorView();
         iso.startTiming();
         defer iso.updateElapsed();
@@ -1000,6 +1197,53 @@ const IsolateState = struct {
         const attribution = alloc_mod.pushIsolate(&iso.cell);
         defer alloc_mod.restoreIsolate(attribution);
 
+        if (comptime features.effects_strict) {
+            if (!c.mrz_strict_begin_attempt(iso.vm.mrb)) return error.StrictAttemptActive;
+        }
+        defer if (comptime features.effects_strict) c.mrz_strict_end_attempt(iso.vm.mrb);
+
+        const effects = iso.vm.effects;
+        if (effects) |state| {
+            if (initializing) try state.beginInitialization() else try state.beginExecution(code_identity, input_identity);
+            state.guard_context = iso;
+            state.guard = effectGuard;
+        }
+        defer if (effects) |state| {
+            state.guard = null;
+            state.guard_context = null;
+        };
+
+        const result = iso.runGuestBody(body, ctx) catch |err| {
+            if (effects) |state| finishEffectPhase(state, initializing, false) catch |effect_err| {
+                // Termination remains authoritative even when Ruby rescued
+                // an effect failure while unwinding the same execution.
+                if (currentTermination(iso)) |kind| return terminationError(kind);
+                if (iso.nativeViolation() != null) return error.NativeEffectViolation;
+                return effect_err;
+            };
+            if (currentTermination(iso)) |kind| return terminationError(kind);
+            if (iso.nativeViolation() != null) return error.NativeEffectViolation;
+            return err;
+        };
+        if (iso.nativeViolation() != null) {
+            if (effects) |state| finishEffectPhase(state, initializing, false) catch {};
+            return error.NativeEffectViolation;
+        }
+        if (effects) |state| try finishEffectPhase(state, initializing, true);
+        return result;
+    }
+
+    fn finishEffectPhase(state: *effect_mod.State, comptime initializing: bool, success: bool) !void {
+        if (initializing) try state.finishInitialization(success) else try state.finishExecution(success);
+    }
+
+    fn nativeViolation(iso: *IsolateState) ?c.StrictDiagnostic {
+        if (comptime !features.effects_strict) return null;
+        var detail: c.StrictDiagnostic = undefined;
+        return if (c.mrz_strict_violation(iso.vm.mrb, &detail)) detail else null;
+    }
+
+    fn runGuestBody(iso: *IsolateState, comptime body: anytype, ctx: anytype) !Value {
         const result = body(iso, ctx) catch |err| {
             if (err == error.RubyException) return iso.mapError(err);
             // The final operation may be native code with no later fetch to
@@ -1012,6 +1256,20 @@ const IsolateState = struct {
         iso.pollDeadline();
         if (currentTermination(iso)) |kind| return terminationError(kind);
         return result;
+    }
+
+    fn effectGuard(context: ?*anyopaque) anyerror!void {
+        const iso: *IsolateState = @ptrCast(@alignCast(context.?));
+        try iso.rejectPending(false);
+    }
+
+    fn effectCodeIdentity(iso: *const IsolateState, comptime format: []const u8, bytes: []const u8) ?[32]u8 {
+        const effects = iso.vm.effects orelse return null;
+        if (effects.mode == .live) return null;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("mruby-zig.effect.code.v1\x00" ++ format ++ "\x00");
+        hash.update(bytes);
+        return hash.finalResult();
     }
 
     fn startTiming(iso: *IsolateState) void {
@@ -1254,6 +1512,9 @@ const IsolateState = struct {
             try iso.installFrozenClock(epoch);
             try maskMethods(iso, &authority.clock_read_methods);
         }
+        // Policy pinning must not restore an ambient entry point that the
+        // effect installation masks. Reapply its masks before model sealing.
+        if (iso.vm.effects) |effects| try effects.hardenAmbient();
         if (caps.freeze_object_model) try iso.sealModel();
 
         // The sandbox's own module is a script-visible constant (scripts may
@@ -1729,6 +1990,22 @@ pub const Isolate = struct {
         return iso.internal.call(recv, name, args);
     }
 
+    /// Call an identified Ruby method in live, recording, or replay mode.
+    /// Positional arguments are snapshotted as bounded inert values: Ruby sees
+    /// private copies, preserving aliasing within the argument graph. No block
+    /// is accepted. The host must identify the complete code, bootstrap, and
+    /// starting receiver/handler state; the runtime binds the actual method and
+    /// arguments. Nested identified calls are rejected before execution.
+    pub fn callWithEffects(
+        iso: Isolate,
+        recv: Value,
+        name: []const u8,
+        args: anytype,
+        invocation: effect_mod.Invocation,
+    ) !Value {
+        return iso.internal.callWithEffects(recv, name, args, invocation);
+    }
+
     /// Call a Ruby method with options (block argument), under the policy.
     pub fn callWithOptions(
         iso: Isolate,
@@ -1741,7 +2018,59 @@ pub const Isolate = struct {
             fn body(iso_: *IsolateState, ctx: anytype) !Value {
                 return iso_.vm.callWithOptions(ctx.recv, ctx.name, ctx.args, ctx.options);
             }
-        }.body, .{ .recv = recv, .name = name, .args = args, .options = options });
+        }.body, .{ .recv = recv, .name = name, .args = args, .options = options }, null);
+    }
+
+    /// Transfer the most recent effect trace to the host without entering Ruby.
+    /// The caller owns the returned trace and must deinitialize it. Recording
+    /// and replay require an identified outer entry: `run`, `runImage`,
+    /// `runRite`, or `callWithEffects`. Ordinary calls and load-once CodeDB
+    /// initialization do not supply the required identities.
+    pub fn takeEffectTrace(iso: Isolate) !effect_mod.Trace {
+        return iso.internal.hostOperation(.lock_only, effect_mod.Trace, struct {
+            fn body(state: *IsolateState, _: void) !effect_mod.Trace {
+                const effects = state.vm.effects orelse return error.EffectNotInstalled;
+                return effects.takeTrace();
+            }
+        }.body, {});
+    }
+
+    /// Copy the most recent effect diagnostic without entering Ruby. The
+    /// returned value owns its operation labels and survives later executions.
+    pub fn effectDiagnostic(iso: Isolate) !?effect_mod.Diagnostic {
+        return iso.internal.hostOperation(.lock_only, ?effect_mod.Diagnostic, struct {
+            fn body(state: *IsolateState, _: void) !?effect_mod.Diagnostic {
+                const effects = state.vm.effects orelse return error.EffectNotInstalled;
+                return effects.diagnostic();
+            }
+        }.body, {});
+    }
+
+    /// Owned native admission diagnostic; absent in compatibility builds.
+    pub fn nativeDiagnostic(iso: Isolate) !?c.StrictDiagnostic {
+        return iso.internal.hostOperation(.lock_only, ?c.StrictDiagnostic, struct {
+            fn body(state: *IsolateState, _: void) !?c.StrictDiagnostic {
+                return state.nativeViolation();
+            }
+        }.body, {});
+    }
+
+    /// Host lookup with allocator attribution and serialized VM access.
+    pub fn classValue(iso: Isolate, name: []const u8) !Value {
+        return iso.internal.hostOperation(.attributed, Value, struct {
+            fn body(state: *IsolateState, class_name: []const u8) !Value {
+                return (try state.vm.getClass(class_name)).asValue();
+            }
+        }.body, name);
+    }
+
+    /// Finish the definition phase without exposing the raw VM.
+    pub fn sealModel(iso: Isolate) !void {
+        return iso.internal.hostOperation(.attributed, void, struct {
+            fn body(state: *IsolateState, _: void) !void {
+                try state.sealModel();
+            }
+        }.body, {});
     }
 
     /// Export a bounded, inert Ruby value graph. The returned bytes are

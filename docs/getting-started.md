@@ -161,6 +161,36 @@ that a compiler is required. `test` and `check` use the artifact execution
 suite plus compiler-independent tests. `test-runtime-only` runs that same
 artifact suite under either compiler profile.
 
+## Strict effects profile
+
+`-Deffects-strict=true` selects a core-only minimal runtime without a target
+compiler and enables native implementation admission. It rejects incompatible
+gem/compiler/worker options. Use `mruby.strict.Program` to install Effects before
+bounded application initialization; use CodeDB for all application Ruby.
+
+```sh
+mise x -- zig build test check -Deffects-strict=true
+mise x -- zig build run-effects-inventory -Deffects-strict=true -Dsqlite-effects=true
+mise x -- zig build run-effects-durable -Deffects-strict=true -Dsqlite-effects=true
+mise x -- zig build run-effects-reservation -Deffects-strict=true
+```
+
+For a contained worker with native adapters retained in the host, run
+`mise x -- zig build run-effects-worker -Deffects-strict=true` and see
+[effects-workers.md](effects-workers.md).
+The [durable host guide](effects-durable.md) covers atomic persistence, stable
+request IDs, process-crash recovery, and deferred local delivery.
+Use `mise x -- zig build run-effects-inspect-demo` to inspect a constructed
+receipt without executing Ruby. [Diagnostics and inspection](effects-diagnostics.md)
+covers worker failures, source locations, and safe JSON reports.
+The [typed contracts guide](effects-contracts.md) shows shared operation schemas
+and a reservation flow with staged stock and notification intents.
+
+See [effects-strict.md](effects-strict.md) for downstream build configuration,
+the native trust contract, and links to terminal-state verification and worker
+containment. The ordinary runtime-only profile above retains its
+existing behavior.
+
 ## Allocator profile
 
 All mruby allocations flow through `mruby.alloc`, a Zig-side

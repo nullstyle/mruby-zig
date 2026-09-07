@@ -22,11 +22,44 @@ comptime {
 }
 
 pub const mrb_int = i64;
+/// Binary64 shim transport type; integer64 builds reject Float construction.
 pub const mrb_float = f64;
 pub const mrb_sym = u32;
 pub const mrb_bool = bool;
 pub const mrb_aspec = u32;
 pub const mrb_vtype = c_int;
+
+/// Present only in the strict native build. Call sites must be comptime-gated.
+pub const DiagnosticSource = extern struct {
+    line: u32 = 0,
+    file_len: u32 = 0,
+    method_len: u32 = 0,
+    truncated: u32 = 0,
+    file: [256]u8 = @splat(0),
+    method: [96]u8 = @splat(0),
+
+    pub fn fileName(self: *const DiagnosticSource) []const u8 {
+        return self.file[0..self.file_len];
+    }
+    pub fn methodName(self: *const DiagnosticSource) []const u8 {
+        return self.method[0..self.method_len];
+    }
+};
+pub extern fn mrz_diagnostic_source_current(mrb: *mrb_state, out: *DiagnosticSource) bool;
+pub extern fn mrz_diagnostic_source_exception(mrb: *mrb_state, exc: mrb_value, out: *DiagnosticSource) bool;
+
+/// Present only in the strict native build. Call sites must be comptime-gated.
+pub const StrictDiagnostic = extern struct {
+    reason: u32,
+    name_len: u32,
+    name: [96]u8,
+    source: DiagnosticSource = .{},
+};
+pub extern fn mrz_strict_begin_attempt(mrb: *mrb_state) bool;
+pub extern fn mrz_strict_end_attempt(mrb: *mrb_state) void;
+pub extern fn mrz_strict_violation(mrb: *mrb_state, out: *StrictDiagnostic) bool;
+pub extern fn mrz_strict_approve_method(mrb: *mrb_state, klass: *RClass, name: [*]const u8, length: usize, kind: u8) bool;
+pub extern fn mrz_strict_approve_data_type(mrb: *mrb_state, data_type: *const mrb_data_type) bool;
 
 /// Value types, in `enum mrb_vtype` order (include/mruby/value.h).
 pub const MRB_TT_FALSE: mrb_vtype = 0;
@@ -405,6 +438,13 @@ pub extern fn mrz_protected_set_exception(
     class_name_length: usize,
     message: ?[*]const u8,
     message_length: usize,
+) bool;
+/// Set Effect::Rejected using a saved class and inert [code, message] payload.
+/// Never dispatches guest exception constructors; all raising work stays in C.
+pub extern fn mrz_protected_effect_rejection(
+    mrb: *mrb_state,
+    class: *RClass,
+    payload: mrb_value,
 ) bool;
 /// Install an undefined method-table entry without lookup or Ruby hook
 /// dispatch. This is the sandbox's policy-enforcement primitive, not Ruby's

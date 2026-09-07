@@ -15,6 +15,12 @@
         "CHANGELOG.md",
     },
     .dependencies = .{
+        // Optional inventory/durable examples only; ordinary library builds never fetch SQLite.
+        .sqlite = .{
+            .url = "https://www.sqlite.org/2026/sqlite-amalgamation-3510300.zip",
+            .hash = "N-V-__8AAP9sqgBev59LwVcnj55f78cieK8cAZuADYdwUJLo",
+            .lazy = true,
+        },
         .mruby = .{
             .url = "https://github.com/mruby/mruby/archive/refs/tags/4.0.0.tar.gz",
             .hash = "N-V-__8AANTiWAB7SfrLfA6pKTaZPFOZT4biv9oK15dP3zUP",

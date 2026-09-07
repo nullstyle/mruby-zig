@@ -64,11 +64,16 @@ fn fuzzOne(_: void, smith: *std.testing.Smith) !void {
 }
 
 fn exercise(encoded: []const u8, accepted_schema: ?artifact.Schema) !void {
+    try exerciseWithPolicy(encoded, accepted_schema, true);
+    try exerciseWithPolicy(encoded, accepted_schema, false);
+}
+
+fn exerciseWithPolicy(encoded: []const u8, accepted_schema: ?artifact.Schema, allow_float: bool) !void {
     var failure: codec.Failure = .{};
     var graph = codec.parse(
         std.testing.allocator,
         .{ .bytes = encoded },
-        .{ .limits = limits, .accepted_schema = accepted_schema },
+        .{ .limits = limits, .accepted_schema = accepted_schema, .allow_float = allow_float },
         &failure,
     ) catch |err| switch (err) {
         error.InvalidArtifact,
@@ -78,12 +83,20 @@ fn exercise(encoded: []const u8, accepted_schema: ?artifact.Schema) !void {
         error.SchemaMismatch,
         error.CapsuleLimitExceeded,
         => return,
+        error.NumericPolicyViolation => {
+            try std.testing.expect(!allow_float);
+            return;
+        },
         error.OutOfMemory => return err,
     };
     defer graph.deinit(std.testing.allocator);
 
     try std.testing.expect(graph.nodes.len <= limits.max_nodes);
     try std.testing.expect(graph.edges.len <= limits.max_total_edges);
+    if (!allow_float) {
+        try std.testing.expect(graph.root.tag != mruby.c.MRZ_ARTIFACT_REF_F64);
+        for (graph.edges) |edge| try std.testing.expect(edge.tag != mruby.c.MRZ_ARTIFACT_REF_F64);
+    }
     if (graph.schema) |produced| {
         const accepted = accepted_schema orelse return error.UnexpectedSchemaAdmission;
         try std.testing.expect(accepted.accepts(produced));

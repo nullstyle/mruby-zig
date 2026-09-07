@@ -89,8 +89,11 @@ pub fn main(init: std.process.Init) !void {
         \\pub const rite_compatibility_epoch: u32 = {d};
         \\pub const rite_binary_version = "{s}";
         \\pub const rite_vm_version = "{s}";
+        \\pub const integer_bits: u16 = {d};
+        \\pub const float_bits: u16 = {d};
+        \\pub const inline_float: bool = {};
         \\
-    , .{ compatibility_epoch, rite_binary_version, rite_vm_version });
+    , .{ compatibility_epoch, rite_binary_version, rite_vm_version, integer_bits, float_bits, inline_float });
 
     if (std.fs.path.dirname(output_path)) |dir| try cwd.createDirPath(io, dir);
     try cwd.writeFile(io, .{

@@ -56,6 +56,14 @@ deploy the matching `mruby-worker` executable produced by the build.
 | [getting-started.md](docs/getting-started.md) | dependency setup, build options (gems, allocator), feature manifest, dev commands, running CI locally |
 | [safe-api.md](docs/safe-api.md) | embedding API: evaluation, exceptions, host functions, data wrapping, collections, lifetimes and roots, threading |
 | [sandboxing.md](docs/sandboxing.md) | policies and presets, gas/deadline/memory limits, termination, lifecycle and sealing, threat model |
+| [effects.md](docs/effects.md) | experimental explicit effects, handler grants, inert requests, and record/replay |
+| [effects-strict.md](docs/effects-strict.md) | strict native admission, guarded CodeDB initialization, and remaining trust assumptions |
+| [effects-integer64.md](docs/effects-integer64.md) | optional signed 64-bit integer runtime, Float admission policy, and canonical numeric corpus |
+| [effects-turns.md](docs/effects-turns.md) | data-only handlers, fresh turns, explicit state, terminal verification, and commit/discard |
+| [effects-workers.md](docs/effects-workers.md) | OS-contained Ruby workers, host effect broker, and mandatory fresh replay before commit |
+| [effects-durable.md](docs/effects-durable.md) | typed durable reservations, atomic SQLite turns, stable retries, and deferred idempotent delivery |
+| [effects-diagnostics.md](docs/effects-diagnostics.md) | owned worker failure details, native source locations, and VM-free receipt inspection |
+| [effects-contracts.md](docs/effects-contracts.md) | shared operation and whole-turn schemas, validation, and a reservation domain example |
 | [artifacts.md](docs/artifacts.md) | typed RITE images, CodeDB build-time Ruby, state capsules, compatibility policy |
 | [workers.md](docs/workers.md) | one-shot process execution, typed outcomes, OS limits, deployment and security boundary |
 | [platforms.md](docs/platforms.md) | support matrix and CI coverage |
@@ -73,6 +81,29 @@ restricted policy, bootstrap + seal, limits, host access.
 repeated invoice jobs, source metadata, restricted execution, and capsule output.
 It also runs with `-Dno-compiler`, which removes the target parser/code generator
 while preserving build-time compilation and sandbox limits.
+[effects_demo](examples/effects_demo.zig) — explicit Ruby operations with live
+and fixed handlers, owned outbox intents, and record/replay across fresh VMs;
+also runs with `-Dno-compiler`.
+[effects_inventory](examples/effects_inventory.zig) — identified method calls,
+SQLite reservations, recoverable rejections, inspection grants, and replay;
+run with `zig build run-effects-inventory -Dsqlite-effects=true`.
+Add `-Deffects-strict=true` to exercise guarded initialization and native
+enforcement in the minimal runtime.
+[effects_turn](examples/effects_turn.zig) — data-only handlers, explicit state,
+staged intents/output, commit/discard, and verified terminal replay;
+run with `zig build run-effects-turn -Deffects-strict=true`.
+[effects_worker](examples/effects_worker.zig) — contained child processes, host-only
+effect adapters, journal validation, and mandatory fresh replay before commit;
+run with `zig build run-effects-worker -Deffects-strict=true`.
+[effects_durable](examples/effects_durable.zig) — typed reservation/notification
+effects, whole-turn admission, atomic disk persistence, retry recovery, and a
+separate local recipient that deduplicates intents;
+run with `zig build run-effects-durable -Deffects-strict=true -Dsqlite-effects=true`.
+
+[effects_integer64](examples/effects_integer64.zig) — checked integer arithmetic,
+full-width comparisons, Float boundary regressions, and canonical effect/terminal
+output for platform comparison; on Linux/macOS x86_64 or aarch64, run with
+`zig build run-effects-integer64 -Deffects-strict=true -Deffects-integer64=true`.
 
 ## Highlights
 
@@ -89,12 +120,24 @@ while preserving build-time compilation and sandbox limits.
 - **Typed artifacts**: compile-once RITE images with build-compatibility
   fingerprints and application identity; inert state capsules that move
   value graphs across processes without executing guest code.
+- **Experimental effects**: first-class inert requests with explicit
+  `Effect.perform` sites, deny-by-default operation grants, replaceable host
+  handlers, recoverable application rejections, and bounded transcripts that
+  replay identified scripts or method calls without invoking handlers.
+  The opt-in strict profile adds native implementation admission from VM creation
+  and rejects performed effects during application initialization.
+  `strict.Turn` adds fresh VMs, data-only handlers, explicit state, terminal
+  verification, and host commit/discard. `strict.Worker` moves Ruby into
+  OS-contained processes and keeps adapter authority in the host broker.
+  The durable reference host commits state, receipts, inventory, and outbox
+  together, with stable request IDs and process-crash recovery tests.
 - **Worker processes**: synchronous one-shot `runRite` execution in a fresh
   Linux/macOS helper, with bounded binary framing, typed capsule transfer,
   hard wall/CPU supervision, and optional Linux address-space ceilings.
 - **Generated build**: presym tables, core bytecode, and gem registry all
   generated by `build.zig` — the rake build reproduced in Zig, with one
-  audited core patch (see [maintenance.md](docs/maintenance.md)).
+  audited hash patch and optional strict-profile patches (see
+  [maintenance.md](docs/maintenance.md)).
 - **Auditable authority**: core, compiler, and every catalog gem declare the
   authority they can expose; the generated manifest reports it per source,
   and worker builds fail closed on host-access authority unless explicitly
