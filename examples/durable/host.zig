@@ -307,6 +307,9 @@ pub const Host = struct {
             try done(&update);
             if (self.db.changes() != 1) return error.InvalidDurableState;
         }
+        var subject: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(next.encoded, &subject, .{});
+        try self.appendChain(1, request.upgrade_id, &fingerprint, next_revision, &subject);
         self.db.exec("COMMIT") catch {
             // The publication outcome is uncertain: close and reopen, then
             // retry this exact upgrade to resolve the durable decision.
@@ -493,6 +496,104 @@ pub const Host = struct {
             if (!sent) break;
         }
         return delivered;
+    }
+
+    /// Result of walking the tamper-evident history chain.
+    pub const ChainSummary = struct {
+        /// Number of chained revision events (turns plus upgrades).
+        entries: usize,
+        /// Revision of the newest chained event; zero when nothing is chained.
+        head_revision: i64,
+        /// Digest of the newest chained event; all zeroes when unchained.
+        head_digest: [32]u8,
+    };
+
+    /// Walk the append-only chain of revision events and verify it: every
+    /// digest recomputes from its stored fields, every link points at the
+    /// previous digest (genesis is all zeroes), revisions are contiguous
+    /// starting at one, and every chain entry whose live row still exists
+    /// matches its stored request hash and subject digest. Chain rows survive
+    /// pruning, so history cannot be restated or reordered without breaking a
+    /// link; truncating the tail is only detectable against an exported head.
+    pub fn verifyChain(self: *Host) !ChainSummary {
+        try self.enter();
+        defer self.in_use = false;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        var query = try self.db.prepare("SELECT revision,kind,record_id,request_hash,subject,prev,digest FROM history_chain ORDER BY sequence");
+        defer query.deinit();
+        var expected_prev: [32]u8 = @splat(0);
+        var expected_revision: i64 = 0;
+        var entries: usize = 0;
+        while (try query.step() == .row) {
+            const revision = try query.int(0);
+            const kind = try query.int(1);
+            const record_id = try query.copyText(owned, 2, 128);
+            const request_hash = (try query.copyBlob(owned, 3, 32))[0..32].*;
+            const subject = (try query.copyBlob(owned, 4, 32))[0..32].*;
+            const prev = (try query.copyBlob(owned, 5, 32))[0..32].*;
+            const digest = (try query.copyBlob(owned, 6, 32))[0..32].*;
+            if (revision != expected_revision + 1 or !std.mem.eql(u8, &prev, &expected_prev) or
+                !std.mem.eql(u8, &digest, &chainDigest(&prev, @intCast(kind), record_id, &request_hash, revision, &subject))) return error.ChainBroken;
+            // Cross-check against the live row when it still exists; pruned
+            // turns deliberately leave only their chain entry behind.
+            if (kind == 0) {
+                var live = try self.db.prepare("SELECT request_hash,receipt FROM turns WHERE turn_id=?");
+                defer live.deinit();
+                try live.bindText(1, record_id);
+                if (try live.step() == .row) {
+                    if (!std.mem.eql(u8, try live.blob(0), &request_hash)) return error.ChainRewritten;
+                    var computed: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(try live.blob(1), &computed, .{});
+                    if (!std.mem.eql(u8, &computed, &subject)) return error.ChainRewritten;
+                    if (try live.step() != .done) return error.InvalidDurableState;
+                }
+            } else if (kind == 1) {
+                var live = try self.db.prepare("SELECT request_hash FROM upgrades WHERE upgrade_id=?");
+                defer live.deinit();
+                try live.bindText(1, record_id);
+                if (try live.step() == .row) {
+                    if (!std.mem.eql(u8, try live.blob(0), &request_hash)) return error.ChainRewritten;
+                    if (try live.step() != .done) return error.InvalidDurableState;
+                }
+            } else return error.ChainBroken;
+            expected_prev = digest;
+            expected_revision = revision;
+            entries += 1;
+        }
+        return .{ .entries = entries, .head_revision = expected_revision, .head_digest = expected_prev };
+    }
+
+    /// Current chain head digest, or all zeroes when nothing is chained.
+    fn chainHead(self: *Host) ![32]u8 {
+        var query = try self.db.prepare("SELECT digest FROM history_chain ORDER BY sequence DESC LIMIT 1");
+        defer query.deinit();
+        if (try query.step() == .row) {
+            const value = try query.blob(0);
+            if (value.len != 32) return error.InvalidDurableState;
+            const digest = value[0..32].*;
+            if (try query.step() != .done) return error.InvalidDurableState;
+            return digest;
+        }
+        return @splat(0);
+    }
+    /// Append one revision event to the history chain inside the caller's
+    /// open transaction. `subject` digests the event's content: receipt bytes
+    /// for a turn, published state bytes for an upgrade.
+    fn appendChain(self: *Host, kind: u8, record_id: []const u8, request_hash: *const [32]u8, revision: i64, subject: *const [32]u8) !void {
+        const prev = try self.chainHead();
+        const digest = chainDigest(&prev, kind, record_id, request_hash, revision, subject);
+        var insert = try self.db.prepare("INSERT INTO history_chain(revision,kind,record_id,request_hash,subject,prev,digest) VALUES(?,?,?,?,?,?,?)");
+        defer insert.deinit();
+        try insert.bindInt(1, revision);
+        try insert.bindInt(2, kind);
+        try insert.bindText(3, record_id);
+        try insert.bindBlob(4, request_hash);
+        try insert.bindBlob(5, subject);
+        try insert.bindBlob(6, &prev);
+        try insert.bindBlob(7, &digest);
+        try done(&insert);
     }
 
     fn enter(self: *Host) !void {
@@ -693,7 +794,7 @@ pub const Host = struct {
             defer query.deinit();
             if (try query.step() != .row or !std.mem.eql(u8, try query.text(0), "3")) return error.UnsupportedDurableSchema;
             if (try query.step() != .done) return error.UnsupportedDurableSchema;
-        } else if (try self.db.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('admissions','current_state','stock','turns','turn_versions','upgrades','reservations','outbox')") != 0) {
+        } else if (try self.db.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('admissions','current_state','stock','turns','turn_versions','upgrades','history_chain','reservations','outbox')") != 0) {
             return error.UnsupportedDurableSchema;
         }
         try self.db.exec("BEGIN IMMEDIATE");
@@ -852,6 +953,9 @@ const Execution = struct {
             try insert.bindBlob(2, &self.host.apps[self.ordinal].application);
             try done(&insert);
         }
+        var subject: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(receipt, &subject, .{});
+        try self.host.appendChain(0, self.request.turn_id, &self.request_hash, self.next_revision, &subject);
         self.host.checkpoint.reach(.before_commit);
         self.host.db.exec("COMMIT") catch {
             // Conservatively classify every COMMIT error as uncertain. Suppress
@@ -1116,6 +1220,20 @@ fn validName(name: []const u8) !void {
 fn done(statement: *sql.Statement) !void {
     if (try statement.step() != .done) return error.DatabaseUnexpectedRow;
 }
+/// One history-chain link: the domain tag, previous digest, event kind,
+/// record ID, request hash, revision, and the event's subject digest.
+pub fn chainDigest(prev: *const [32]u8, kind: u8, record_id: []const u8, request_hash: *const [32]u8, revision: i64, subject: *const [32]u8) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("mruby-zig.durable.chain.v1\x00");
+    hash.update(prev);
+    hash.update(&.{kind});
+    hashBytes(&hash, record_id);
+    hash.update(request_hash);
+    hashInteger(&hash, revision);
+    hash.update(subject);
+    return hash.finalResult();
+}
+
 fn hashBytes(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
     var length: [8]u8 = undefined;
     std.mem.writeInt(u64, &length, @intCast(bytes.len), .big);
@@ -1134,5 +1252,6 @@ const schema =
     "CREATE TABLE IF NOT EXISTS turns(turn_id TEXT PRIMARY KEY,request_hash BLOB NOT NULL CHECK(length(request_hash)=32),starting_revision INTEGER NOT NULL,start_state BLOB NOT NULL,input BLOB NOT NULL,adapter_identity BLOB NOT NULL CHECK(length(adapter_identity)=32),receipt BLOB NOT NULL,revision INTEGER NOT NULL UNIQUE CHECK(revision>0)) STRICT;" ++
     "CREATE TABLE IF NOT EXISTS turn_versions(turn_id TEXT PRIMARY KEY,application BLOB NOT NULL CHECK(length(application)=32),FOREIGN KEY(turn_id) REFERENCES turns(turn_id)) STRICT;" ++
     "CREATE TABLE IF NOT EXISTS upgrades(upgrade_id TEXT PRIMARY KEY,request_hash BLOB NOT NULL CHECK(length(request_hash)=32),from_application BLOB NOT NULL CHECK(length(from_application)=32),to_application BLOB NOT NULL CHECK(length(to_application)=32),starting_revision INTEGER NOT NULL CHECK(starting_revision>=0),revision INTEGER NOT NULL CHECK(revision>0)) STRICT;" ++
+    "CREATE TABLE IF NOT EXISTS history_chain(sequence INTEGER PRIMARY KEY,revision INTEGER NOT NULL UNIQUE CHECK(revision>0),kind INTEGER NOT NULL CHECK(kind IN (0,1)),record_id TEXT NOT NULL,request_hash BLOB NOT NULL CHECK(length(request_hash)=32),subject BLOB NOT NULL CHECK(length(subject)=32),prev BLOB NOT NULL CHECK(length(prev)=32),digest BLOB NOT NULL CHECK(length(digest)=32)) STRICT;" ++
     "CREATE TABLE IF NOT EXISTS reservations(turn_id TEXT NOT NULL,sequence INTEGER NOT NULL CHECK(sequence>=0),sku TEXT NOT NULL REFERENCES stock(sku),quantity INTEGER NOT NULL CHECK(quantity>0),PRIMARY KEY(turn_id,sequence),FOREIGN KEY(turn_id) REFERENCES turns(turn_id) DEFERRABLE INITIALLY DEFERRED) STRICT;" ++
     "CREATE TABLE IF NOT EXISTS outbox(intent_id TEXT PRIMARY KEY,turn_id TEXT NOT NULL,sequence INTEGER NOT NULL CHECK(sequence>=0),destination TEXT NOT NULL,payload BLOB NOT NULL,delivered INTEGER NOT NULL CHECK(delivered IN(0,1)),UNIQUE(turn_id,sequence),FOREIGN KEY(turn_id) REFERENCES turns(turn_id) DEFERRABLE INITIALLY DEFERRED) STRICT;";
