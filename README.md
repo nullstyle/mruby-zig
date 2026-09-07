@@ -61,7 +61,7 @@ deploy the matching `mruby-worker` executable produced by the build.
 | [effects-integer64.md](docs/effects-integer64.md) | optional signed 64-bit integer runtime, Float admission policy, and canonical numeric corpus |
 | [effects-turns.md](docs/effects-turns.md) | data-only handlers, fresh turns, explicit state, terminal verification, and commit/discard |
 | [effects-workers.md](docs/effects-workers.md) | OS-contained Ruby workers, host effect broker, and mandatory fresh replay before commit |
-| [effects-durable.md](docs/effects-durable.md) | typed durable reservations, atomic SQLite turns, stable retries, and deferred idempotent delivery |
+| [effects-durable.md](docs/effects-durable.md) | typed durable reservations, atomic SQLite turns, stable retries, controlled application upgrades, and deferred idempotent delivery |
 | [effects-diagnostics.md](docs/effects-diagnostics.md) | owned worker failure details, native source locations, and VM-free receipt inspection |
 | [effects-contracts.md](docs/effects-contracts.md) | shared operation and whole-turn schemas, validation, and a reservation domain example |
 | [artifacts.md](docs/artifacts.md) | typed RITE images, CodeDB build-time Ruby, state capsules, compatibility policy |
