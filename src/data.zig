@@ -30,6 +30,12 @@ pub fn DataType(
             .dfree = if (destroy != null) dfreeC else null,
         };
 
+        /// Native identity used by audited runtime registration. This grants
+        /// nothing by itself; ordinary wrappers are rejected in strict VMs.
+        pub fn nativeType() *const c.mrb_data_type {
+            return &data_type;
+        }
+
         fn dfreeC(mrb: ?*c.mrb_state, p: ?*anyopaque) callconv(.c) void {
             _ = mrb;
             if (p) |ptr| {

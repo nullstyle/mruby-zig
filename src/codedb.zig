@@ -56,6 +56,8 @@ pub fn run(iso: sandbox_mod.Isolate, manifest: anytype, name: []const u8) RunErr
 /// constants. Every initializer in this call shares one execution budget.
 /// The first load binds the isolate to this manifest. Initialization failure
 /// poisons its loader permanently; recovery needs a fresh isolate.
+/// Live effect handlers are supported, but recording and replay require
+/// `run`/`runArtifact` because load-once initialization has no code identity.
 pub fn load(iso: sandbox_mod.Isolate, comptime manifest: type, name: []const u8) LoadError!bool {
     comptime validateManifest(manifest);
     const Compiled = struct {
@@ -65,6 +67,17 @@ pub fn load(iso: sandbox_mod.Isolate, comptime manifest: type, name: []const u8)
         const entries = compileGraph(manifest);
     };
     return iso.internal.loadCodeDB(&Compiled.identity, &Compiled.entries, name);
+}
+
+/// Strict initialization uses the existing graph validation and loader, but
+/// forbids performed effects and poisons the loader on any failed initializer.
+pub fn initializeStrict(iso: sandbox_mod.Isolate, comptime manifest: type, name: []const u8) LoadError!bool {
+    comptime validateManifest(manifest);
+    const Compiled = struct {
+        var identity: u8 = 0;
+        const entries = compileGraph(manifest);
+    };
+    return iso.internal.initializeCodeDB(&Compiled.identity, &Compiled.entries, name);
 }
 
 const GraphEntry = struct {

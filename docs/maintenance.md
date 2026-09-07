@@ -30,7 +30,7 @@ functions, keeping every layout decision on the C side.
 
 ## Audited core patch
 
-`tools/patch_mruby_hash.zig` produces the one audited mruby core patch: a
+`tools/patch_mruby_hash.zig` produces the shared audited mruby hash patch: a
 cache-owned copy of `hash.c` (never written into the package dependency).
 mruby 4.0 word boxing stores full-width signed integers outside the fixnum
 range in `RInteger`, but the non-BigInt Hash fallback hashes those objects
@@ -41,6 +41,13 @@ stable name-byte hashes. Both patch markers
 (`hash_integer_patch_marker`, `hash_symbol_patch_marker` in `build.zig`)
 participate in the RITE compatibility fingerprint, so any change to the
 patch semantics rejects previously produced artifacts.
+
+The optional strict-effects profile additionally runs
+`tools/patch_mruby_strict.zig` over cache-owned core/header copies. Its catalogue
+in `build/native_catalogue.zig` pins source hashes and explicitly classifies native
+implementations. Exact replacement counts verify every dispatch and primitive
+patch site. The strict source/catalogue digest participates in compatibility
+identity. See [effects-strict.md](effects-strict.md) for the enforcement contract.
 
 ## Upgrading mruby
 
@@ -54,6 +61,13 @@ patch semantics rejects previously produced artifacts.
    change shape) and `tools/patch_mruby_hash.zig` (the patch context is
    literal C text — upstream edits to `hash.c` break the match loudly, by
    design).
+   Re-audit every strict-profile source/native entry and dispatch form before
+   updating its source hashes. Run `test check -Deffects-strict=true` in Debug
+   and ReleaseSafe, including the optional SQLite example.
+   Diagnostic capture also reads native IREP debug positions and packed
+   `MRB_TT_BACKTRACE` locations in `src/shim.c`. Recheck those layouts and run
+   the source-location, hostile-exception-method, and worker diagnostic tests;
+   guest-provided backtrace strings must never become trusted source metadata.
 4. If the presym table layout or generation procedure changed, verify the
    canonical digest is still derived from the emitted table, not inputs.
 5. The fingerprint changes automatically through its inputs (version,

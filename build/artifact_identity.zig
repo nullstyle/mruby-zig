@@ -35,6 +35,7 @@ pub const Inputs = struct {
     pointer_bits: u16,
     endian: Endian,
     integer_bits: u16,
+    /// Zero denotes an integer-only runtime with no Float representation.
     float_bits: u16,
     boxing: Boxing,
     inline_float: bool,
@@ -235,4 +236,17 @@ test "unrepresented build labels cannot affect the fingerprint" {
     const macos_debug_cpu_name = fingerprint(fixture);
     const linux_release_cpu_name = fingerprint(fixture);
     try std.testing.expectEqualSlices(u8, &macos_debug_cpu_name, &linux_release_cpu_name);
+}
+
+test "integer-only traits and policy distinguish artifacts from Float builds" {
+    var integer_only = fixture;
+    integer_only.float_bits = 0;
+    integer_only.inline_float = false;
+    integer_only.semantic_defines = &.{ "MRB_NO_FLOAT", "MRB_INT64", "MRZ_INTEGER_ONLY=1" };
+    integer_only.generated_configuration = &.{"effects-integer64-policy=v1"};
+    const integer_digest = fingerprint(integer_only);
+    try std.testing.expect(!std.mem.eql(u8, &fingerprint(fixture), &integer_digest));
+    var changed_policy = integer_only;
+    changed_policy.generated_configuration = &.{"effects-integer64-policy=v2"};
+    try std.testing.expect(!std.mem.eql(u8, &fingerprint(changed_policy), &integer_digest));
 }

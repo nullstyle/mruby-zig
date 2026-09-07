@@ -59,6 +59,8 @@ pub const Vm = struct {
     /// stdout via mruby's default `print` (cstdio).
     writer: ?*std.Io.Writer = null,
     output_installed: bool = false,
+    /// Bootstrap-installed effect dispatcher and host-owned execution state.
+    effects: ?*@import("effect.zig").State = null,
 
     /// Look up the Vm for a C state (used internally by method callbacks).
     pub fn fromMrb(mrb: *c.mrb_state) *Vm {
@@ -78,6 +80,10 @@ pub const Vm = struct {
     pub fn init() !*Vm {
         const mrb = c.mrb_open() orelse return error.OutOfMemory;
         errdefer c.mrb_close(mrb);
+        if (comptime features.effects_strict) {
+            var detail: c.StrictDiagnostic = undefined;
+            if (c.mrz_strict_violation(mrb, &detail)) return error.StrictInitializationFailed;
+        }
         if (!c.mrz_nil_p(c.mrz_exc_value(mrb))) {
             captureInitFailure(mrb);
             return error.InitFailed;
@@ -120,6 +126,7 @@ pub const Vm = struct {
     }
 
     pub fn deinit(vm: *Vm) void {
+        if (vm.effects) |effects| effects.deinit();
         vm.roots.deinit();
         {
             registryLock();

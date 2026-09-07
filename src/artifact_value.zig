@@ -31,6 +31,7 @@ pub const ExportError = std.mem.Allocator.Error || artifact.FramingError || erro
 
 pub const ParseError = std.mem.Allocator.Error || artifact.StateValidationError || error{
     CapsuleLimitExceeded,
+    NumericPolicyViolation,
 };
 
 pub const FailureKind = enum {
@@ -42,6 +43,7 @@ pub const FailureKind = enum {
     unsupported_hash_key,
     unsupported_container_state,
     duplicate_hash_key,
+    numeric_policy_violation,
 };
 
 /// Best-effort diagnostics contain no allocation and remain valid when an
@@ -73,6 +75,8 @@ pub const ExportOptions = struct {
 
 pub const ParseOptions = struct {
     limits: artifact.CapsuleLimits = .{},
+    /// Structural tools accept Float bits; execution supplies its stricter policy.
+    allow_float: bool = true,
     accepted_schema: ?artifact.Schema = null,
 };
 
@@ -599,6 +603,7 @@ pub fn parse(
 
     var parse_context: ParseContext = .{
         .allocator = allocator,
+        .allow_float = options.allow_float,
         .limits = options.limits,
         .failure = failure,
         .nodes = nodes,
@@ -652,6 +657,7 @@ pub fn parse(
 
 const ParseContext = struct {
     allocator: std.mem.Allocator,
+    allow_float: bool,
     limits: artifact.CapsuleLimits,
     failure: ?*Failure,
     nodes: []c.mrz_artifact_node,
@@ -822,6 +828,11 @@ fn parseRef(
             result.payload = @bitCast(integer);
         },
         .float => |bits| {
+            if (!context.allow_float) {
+                setParseFailure(context.failure, .numeric_policy_violation, payload_offset, site);
+                if (context.failure) |failure| failure.value_type = c.MRB_TT_FLOAT;
+                return error.NumericPolicyViolation;
+            }
             result.tag = c.MRZ_ARTIFACT_REF_F64;
             result.payload = bits;
         },

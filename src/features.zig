@@ -20,8 +20,10 @@
 //!
 //! The manifest is generated per build: `-Dgem-set`, `-Dwith-gems`, and
 //! `-Dwithout-gems` change `gems`/`gem_set`/`custom_selection`, and the
-//! compiler profile is exposed as `has_compiler`, and the compatibility
-//! identity follows the compiler profile, presym table, and target traits.
+//! compiler profile is exposed as `has_compiler`. The strict native profile
+//! is exposed as `effects_strict`; its optional integer-only profile is
+//! `effects_integer64`. Compatibility identity includes these profiles,
+//! the presym table, native catalogue, and target traits.
 
 const std = @import("std");
 
@@ -119,6 +121,24 @@ pub const has_debug_hook: bool = true;
 /// build-time host compiler remains available to generate CodeDB artifacts.
 pub const has_compiler: bool = config.has_compiler;
 
+/// Strict effects execution profile: minimal native surface, no runtime
+/// compiler, and guarded application bootstrap. Use `mruby.strict.Program`.
+pub const effects_strict: bool = config.effects_strict;
+
+/// Strict signed 64-bit integer profile. Float values are unavailable to
+/// execution; the build-time compiler uses the same numeric configuration.
+pub const effects_integer64: bool = config.effects_integer64;
+/// Numeric representation recorded in the artifact compatibility identity.
+pub const integer_bits: u16 = artifact_config.integer_bits;
+pub const float_bits: u16 = artifact_config.float_bits;
+pub const inline_float: bool = artifact_config.inline_float;
+pub const has_float: bool = float_bits != 0;
+
+/// Dedicated strict application workers with a host effect broker are
+/// available on Linux/macOS x86_64 and aarch64. This is independent of the
+/// compatibility worker gate below.
+pub const effects_worker_supported: bool = config.effects_worker_supported;
+
 /// Whether the sandboxing tier is usable in this build: the debug hook
 /// must be compiled in and the target must satisfy the ABI constraint.
 pub const sandbox_supported: bool = has_debug_hook and pointer_bits == 64;
@@ -142,6 +162,12 @@ pub const worker_ambient_authority_opt_in: bool =
 pub const worker_process_supported: bool = config.worker_process_supported;
 
 comptime {
+    if (effects_integer64 and (!effects_strict or pointer_bits != 64 or integer_bits != 64 or has_float or inline_float)) {
+        @compileError("integer effects requires strict execution, 64-bit integers, and no Float");
+    }
+    if (effects_strict and (has_compiler or gems.len != 0 or worker_process_supported)) {
+        @compileError("strict effects requires minimal gems, no runtime compiler, and no generic worker");
+    }
     if (sandbox_supported and @bitSizeOf(usize) != pointer_bits) {
         @compileError("features.sandbox_supported disagrees with the compiled target");
     }

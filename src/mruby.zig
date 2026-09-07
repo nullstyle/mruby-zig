@@ -37,6 +37,8 @@ pub const sandbox = @import("sandbox.zig");
 pub const worker = @import("worker.zig");
 pub const features = @import("features.zig");
 pub const codedb = @import("codedb.zig");
+pub const effect = @import("effect.zig");
+pub const strict = @import("strict.zig");
 
 // libmruby's C objects call this Zig export even when a consumer only reads
 // compile-time metadata from this module. Force the allocator namespace to be
@@ -67,4 +69,10 @@ test {
     _ = @import("artifact_value.zig");
     _ = @import("sandbox.zig");
     _ = @import("worker.zig");
+}
+
+// Keep the bounded diagnostic codec tests discoverable when the build runs
+// only their filtered target against this module's native/configuration setup.
+test "worker diagnostic codec module" {
+    _ = @import("effect_worker_diagnostic.zig");
 }

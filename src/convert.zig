@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const c = @import("c.zig");
+const features = @import("features.zig");
 const value_mod = @import("value.zig");
 
 pub const Value = value_mod.Value;
@@ -32,6 +33,7 @@ pub fn toValue(mrb: *c.mrb_state, x: anytype) !Value {
             break :blk .{ .mrb = mrb, .v = value };
         },
         .float, .comptime_float => blk: {
+            if (comptime features.effects_integer64) return error.NumericPolicyViolation;
             const floating = try toMrbFloat(x);
             var value: c.mrb_value = undefined;
             if (!c.mrz_protected_float(mrb, floating, &value))

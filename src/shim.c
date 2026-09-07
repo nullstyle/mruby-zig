@@ -20,6 +20,7 @@
 #include <mruby/hash.h>
 #include <mruby/string.h>
 #include <mruby/proc.h>
+#include <mruby/debug.h>
 #ifndef MRZ_NO_COMPILER
 #include <mruby/compile.h>
 #include <mruby/dump.h>
@@ -29,7 +30,93 @@
 #include <mruby/variable.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include "strict_native.h"
+
+/* Diagnostic reads never allocate, raise, or dispatch guest methods. The
+ * caller owns the bounded copy; missing debug data stays explicitly absent. */
+static void
+mrz_diagnostic_copy(char *out, size_t capacity, uint32_t *length,
+                    uint32_t *truncated, const char *bytes, size_t size)
+{
+  if (size > capacity) { size = capacity; *truncated = 1; }
+  if (size != 0) memcpy(out, bytes, size);
+  *length = (uint32_t)size;
+}
+
+static mrb_bool
+mrz_diagnostic_position(mrb_state *mrb, const mrb_irep *irep,
+                        uint32_t pc, mrb_sym method,
+                        struct mrz_diagnostic_source *out)
+{
+  int32_t line = -1;
+  const char *file = NULL;
+  if (irep == NULL || irep->debug_info == NULL || pc >= irep->ilen ||
+      !mrb_debug_get_position(mrb, irep, pc, &line, &file) || file == NULL)
+    return FALSE;
+  /* Filename bytes come from an interned source name. Bound the scan too. */
+  size_t file_size = 0;
+  while (file_size <= sizeof(out->file) && file[file_size] != '\0') ++file_size;
+  mrz_diagnostic_copy(out->file, sizeof(out->file), &out->file_len,
+                      &out->truncated, file, file_size);
+  if (line > 0) out->line = (uint32_t)line;
+  if (method != 0) {
+    mrb_int size = 0;
+    const char *name = mrb_sym_name_len(mrb, method, &size);
+    if (name != NULL && size > 0)
+      mrz_diagnostic_copy(out->method, sizeof(out->method), &out->method_len,
+                          &out->truncated, name, (size_t)size);
+  }
+  return out->file_len != 0;
+}
+
+mrb_bool
+mrz_diagnostic_source_current(mrb_state *mrb, struct mrz_diagnostic_source *out)
+{
+  if (out == NULL) return FALSE;
+  memset(out, 0, sizeof(*out));
+  if (mrb->c == NULL || mrb->c->ci == NULL || mrb->c->cibase == NULL ||
+      mrb->c->ci < mrb->c->cibase || mrb->c->ci >= mrb->c->ciend) return FALSE;
+  size_t inspected = 0;
+  for (mrb_callinfo *ci = mrb->c->ci; ci >= mrb->c->cibase; --ci) {
+    if (++inspected > 256) break;
+    if (ci->proc != NULL && !MRB_PROC_CFUNC_P(ci->proc) &&
+        !MRB_PROC_ALIAS_P(ci->proc) && ci->pc != NULL) {
+      const mrb_irep *irep = ci->proc->body.irep;
+      if (irep != NULL && irep->iseq != NULL) {
+        uintptr_t pc = (uintptr_t)ci->pc, start = (uintptr_t)irep->iseq;
+        if (pc > start && pc - start <= irep->ilen * sizeof(mrb_code) &&
+            (pc - start) % sizeof(mrb_code) == 0 &&
+            mrz_diagnostic_position(mrb, irep,
+              (uint32_t)((pc - start) / sizeof(mrb_code) - 1), ci->mid, out)) return TRUE;
+      }
+    }
+    if (ci == mrb->c->cibase) break;
+  }
+  return FALSE;
+}
+
+mrb_bool
+mrz_diagnostic_source_exception(mrb_state *mrb, mrb_value exc,
+                                struct mrz_diagnostic_source *out)
+{
+  if (out == NULL) return FALSE;
+  memset(out, 0, sizeof(*out));
+  if (!mrb_exception_p(exc)) return FALSE;
+  struct RBasic *raw = mrb_exc_ptr(exc)->backtrace;
+  /* An Array may be supplied/overridden by Ruby; never trust its text. */
+  if (raw == NULL || raw->tt != MRB_TT_BACKTRACE) return FALSE;
+  const struct RBacktrace *backtrace = (const struct RBacktrace*)raw;
+  if (backtrace->locations == NULL) return FALSE;
+  size_t count = backtrace->len < 256 ? backtrace->len : 256;
+  for (size_t i = 0; i < count; ++i) {
+    const struct mrb_backtrace_location *location = &backtrace->locations[i];
+    if (mrz_diagnostic_position(mrb, location->irep, location->idx,
+                                location->method_id, out)) return TRUE;
+  }
+  return FALSE;
+}
 
 /* ---- GC arena (macros over mrb->gc.arena_idx) ---- */
 
@@ -73,11 +160,35 @@ mrz_protect_result(mrb_state *mrb, mrb_protect_error_func *body, void *data,
                    mrb_value *out)
 {
   mrb_bool raised = FALSE;
+  int entry_arena = mrb_gc_arena_save(mrb);
   /* A new safe-layer operation supersedes diagnostics from the previous one.
    * Without this reset, non-executing operations such as string allocation
    * falsely report the stale exception as their own failure. */
   mrb->exc = NULL;
-  mrb_value result = mrb_protect_error(mrb, body, data, &raised);
+  mrb_value result = mrb_nil_value();
+  struct mrb_jmpbuf *prev_jmp = mrb->jmp;
+  struct mrb_jmpbuf outer_jmp;
+  mrb_bool outer_raised = FALSE;
+  /* mrb_protect_error roots its result AFTER removing its own catch frame.
+   * Protect that postlude too: growing a full arena can raise another OOM,
+   * including while preserving an exception from the original operation. */
+  MRB_TRY(&outer_jmp) {
+    mrb->jmp = &outer_jmp;
+    result = mrb_protect_error(mrb, body, data, &raised);
+    mrb->jmp = prev_jmp;
+  }
+  MRB_CATCH(&outer_jmp) {
+    mrb->jmp = prev_jmp;
+    outer_raised = TRUE;
+  }
+  MRB_END_EXC(&outer_jmp);
+  if (outer_raised) {
+    mrb_gc_arena_restore(mrb, entry_arena);
+    if (out != NULL) *out = mrb_nil_value();
+    /* mrb->exc itself roots the exception. Do not allocate another arena
+     * slot while reporting the failure that exhausted that arena. */
+    return FALSE;
+  }
   if (out != NULL) *out = result;
   if (raised) {
     if (!mrb_immediate_p(result)) mrb->exc = mrb_obj_ptr(result);
@@ -309,21 +420,28 @@ mrz_protected_integer(mrb_state *mrb, mrb_int integer, mrb_value *out)
   return mrz_protect_result(mrb, mrz_integer_body, &context, out);
 }
 
+/* Keep the shim transport ABI binary64 even when mruby has no Float type. */
 struct mrz_float_context {
-  mrb_float floating;
+  double floating;
 };
 
 static mrb_value
 mrz_float_body(mrb_state *mrb, void *data)
 {
   struct mrz_float_context *context = (struct mrz_float_context*)data;
+#ifdef MRB_NO_FLOAT
+  (void)context;
+  mrb_raise(mrb, E_RANGE_ERROR, "Float is disabled by the integer64 profile");
+  return mrb_nil_value();
+#else
   mrb_value value;
   SET_FLOAT_VALUE(mrb, value, context->floating);
   return value;
+#endif
 }
 
 mrb_bool
-mrz_protected_float(mrb_state *mrb, mrb_float floating, mrb_value *out)
+mrz_protected_float(mrb_state *mrb, double floating, mrb_value *out)
 {
   struct mrz_float_context context = { floating };
   return mrz_protect_result(mrb, mrz_float_body, &context, out);
@@ -839,6 +957,11 @@ static mrb_value
 mrz_data_body(mrb_state *mrb, void *data)
 {
   struct mrz_data_context *context = (struct mrz_data_context*)data;
+#ifdef MRZ_EFFECTS_STRICT
+  if (!mrz_strict_data_type_allowed(mrb, context->data_type)) {
+    mrz_strict_deny(mrb, "unapproved native data");
+  }
+#endif
   MRB_SET_INSTANCE_TT(context->klass, MRB_TT_CDATA);
   return mrb_obj_value(mrb_data_object_alloc(
     mrb, context->klass, context->pointer, context->data_type));
@@ -922,6 +1045,46 @@ mrz_protected_set_exception(mrb_state *mrb,
     return TRUE;
   }
   return FALSE;
+}
+
+/* Effect rejection is constructed directly from a trusted saved class handle.
+ * Guest overrides of `.exception`, `new`, and `initialize` are never invoked. */
+struct mrz_effect_rejection_context {
+  struct RClass *klass;
+  mrb_value payload;
+};
+
+static mrb_value
+mrz_effect_rejection_body(mrb_state *mrb, void *data)
+{
+  struct mrz_effect_rejection_context *context =
+    (struct mrz_effect_rejection_context*)data;
+  mrb_value payload = context->payload;
+  if (!mrb_array_p(payload) || RARRAY_LEN(payload) != 2) {
+    mrb_raise(mrb, E_TYPE_ERROR, "invalid effect rejection payload");
+  }
+  mrb_value code = mrb_ary_entry(payload, 0);
+  mrb_value message = mrb_ary_entry(payload, 1);
+  if (!mrb_string_p(code) || !mrb_string_p(message)) {
+    mrb_raise(mrb, E_TYPE_ERROR, "invalid effect rejection payload");
+  }
+  mrb_value exception = mrb_exc_new(mrb, context->klass,
+                                   RSTRING_PTR(message), RSTRING_LEN(message));
+  mrb_iv_set(mrb, exception, mrb_intern_lit(mrb, "@code"), code);
+  return exception;
+}
+
+mrb_bool
+mrz_protected_effect_rejection(mrb_state *mrb, struct RClass *klass,
+                               mrb_value payload)
+{
+  struct mrz_effect_rejection_context context = { klass, payload };
+  mrb_value exception;
+  if (!mrz_protect_result(mrb, mrz_effect_rejection_body, &context, &exception)) {
+    return FALSE;
+  }
+  mrb->exc = mrb_obj_ptr(exception);
+  return TRUE;
 }
 
 enum mrz_mask_kind {
@@ -1363,7 +1526,15 @@ mrb_bool mrz_module_p(mrb_value v) { return mrb_module_p(v); }
 /* ---- value decoding ---- */
 
 mrb_int mrz_integer(mrb_value v) { return mrb_integer(v); }
-mrb_float mrz_float_v(mrb_value v) { return mrb_float(v); }
+double mrz_float_v(mrb_value v) {
+#ifdef MRB_NO_FLOAT
+  (void)v;
+  /* This raw accessor requires a Float, which this runtime cannot contain. */
+  abort();
+#else
+  return mrb_float(v);
+#endif
+}
 mrb_sym mrz_symbol(mrb_value v) { return mrb_symbol(v); }
 void *mrz_ptr(mrb_value v) { return mrb_ptr(v); }
 
@@ -1386,10 +1557,16 @@ mrb_value mrz_int_value(mrb_state *mrb, mrb_int i) {
   SET_INT_VALUE(mrb, v, i);
   return v;
 }
-mrb_value mrz_float_value(mrb_state *mrb, mrb_float f) {
+mrb_value mrz_float_value(mrb_state *mrb, double f) {
+#ifdef MRB_NO_FLOAT
+  (void)f;
+  mrb_raise(mrb, E_RANGE_ERROR, "Float is disabled by the integer64 profile");
+  return mrb_nil_value();
+#else
   mrb_value v;
   SET_FLOAT_VALUE(mrb, v, f);
   return v;
+#endif
 }
 mrb_value mrz_sym_value(mrb_sym s) {
   mrb_value v;
@@ -1458,11 +1635,18 @@ mrz_artifact_frozen_p(mrb_value value)
  * NaN payloads. mruby's ordinary word-boxing constructor deliberately maps
  * every NaN to one inline sentinel, so artifact import uses a heap RFloat and
  * copies its representation without a floating-point conversion. */
+#ifndef MRB_NO_FLOAT
 mrb_static_assert(sizeof(mrb_float) == sizeof(uint64_t));
+#endif
 
 mrb_bool
 mrz_artifact_float_bits(mrb_value value, uint64_t *out)
 {
+#ifdef MRB_NO_FLOAT
+  (void)value;
+  (void)out;
+  return FALSE;
+#else
   if (out == NULL || !mrb_float_p(value)) return FALSE;
 #if defined(MRB_WORD_BOXING)
   if (!mrb_immediate_p(value)) {
@@ -1479,12 +1663,17 @@ mrz_artifact_float_bits(mrb_value value, uint64_t *out)
   mrb_float floating = mrb_float(value);
   memcpy(out, &floating, sizeof(*out));
   return TRUE;
+#endif
 }
 
 static mrb_value
 mrz_artifact_float_from_bits(mrb_state *mrb, uint64_t bits)
 {
-#if defined(MRB_WORD_BOXING)
+#ifdef MRB_NO_FLOAT
+  (void)bits;
+  mrb_raise(mrb, E_RANGE_ERROR, "Float is disabled by the integer64 profile");
+  return mrb_nil_value();
+#elif defined(MRB_WORD_BOXING)
   union mrb_value_ boxed;
   boxed.p = mrb_obj_alloc(mrb, MRB_TT_FLOAT, mrb->float_class);
 # if defined(MRB_WORDBOX_NO_INLINE_FLOAT)
@@ -1730,8 +1919,13 @@ mrz_artifact_ref_valid(const struct mrz_artifact_graph *graph,
   case MRZ_ARTIFACT_REF_TRUE:
     return ref->length == 0 && ref->payload == 0;
   case MRZ_ARTIFACT_REF_I64:
-  case MRZ_ARTIFACT_REF_F64:
     return ref->length == 0;
+  case MRZ_ARTIFACT_REF_F64:
+#ifdef MRB_NO_FLOAT
+    return FALSE;
+#else
+    return ref->length == 0;
+#endif
   case MRZ_ARTIFACT_REF_SYMBOL:
     return ref->length == 0 || ref->payload != 0;
   case MRZ_ARTIFACT_REF_NODE:

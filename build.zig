@@ -36,6 +36,102 @@ pub fn addCodeDB(b: *std.Build, dependency: *std.Build.Dependency, options: Code
     }, options);
 }
 
+/// Compile a dedicated strict worker with one embedded CodeDB bundle and
+/// descriptor module (`pub const operations = ...`). The caller installs the
+/// returned artifact and passes its explicit path to strict.Worker.
+pub const EffectWorkerOptions = struct {
+    name: []const u8,
+    manifest: *std.Build.Module,
+    contract: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode = .Debug,
+    root_source_file: ?std.Build.LazyPath = null,
+    sanitize_thread: bool = false,
+    sanitize_c: ?std.zig.SanitizeC = null,
+};
+
+pub fn addEffectWorker(b: *std.Build, dependency: *std.Build.Dependency, options: EffectWorkerOptions) *std.Build.Step.Compile {
+    return effectWorker(b, dependency.module("mruby"), options.root_source_file orelse dependency.path("tools/effects_worker.zig"), options);
+}
+
+fn effectWorker(b: *std.Build, mruby_mod: *std.Build.Module, wrapper: std.Build.LazyPath, options: EffectWorkerOptions) *std.Build.Step.Compile {
+    const module = b.createModule(.{
+        .root_source_file = wrapper,
+        .target = options.target,
+        .optimize = options.optimize,
+        .sanitize_thread = options.sanitize_thread,
+        .sanitize_c = options.sanitize_c,
+    });
+    module.addImport("mruby", mruby_mod);
+    module.addImport("worker_manifest", options.manifest);
+    module.addImport("worker_contract", options.contract);
+    return b.addExecutable(.{ .name = options.name, .root_module = module });
+}
+
+/// The durable example's build-time-known application table: one applications
+/// module per host variant, wired to the bundles and contracts that variant
+/// knows. The identity-fixture host swaps only the first contract.
+fn durableApplicationsModule(
+    b: *std.Build,
+    mruby_mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sanitize_thread: bool,
+    sanitize_c: ?std.zig.SanitizeC,
+    manifest_v1: *std.Build.Module,
+    manifest_v2: *std.Build.Module,
+    contract_v1: *std.Build.Module,
+    contract_v2: *std.Build.Module,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("examples/durable/applications.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    module.addImport("mruby", mruby_mod);
+    module.addImport("durable_manifest_v1", manifest_v1);
+    module.addImport("durable_manifest_v2", manifest_v2);
+    module.addImport("durable_contract_v1", contract_v1);
+    module.addImport("durable_contract_v2", contract_v2);
+    return module;
+}
+
+fn durableHostModule(
+    b: *std.Build,
+    mruby_mod: *std.Build.Module,
+    applications: *std.Build.Module,
+    contract: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sanitize_thread: bool,
+    sanitize_c: ?std.zig.SanitizeC,
+    sqlite: *std.Build.Dependency,
+) *std.Build.Module {
+    const host_module = b.createModule(.{
+        .root_source_file = b.path("examples/durable/host.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    host_module.addImport("mruby", mruby_mod);
+    host_module.addImport("durable_applications", applications);
+    host_module.addImport("durable_contract", contract);
+    host_module.addIncludePath(sqlite.path(""));
+    host_module.addCSourceFile(.{
+        .file = sqlite.path("sqlite3.c"),
+        .flags = &.{ "-DSQLITE_THREADSAFE=1", "-DSQLITE_OMIT_LOAD_EXTENSION", "-DSQLITE_DQS=0", "-w" },
+    });
+    host_module.addCSourceFile(.{
+        .file = b.path("examples/durable/sql_identity.c"),
+        .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
+    });
+    return host_module;
+}
+
 const mruby_version = "4.0.0";
 const rite_binary_version = "04.00";
 const rite_vm_version = "0400";
@@ -52,11 +148,25 @@ const no_c_fuzz_coverage = "-fno-sanitize-coverage=trace-pc-guard,trace-cmp,trac
 const rite_compatibility_epoch: u32 = 3;
 const hash_integer_patch_marker = "mruby-hash-rinteger-value-hash=v1";
 const hash_symbol_patch_marker = "mruby-hash-symbol-name-hash=v1";
+const integer64_flags: []const []const u8 = &.{ "-DMRB_NO_FLOAT", "-DMRB_INT64", "-DMRZ_INTEGER_ONLY=1" };
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const no_compiler = b.option(bool, "no-compiler", "omit the target Ruby parser/code generator; retain build-time mrbc") orelse false;
+    const effects_strict = b.option(bool, "effects-strict", "use the strict effects runtime (minimal, without runtime compiler)") orelse false;
+    const effects_integer64 = b.option(bool, "effects-integer64", "use signed 64-bit integer arithmetic without Float in the strict effects runtime") orelse false;
+    if (effects_integer64 and (!effects_strict or target.result.ptrBitWidth() != 64)) {
+        std.debug.print("error: -Deffects-integer64=true requires -Deffects-strict=true and a 64-bit target\n", .{});
+        return error.InvalidIntegerEffectsProfile;
+    }
+    const numeric_flags: []const []const u8 = if (effects_integer64) integer64_flags else &.{};
+    const explicit_no_compiler = b.option(bool, "no-compiler", "omit the target Ruby parser/code generator; retain build-time mrbc");
+    const no_compiler = explicit_no_compiler orelse effects_strict;
+    if (effects_strict and !no_compiler) {
+        std.debug.print("error: -Deffects-strict=true requires -Dno-compiler=true\n", .{});
+        return error.StrictEffectsRequiresNoCompiler;
+    }
+    const sqlite_effects = b.option(bool, "sqlite-effects", "build optional SQLite inventory and durable effects examples") orelse false;
     const sanitize_thread = b.option(bool, "sanitize-thread", "enable ThreadSanitizer") orelse false;
     const sanitize_c = if (b.option(bool, "sanitize-c", "enable C undefined-behavior detection in unsafe builds") orelse false)
         std.zig.SanitizeC.full
@@ -66,6 +176,10 @@ pub fn build(b: *std.Build) !void {
         .linux, .macos => target.result.ptrBitWidth() == 64,
         else => false,
     };
+
+    const effects_worker_supported = effects_strict and
+        (target.result.os.tag == .linux or target.result.os.tag == .macos) and
+        (target.result.cpu.arch == .x86_64 or target.result.cpu.arch == .aarch64);
 
     const allocator_name = b.option(
         []const u8,
@@ -99,7 +213,7 @@ pub fn build(b: *std.Build) !void {
         );
         return error.ConflictingGemOptions;
     }
-    const gem_set = explicit_gem_set orelse legacy_gem_set orelse "standard";
+    const gem_set = explicit_gem_set orelse legacy_gem_set orelse if (effects_strict) "minimal" else "standard";
     const with_gems = b.option([]const u8, "with-gems", "comma-separated extra gems to enable on top of the gem set");
     const without_gems = b.option([]const u8, "without-gems", "comma-separated gems to remove from the gem set");
     const allow_worker_ambient_authority = b.option(
@@ -107,6 +221,12 @@ pub fn build(b: *std.Build) !void {
         "allow-worker-ambient-authority",
         "build the generic worker even when linked gems expose host-access authority",
     ) orelse false;
+    if (effects_strict and (!std.mem.eql(u8, gem_set, "minimal") or
+        (with_gems != null and std.mem.trim(u8, with_gems.?, " ,").len != 0) or allow_worker_ambient_authority))
+    {
+        std.debug.print("error: -Deffects-strict=true requires the minimal gem set, no additional gems, and no ambient worker authority\n", .{});
+        return error.InvalidStrictEffectsProfile;
+    }
 
     const arena = b.graph.arena;
     const mruby_dep = b.dependency("mruby", .{});
@@ -123,7 +243,7 @@ pub fn build(b: *std.Build) !void {
     }
     const worker_decision = authority.workerDecision(
         available_authority,
-        worker_target_supported,
+        worker_target_supported and !effects_strict,
         allow_worker_ambient_authority,
     );
     var gem_defines: std.ArrayList([]const u8) = .empty;
@@ -146,6 +266,11 @@ pub fn build(b: *std.Build) !void {
     const file_join = hostTool(b, "tools/file_join.zig");
     const hash_patcher = hostTool(b, "tools/patch_mruby_hash.zig");
     const patched_hash = patchMrubyHash(b, arena, hash_patcher, root);
+    const strict_sources = if (effects_strict) try patchMrubyStrict(b, root, patched_hash) else null;
+    const integer_host_sources: []const PatchedHostSource = if (effects_integer64)
+        try patchIntegerHostSources(b, root, strict_sources.?.tool)
+    else
+        &.{};
 
     // ============================= stage 1 =================================
     // Presym headers for the host mrbc build: scan core (with allocf.c),
@@ -153,12 +278,24 @@ pub fn build(b: *std.Build) !void {
     const host_triple = try b.graph.host.result.zigTriple(arena);
 
     var mrbc_scan: std.ArrayList(ScanInput) = .empty;
-    try addTreeFiles(arena, &mrbc_scan, root, &sources.core_srcs, "core");
+    for (sources.core_srcs) |path| {
+        try mrbc_scan.append(arena, .{
+            .lp = patchedHostSource(integer_host_sources, path) orelse try root.join(arena, path),
+            .pp_name = try std.fmt.allocPrint(arena, "core_{s}", .{try mangle(arena, path, &.{ "c", "pp" })}),
+        });
+    }
     try mrbc_scan.append(arena, .{ .lp = try root.join(arena, sources.allocf_src), .pp_name = "core_allocf.c.pp" });
-    try addTreeFiles(arena, &mrbc_scan, root, &sources.compiler_srcs, "compiler");
+    for (sources.compiler_srcs) |path| {
+        const patched_source = patchedHostSource(integer_host_sources, path);
+        try mrbc_scan.append(arena, .{
+            .lp = patched_source orelse try root.join(arena, path),
+            .pp_name = try std.fmt.allocPrint(arena, "compiler_{s}", .{try mangle(arena, path, &.{ "c", "pp" })}),
+            .includes = if (patched_source != null) &.{"mrbgems/mruby-compiler/core"} else &.{},
+        });
+    }
     try addTreeFiles(arena, &mrbc_scan, root, &sources.mrbc_srcs, "mrbc");
 
-    const mrbc_presym_dir = try presymHeaders(b, presym_gen, arena, mrbc_scan.items, &.{}, root, host_triple);
+    const mrbc_presym_dir = try presymHeaders(b, presym_gen, arena, mrbc_scan.items, numeric_flags, root, host_triple, &.{});
 
     // ============================= stage 2 =================================
     const mrbc_mod = b.createModule(.{
@@ -167,19 +304,27 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
     });
     var mrbc_files: std.ArrayList([]const u8) = .empty;
-    try mrbc_files.appendSlice(arena, &sources.core_srcs);
+    for (sources.core_srcs) |path| {
+        if (patchedHostSource(integer_host_sources, path) != null) continue;
+        try mrbc_files.append(arena, path);
+    }
     try mrbc_files.append(arena, sources.allocf_src);
-    try mrbc_files.appendSlice(arena, &sources.compiler_srcs);
+    for (sources.compiler_srcs) |path| {
+        if (patchedHostSource(integer_host_sources, path) != null) continue;
+        try mrbc_files.append(arena, path);
+    }
     try mrbc_files.appendSlice(arena, &sources.mrbc_srcs);
+    var mrbc_flags: std.ArrayList([]const u8) = .empty;
+    try mrbc_flags.append(arena, "-w");
+    try mrbc_flags.appendSlice(arena, portable_container_flags);
+    try mrbc_flags.appendSlice(arena, numeric_flags);
     mrbc_mod.addCSourceFiles(.{
         .root = root,
         .files = mrbc_files.items,
-        .flags = &.{
-            "-w",
-            "-DMRB_STR_LENGTH_MAX=0",
-            "-DMRB_ARY_LENGTH_MAX=0",
-        },
+        .flags = mrbc_flags.items,
     });
+    for (integer_host_sources) |source| mrbc_mod.addCSourceFile(.{ .file = source.file, .flags = mrbc_flags.items });
+    if (integer_host_sources.len != 0) mrbc_mod.addIncludePath(root.path(b, "mrbgems/mruby-compiler/core"));
     mrbc_mod.addIncludePath(try root.join(arena, "include"));
     mrbc_mod.addIncludePath(mrbc_presym_dir);
     const mrbc = b.addExecutable(.{ .name = "mrbc", .root_module = mrbc_mod });
@@ -243,8 +388,13 @@ pub fn build(b: *std.Build) !void {
     else
         &.{};
     var lib_scan: std.ArrayList(ScanInput) = .empty;
-    for (sources.core_srcs) |path| {
-        if (std.mem.eql(u8, path, "src/hash.c")) {
+    for (sources.core_srcs, 0..) |path, index| {
+        if (strict_sources) |strict| {
+            try lib_scan.append(arena, .{
+                .lp = strict.core[index],
+                .pp_name = try std.fmt.allocPrint(arena, "strict_{s}", .{try mangle(arena, path, &.{ "c", "pp" })}),
+            });
+        } else if (std.mem.eql(u8, path, "src/hash.c")) {
             try lib_scan.append(arena, .{ .lp = patched_hash, .pp_name = "core_src_hash.c.pp" });
         } else {
             try lib_scan.append(arena, .{
@@ -268,6 +418,7 @@ pub fn build(b: *std.Build) !void {
         }
     }
     try lib_scan.append(arena, .{ .lp = b.path("src/shim.c"), .pp_name = "mruby_zig_shim.c.pp" });
+    if (effects_strict) try lib_scan.append(arena, .{ .lp = b.path("src/strict_native.c"), .pp_name = "strict_native.c.pp" });
     for (generated_c.items) |g| try lib_scan.append(arena, .{ .lp = g.lp, .pp_name = g.pp_name });
 
     // Keep the presym scan consistent with the compile-time defines.
@@ -276,11 +427,14 @@ pub fn build(b: *std.Build) !void {
         try d.appendSlice(arena, gem_defines.items);
         try d.append(arena, "-DMRB_USE_DEBUG_HOOK");
         if (no_compiler) try d.append(arena, "-DMRZ_NO_COMPILER");
+        if (effects_strict) try d.appendSlice(arena, &.{ "-DMRZ_EFFECTS_STRICT=1", "-DMRB_NO_STDIO" });
+        try d.appendSlice(arena, numeric_flags);
         try d.appendSlice(arena, portable_container_flags);
         try d.appendSlice(arena, ro_data_flags);
         break :defines d.items;
     };
-    const lib_presym_dir = try presymHeaders(b, presym_gen, arena, lib_scan.items, lib_scan_defines, root, triple);
+    const strict_include_dirs: []const std.Build.LazyPath = if (strict_sources) |strict| &.{ strict.include, b.path("src"), root.path(b, "src") } else &.{};
+    const lib_presym_dir = try presymHeaders(b, presym_gen, arena, lib_scan.items, lib_scan_defines, root, triple, strict_include_dirs);
 
     // ============================= stage 5 =================================
     // The `mruby` module carries the entire C library (core + compiler +
@@ -295,6 +449,8 @@ pub fn build(b: *std.Build) !void {
         // site) used by the sandboxing layer for limits and termination.
         try f.append(arena, "-DMRB_USE_DEBUG_HOOK");
         if (no_compiler) try f.append(arena, "-DMRZ_NO_COMPILER");
+        if (effects_strict) try f.appendSlice(arena, &.{ "-DMRZ_EFFECTS_STRICT=1", "-DMRB_NO_STDIO" });
+        try f.appendSlice(arena, numeric_flags);
         try f.appendSlice(arena, portable_container_flags);
         try f.append(arena, no_c_fuzz_coverage);
         try f.appendSlice(arena, ro_data_flags);
@@ -306,6 +462,8 @@ pub fn build(b: *std.Build) !void {
         var f: std.ArrayList([]const u8) = .empty;
         try f.appendSlice(arena, &.{ "-Wall", "-Wextra", "-DMRB_USE_DEBUG_HOOK" });
         if (no_compiler) try f.append(arena, "-DMRZ_NO_COMPILER");
+        if (effects_strict) try f.appendSlice(arena, &.{ "-DMRZ_EFFECTS_STRICT=1", "-DMRB_NO_STDIO" });
+        try f.appendSlice(arena, numeric_flags);
         try f.appendSlice(arena, portable_container_flags);
         try f.append(arena, no_c_fuzz_coverage);
         try f.appendSlice(arena, ro_data_flags);
@@ -351,6 +509,8 @@ pub fn build(b: *std.Build) !void {
         mruby_dep.builder.pkg_hash,
         lib_presym_dir,
         no_compiler,
+        effects_strict,
+        effects_integer64,
     );
     mruby_mod.addImport("artifact_config", artifact_config);
     // Comptime feature manifest: everything here is known at configure time
@@ -392,6 +552,9 @@ pub fn build(b: *std.Build) !void {
         build_features.addOption(bool, "worker_process_supported", worker_decision.enabled);
         build_features.addOption([]const u8, "gem_set", gem_set);
         build_features.addOption(bool, "has_compiler", !no_compiler);
+        build_features.addOption(bool, "effects_strict", effects_strict);
+        build_features.addOption(bool, "effects_integer64", effects_integer64);
+        build_features.addOption(bool, "effects_worker_supported", effects_worker_supported);
         build_features.addOption(
             bool,
             "custom_selection",
@@ -403,12 +566,17 @@ pub fn build(b: *std.Build) !void {
     mruby_mod.addOptions("build_features", build_features);
     var lib_files: std.ArrayList([]const u8) = .empty;
     for (sources.core_srcs) |path| {
-        if (!std.mem.eql(u8, path, "src/hash.c")) try lib_files.append(arena, path);
+        if (!effects_strict and !std.mem.eql(u8, path, "src/hash.c")) try lib_files.append(arena, path);
     }
     if (!no_compiler) try lib_files.appendSlice(arena, &sources.compiler_srcs);
     for (selected_gems) |g| try lib_files.appendSlice(arena, g.c_srcs);
     mruby_mod.addCSourceFiles(.{ .root = root, .files = lib_files.items, .flags = lib_flags });
-    mruby_mod.addCSourceFile(.{ .file = patched_hash, .flags = lib_flags });
+    if (strict_sources) |strict| {
+        for (strict.core) |source| mruby_mod.addCSourceFile(.{ .file = source, .flags = lib_flags });
+        mruby_mod.addCSourceFile(.{ .file = b.path("src/strict_native.c"), .flags = lib_flags });
+    } else {
+        mruby_mod.addCSourceFile(.{ .file = patched_hash, .flags = lib_flags });
+    }
     // Generated sources (cache paths, not under the dependency root).
     for (generated_c.items) |g| {
         mruby_mod.addCSourceFile(.{ .file = g.lp, .flags = lib_flags });
@@ -429,9 +597,58 @@ pub fn build(b: *std.Build) !void {
             mruby_mod.linkSystemLibrary("pthread", .{ .use_pkg_config = .no });
         }
     }
+    if (effects_worker_supported) mruby_mod.addCSourceFile(.{
+        .file = b.path("src/effect_worker_process.c"),
+        .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
+    });
+    for (strict_include_dirs) |dir| mruby_mod.addIncludePath(dir);
     mruby_mod.addIncludePath(try root.join(arena, "include"));
     mruby_mod.addIncludePath(lib_presym_dir);
     for (gem_include_dirs.items) |dir| mruby_mod.addIncludePath(dir);
+
+    // Share configured host tools with downstream build scripts. Named lazy
+    // paths do not install host executables into the target deployment.
+    const artifact_lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/artifact.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const rite_envelope = hostTool(b, "tools/rite_envelope.zig");
+    const codedb_graph_mod = b.createModule(.{
+        .root_source_file = b.path("build/codedb_graph.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    rite_envelope.root_module.addImport("artifact", artifact_lib_mod);
+    rite_envelope.root_module.addImport("artifact_config", artifact_config);
+    rite_envelope.root_module.addImport("codedb_graph", codedb_graph_mod);
+    const codedb_authority_mod = b.createModule(.{
+        .root_source_file = b.path("build/authority.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    rite_envelope.root_module.addImport("authority_manifest", codedb_authority_mod);
+    const codedb_features = b.addOptions();
+    codedb_features.addOption([]const []const u8, "authority_source_names", authority_source_names.items);
+    codedb_features.addOption([]const u16, "authority_source_bits", authority_source_bits.items);
+    codedb_features.addOption([]const u8, "gem_set", gem_set);
+    var codedb_gems: std.ArrayList([]const u8) = .empty;
+    for (selected_gems) |gem| try codedb_gems.append(arena, gem.name);
+    codedb_features.addOption([]const []const u8, "gems", codedb_gems.items);
+    const codedb_features_mod = codedb_features.createModule();
+    rite_envelope.root_module.addImport("codedb_features", codedb_features_mod);
+    b.addNamedLazyPath("codedb-mrbc", mrbc.getEmittedBin());
+    b.addNamedLazyPath("codedb-envelope", rite_envelope.getEmittedBin());
+    const codedb_tools: CodeDB.Tools = .{
+        .mrbc = mrbc.getEmittedBin(),
+        .envelope = rite_envelope.getEmittedBin(),
+    };
+
+    if (!effects_strict) integer64Unavailable(b, "integer effects requires -Deffects-strict=true -Deffects-integer64=true");
+    if (effects_strict) {
+        try buildStrict(b, mruby_mod, codedb_tools, target, optimize, sanitize_thread, sanitize_c, sqlite_effects, effects_worker_supported, effects_integer64);
+        return;
+    }
 
     const check_step = b.step(
         "check",
@@ -838,43 +1055,94 @@ pub fn build(b: *std.Build) !void {
         }
     }
 
-    // Share configured host tools with downstream build scripts. Named lazy
-    // paths do not install host executables into the target deployment.
-    const artifact_lib_mod = b.createModule(.{
-        .root_source_file = b.path("src/artifact.zig"),
-        .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+    // Use the runtime operation catalogue for CodeDB's host authority metadata
+    // as well, so the demo cannot silently describe different operations.
+    const effect_contract = @import("examples/effects/contract.zig");
+    var effect_hosts: [effect_contract.operations.len]CodeDB.HostBinding = undefined;
+    var effect_names: [effect_contract.operations.len][]const u8 = undefined;
+    inline for (effect_contract.operations, 0..) |operation, i| {
+        effect_hosts[i] = .{
+            .name = operation.name,
+            .authority = CodeDB.AuthoritySet.fromBits(operation.authority_bits),
+        };
+        effect_names[i] = operation.name;
+    }
+    const effects_bundle = try CodeDB.add(b, codedb_tools, .{
+        .tier = .trusted,
+        .host_bindings = &effect_hosts,
+        .sources = &.{.{
+            .name = "announce",
+            .source = b.path("examples/effects/announce.rb"),
+            .source_name = "effects/announce.rb",
+            .host_bindings = &effect_names,
+        }},
     });
-    const rite_envelope = hostTool(b, "tools/rite_envelope.zig");
-    const codedb_graph_mod = b.createModule(.{
-        .root_source_file = b.path("build/codedb_graph.zig"),
-        .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+    const effects_demo_mod = b.createModule(.{
+        .root_source_file = b.path("examples/effects_demo.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
     });
-    rite_envelope.root_module.addImport("artifact", artifact_lib_mod);
-    rite_envelope.root_module.addImport("artifact_config", artifact_config);
-    rite_envelope.root_module.addImport("codedb_graph", codedb_graph_mod);
-    const codedb_authority_mod = b.createModule(.{
-        .root_source_file = b.path("build/authority.zig"),
-        .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+    effects_demo_mod.addImport("mruby", mruby_mod);
+    effects_demo_mod.addImport("effects_manifest", effects_bundle.manifest);
+    const effects_demo = b.addExecutable(.{ .name = "effects-demo", .root_module = effects_demo_mod });
+    check_step.dependOn(&effects_demo.step);
+    b.installArtifact(effects_demo);
+    const run_effects_demo = b.addRunArtifact(effects_demo);
+    const effects_demo_step = b.step("run-effects-demo", "run explicit effects with live, fixed, recording, and replay adapters");
+    effects_demo_step.dependOn(&run_effects_demo.step);
+    const effects_test_step = b.step("test-effects", "test explicit effect enforcement and record/replay");
+    addEffectDataTests(b, mruby_mod, target, optimize, sanitize_thread, sanitize_c, check_step, effects_test_step);
+    addEffectInspector(b, mruby_mod, target, optimize, sanitize_thread, sanitize_c, check_step, effects_test_step);
+    addEffectSchemaTests(b, mruby_mod, target, optimize, sanitize_thread, sanitize_c, check_step, effects_test_step);
+    effects_test_step.dependOn(&run_effects_demo.step);
+    const effect_trace_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/effect_trace.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-    rite_envelope.root_module.addImport("authority_manifest", codedb_authority_mod);
-    const codedb_features = b.addOptions();
-    codedb_features.addOption([]const []const u8, "authority_source_names", authority_source_names.items);
-    codedb_features.addOption([]const u16, "authority_source_bits", authority_source_bits.items);
-    codedb_features.addOption([]const u8, "gem_set", gem_set);
-    var codedb_gems: std.ArrayList([]const u8) = .empty;
-    for (selected_gems) |gem| try codedb_gems.append(arena, gem.name);
-    codedb_features.addOption([]const []const u8, "gems", codedb_gems.items);
-    const codedb_features_mod = codedb_features.createModule();
-    rite_envelope.root_module.addImport("codedb_features", codedb_features_mod);
-    b.addNamedLazyPath("codedb-mrbc", mrbc.getEmittedBin());
-    b.addNamedLazyPath("codedb-envelope", rite_envelope.getEmittedBin());
-    const codedb_tools: CodeDB.Tools = .{
-        .mrbc = mrbc.getEmittedBin(),
-        .envelope = rite_envelope.getEmittedBin(),
-    };
+    const effect_trace_tests = b.addTest(.{ .root_module = effect_trace_tests_mod });
+    check_step.dependOn(&effect_trace_tests.step);
+    const run_effect_trace_tests = b.addRunArtifact(effect_trace_tests);
+    effects_test_step.dependOn(&run_effect_trace_tests.step);
+    const effect_invocation_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/effect_invocation.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const effect_invocation_tests = b.addTest(.{ .root_module = effect_invocation_tests_mod });
+    check_step.dependOn(&effect_invocation_tests.step);
+    const run_effect_invocation_tests = b.addRunArtifact(effect_invocation_tests);
+    effects_test_step.dependOn(&run_effect_invocation_tests.step);
+    if (!no_compiler) {
+        const effects_tests_mod = b.createModule(.{
+            .root_source_file = b.path("src/effect_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        effects_tests_mod.addImport("mruby", mruby_mod);
+        const effects_tests = b.addTest(.{ .root_module = effects_tests_mod });
+        check_step.dependOn(&effects_tests.step);
+        const run_effects_tests = b.addRunArtifact(effects_tests);
+        effects_test_step.dependOn(&run_effects_tests.step);
+    }
+    test_step.dependOn(effects_test_step);
+
+    _ = try addInventoryExample(b, mruby_mod, codedb_tools, target, optimize, sanitize_thread, sanitize_c, check_step, sqlite_effects);
+    const strict_turn_required = b.addFail("strict turn example requires -Deffects-strict=true");
+    b.step("run-effects-turn", "run the fresh strict turn example (requires -Deffects-strict=true)").dependOn(&strict_turn_required.step);
+    b.step("test-effects-turn", "test fresh strict turns (requires -Deffects-strict=true)").dependOn(&strict_turn_required.step);
+    b.step("run-effects-worker", "run brokered strict effects (requires -Deffects-strict=true)").dependOn(&strict_turn_required.step);
+    b.step("test-effects-worker", "test brokered strict effects (requires -Deffects-strict=true)").dependOn(&strict_turn_required.step);
+    b.step("run-effects-reservation", "run typed domain effects (requires -Deffects-strict=true)").dependOn(&strict_turn_required.step);
+    b.step("test-effects-reservation", "test typed domain effects (requires -Deffects-strict=true)").dependOn(&strict_turn_required.step);
+    const durable_required = b.addFail("durable example requires -Deffects-strict=true -Dsqlite-effects=true");
+    b.step("run-effects-durable", "run durable strict effects (requires -Deffects-strict=true -Dsqlite-effects=true)").dependOn(&durable_required.step);
+    b.step("test-effects-durable", "test durable strict effects (requires -Deffects-strict=true -Dsqlite-effects=true)").dependOn(&durable_required.step);
+
     // Package examples/tests must work with every selectable linked profile.
     // Applications default to the stricter worker tier in addCodeDB.
     const codedb_bundle = try CodeDB.add(b, codedb_tools, .{ .tier = .trusted, .sources = &.{
@@ -1151,6 +1419,902 @@ fn parseAllocatorProfile(name: []const u8) !AllocatorProfile {
         error.UnknownAllocator;
 }
 
+fn buildStrict(
+    b: *std.Build,
+    mruby_mod: *std.Build.Module,
+    codedb_tools: CodeDB.Tools,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sanitize_thread: bool,
+    sanitize_c: ?std.zig.SanitizeC,
+    sqlite_effects: bool,
+    effects_worker_supported: bool,
+    effects_integer64: bool,
+) !void {
+    const check_step = b.step("check", "compile strict effects tests and examples");
+    const test_step = b.step("test", "run strict effects tests for the selected profile");
+    const strict_step = b.step("test-effects-strict", "verify strict bootstrap, native admission, and identified effects");
+    test_step.dependOn(strict_step);
+    b.step("test-effects", "verify strict effects execution").dependOn(strict_step);
+    addEffectDataTests(b, mruby_mod, target, optimize, sanitize_thread, sanitize_c, check_step, strict_step);
+    addEffectInspector(b, mruby_mod, target, optimize, sanitize_thread, sanitize_c, check_step, strict_step);
+    addEffectSchemaTests(b, mruby_mod, target, optimize, sanitize_thread, sanitize_c, check_step, strict_step);
+    if (effects_integer64 and effects_worker_supported) {
+        try addInteger64Example(b, mruby_mod, codedb_tools, target, optimize, sanitize_thread, sanitize_c, check_step, strict_step);
+    } else {
+        integer64Unavailable(b, "integer effects requires -Deffects-strict=true -Deffects-integer64=true on Linux/macOS x86_64 or aarch64");
+    }
+
+    const fixture_hosts = [_]CodeDB.HostBinding{
+        .{ .name = "clock.now", .authority = CodeDB.AuthoritySet.fromBits(1 << 4) },
+        .{ .name = "sink.write", .authority = CodeDB.AuthoritySet.fromBits(1 << 13) },
+    };
+    var fixture_sources: std.ArrayList(CodeDB.Source) = .empty;
+    for ([_][]const u8{ "app", "bad_init", "loop_init", "identity_init", "native_alias", "integer_boundaries" }) |name| {
+        try fixture_sources.append(b.allocator, .{
+            .name = name,
+            .source = b.path(b.fmt("src/tests_strict/{s}.rb", .{name})),
+            .source_name = b.fmt("strict/{s}.rb", .{name}),
+            .host_bindings = &.{ "clock.now", "sink.write" },
+        });
+    }
+    const fixtures = try CodeDB.add(b, codedb_tools, .{
+        .tier = .trusted,
+        .host_bindings = &fixture_hosts,
+        .sources = fixture_sources.items,
+    });
+    for ([_][]const u8{ "src/strict_tests.zig", "src/strict_integer_regression_tests.zig" }) |path| {
+        const strict_mod = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        strict_mod.addImport("mruby", mruby_mod);
+        strict_mod.addImport("strict_manifest", fixtures.manifest);
+        const strict_tests = b.addTest(.{ .root_module = strict_mod });
+        check_step.dependOn(&strict_tests.step);
+        strict_step.dependOn(&b.addRunArtifact(strict_tests).step);
+    }
+
+    // These parsers and identities are VM-independent and apply equally to
+    // strict and compatibility builds. Ordinary VM regression suites have
+    // deliberate compatibility assumptions and are not wired into this graph.
+    for ([_][]const u8{ "build/artifact_identity.zig", "src/artifact.zig", "src/effect_trace.zig", "src/effect_invocation.zig", "src/turn_receipt.zig", "src/effect_worker_protocol.zig" }) |path| {
+        const module = b.createModule(.{ .root_source_file = b.path(path), .target = target, .optimize = optimize });
+        const tests = b.addTest(.{ .root_module = module });
+        check_step.dependOn(&tests.step);
+        strict_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+    const catalogue_module = b.createModule(.{
+        .root_source_file = b.path("build/native_catalogue.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const patcher_module = b.createModule(.{
+        .root_source_file = b.path("tools/patch_mruby_strict.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    patcher_module.addImport("native_catalogue", catalogue_module);
+    for ([_]*std.Build.Module{ catalogue_module, patcher_module }) |module| {
+        const tests = b.addTest(.{ .root_module = module });
+        check_step.dependOn(&tests.step);
+        strict_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+    try addTurnExample(b, mruby_mod, codedb_tools, target, optimize, sanitize_thread, sanitize_c, check_step, strict_step);
+    if (effects_worker_supported) {
+        try addWorkerExample(b, mruby_mod, codedb_tools, target, optimize, sanitize_thread, sanitize_c, check_step, strict_step);
+        try addReservationExample(b, mruby_mod, codedb_tools, target, optimize, sanitize_thread, sanitize_c, check_step, strict_step);
+    } else {
+        const unavailable = b.addFail("strict effect workers require Linux/macOS x86_64 or aarch64");
+        b.step("run-effects-worker", "run brokered strict effects").dependOn(&unavailable.step);
+        b.step("test-effects-worker", "test brokered strict effects").dependOn(&unavailable.step);
+        b.step("run-effects-reservation", "run typed domain effects").dependOn(&unavailable.step);
+        b.step("test-effects-reservation", "test typed domain effects").dependOn(&unavailable.step);
+    }
+    const inventory_tests = try addInventoryExample(b, mruby_mod, codedb_tools, target, optimize, sanitize_thread, sanitize_c, check_step, sqlite_effects);
+    if (sqlite_effects) strict_step.dependOn(inventory_tests);
+    try addDurableExample(b, mruby_mod, codedb_tools, target, optimize, sanitize_thread, sanitize_c, check_step, strict_step, sqlite_effects, effects_worker_supported);
+}
+
+fn integer64Unavailable(b: *std.Build, message: []const u8) void {
+    const disabled = b.addFail(message);
+    b.step("run-effects-integer64", "emit the strict integer arithmetic corpus").dependOn(&disabled.step);
+    b.step("test-effects-integer64", "test strict integer execution and worker boundaries").dependOn(&disabled.step);
+    b.step("test-effects-integer64-compiler", "reject unsupported numeric literals with the configured CodeDB compiler").dependOn(&disabled.step);
+}
+
+fn addInteger64Example(
+    b: *std.Build,
+    mruby_mod: *std.Build.Module,
+    codedb_tools: CodeDB.Tools,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sanitize_thread: bool,
+    sanitize_c: ?std.zig.SanitizeC,
+    check_step: *std.Build.Step,
+    strict_step: *std.Build.Step,
+) !void {
+    const contract = @import("examples/integer64/contract.zig");
+    var hosts: [contract.operations.len]CodeDB.HostBinding = undefined;
+    var names: [contract.operations.len][]const u8 = undefined;
+    inline for (contract.operations, 0..) |operation, i| {
+        hosts[i] = .{ .name = operation.name, .authority = CodeDB.AuthoritySet.fromBits(operation.authority_bits) };
+        names[i] = operation.name;
+    }
+    const bundle = try CodeDB.add(b, codedb_tools, .{
+        .tier = .trusted,
+        .host_bindings = &hosts,
+        .sources = &.{.{ .name = "app", .source = b.path("examples/integer64/app.rb"), .source_name = "integer64/app.rb", .host_bindings = &names }},
+    });
+    const contract_module = b.createModule(.{ .root_source_file = b.path("examples/integer64/contract.zig"), .target = target, .optimize = optimize });
+    const child = effectWorker(b, mruby_mod, b.path("tools/effects_worker.zig"), .{
+        .name = "effects-integer64-child",
+        .manifest = bundle.manifest,
+        .contract = contract_module,
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    check_step.dependOn(&child.step);
+    b.installArtifact(child);
+    const module = b.createModule(.{
+        .root_source_file = b.path("examples/effects_integer64.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    module.addImport("mruby", mruby_mod);
+    module.addImport("integer64_manifest", bundle.manifest);
+    module.addImport("integer64_contract", contract_module);
+    const corpus = b.addExecutable(.{ .name = "effects-integer64", .root_module = module });
+    check_step.dependOn(&corpus.step);
+    b.installArtifact(corpus);
+    b.step("run-effects-integer64", "emit the strict integer arithmetic corpus").dependOn(&b.addRunArtifact(corpus).step);
+    const tests_module = b.createModule(.{
+        .root_source_file = b.path("src/effects_integer64_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    tests_module.addImport("mruby", mruby_mod);
+    tests_module.addImport("integer64_example", module);
+    const config = b.addOptions();
+    config.addOptionPath("worker_executable", child.getEmittedBin());
+    tests_module.addOptions("integer64_test_config", config);
+    const tests = b.addTest(.{ .root_module = tests_module });
+    check_step.dependOn(&tests.step);
+    const step = b.step("test-effects-integer64", "test strict integer execution and worker boundaries");
+    step.dependOn(&b.addRunArtifact(tests).step);
+    strict_step.dependOn(step);
+    const compiler_step = b.step("test-effects-integer64-compiler", "reject unsupported numeric literals with the configured CodeDB compiler");
+    const rejected_literals = [_]struct { name: []const u8, diagnostic: []const u8 }{
+        .{ .name = "float_literal", .diagnostic = "floating-point numbers are not supported" },
+        .{ .name = "float_folded", .diagnostic = "floating-point numbers are not supported" },
+        .{ .name = "float_dead", .diagnostic = "floating-point numbers are not supported" },
+        .{ .name = "integer_overflow", .diagnostic = "integer literal outside int64 range" },
+        .{ .name = "integer_underflow", .diagnostic = "integer literal outside int64 range" },
+    };
+    for (rejected_literals) |literal| {
+        const rejected = std.Build.Step.Run.create(b, b.fmt("reject integer profile {s}", .{literal.name}));
+        rejected.addFileArg(codedb_tools.mrbc);
+        rejected.addArg("-o");
+        // Failed compilation must not publish an artifact. Use the platform's
+        // null device so a successful but forbidden compile still fails the
+        // expected-exit assertion without declaring a missing build output.
+        rejected.addArg(if (b.graph.host.result.os.tag == .windows) "NUL" else "/dev/null");
+        rejected.addFileArg(b.path(b.fmt("examples/integer64/{s}.rb", .{literal.name})));
+        rejected.expectExitCode(1);
+        rejected.expectStdErrMatch(literal.diagnostic);
+        compiler_step.dependOn(&rejected.step);
+    }
+    step.dependOn(compiler_step);
+}
+
+fn addEffectInspector(
+    b: *std.Build,
+    mruby_mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sanitize_thread: bool,
+    sanitize_c: ?std.zig.SanitizeC,
+    check_step: *std.Build.Step,
+    effects_step: *std.Build.Step,
+) void {
+    // The installed inspector imports only inert codecs. In particular it does
+    // not link mruby, SQLite, a worker executable, or an operation catalogue.
+    const inspect_module = b.createModule(.{
+        .root_source_file = b.path("src/effect_inspect.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const cli_module = b.createModule(.{
+        .root_source_file = b.path("tools/effects_inspect.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_module.addImport("effect_inspect", inspect_module);
+    const cli = b.addExecutable(.{ .name = "mruby-effects-inspect", .root_module = cli_module });
+    check_step.dependOn(&cli.step);
+    b.installArtifact(cli);
+    const run_cli = b.addRunArtifact(cli);
+    run_cli.addPassthruArgs();
+    b.step("run-effects-inspect", "inspect an inert turn receipt: -- <receipt-file>").dependOn(&run_cli.step);
+    const tests_module = b.createModule(.{
+        .root_source_file = b.path("src/effect_inspect_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    tests_module.addImport("mruby", mruby_mod);
+    const tests = b.addTest(.{ .root_module = tests_module });
+    check_step.dependOn(&tests.step);
+    const test_step = b.step("test-effects-inspect", "test inert receipt inspection and the VM-free CLI");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+    const fixture_module = b.createModule(.{
+        .root_source_file = b.path("tools/effects_inspect_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fixture_module.addImport("mruby", mruby_mod);
+    const fixture = b.addExecutable(.{ .name = "effects-inspect-fixture", .root_module = fixture_module });
+    check_step.dependOn(&fixture.step);
+    const export_fixture = b.addRunArtifact(fixture);
+    export_fixture.addPassthruArgs();
+    b.step("make-effects-inspect-fixture", "write a synthetic receipt: -- <output-file>").dependOn(&export_fixture.step);
+    const make_fixture = b.addRunArtifact(fixture);
+    const receipt = make_fixture.addOutputFileArg("inspection.receipt");
+    const demo = b.addRunArtifact(cli);
+    demo.addFileArg(receipt);
+    b.step("run-effects-inspect-demo", "inspect a constructed receipt fixture without executing Ruby").dependOn(&demo.step);
+    const smoke = b.addRunArtifact(cli);
+    smoke.addFileArg(receipt);
+    smoke.expectStdOutMatch("\"operation_count\":1");
+    smoke.expectStdOutMatch("\"preview_bytes\":\"OutOfStock\"");
+    smoke.expectStdErrEqual("");
+    test_step.dependOn(&smoke.step);
+    const invalid = b.addWriteFiles().add("malformed.receipt", "not a receipt\x1b");
+    const rejected = b.addRunArtifact(cli);
+    rejected.addFileArg(invalid);
+    rejected.expectExitCode(1);
+    rejected.expectStdOutEqual("");
+    rejected.expectStdErrMatch("mruby-effects-inspect:");
+    test_step.dependOn(&rejected.step);
+    effects_step.dependOn(test_step);
+}
+
+fn addEffectDataTests(
+    b: *std.Build,
+    mruby_mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sanitize_thread: bool,
+    sanitize_c: ?std.zig.SanitizeC,
+    check_step: *std.Build.Step,
+    test_step: *std.Build.Step,
+) void {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/effect_data_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    module.addImport("mruby", mruby_mod);
+    const tests = b.addTest(.{ .root_module = module });
+    check_step.dependOn(&tests.step);
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+}
+
+fn addTurnExample(
+    b: *std.Build,
+    mruby_mod: *std.Build.Module,
+    codedb_tools: CodeDB.Tools,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sanitize_thread: bool,
+    sanitize_c: ?std.zig.SanitizeC,
+    check_step: *std.Build.Step,
+    strict_step: *std.Build.Step,
+) !void {
+    const contract = @import("examples/turn/contract.zig");
+    var hosts: [contract.operations.len]CodeDB.HostBinding = undefined;
+    var names: [contract.operations.len][]const u8 = undefined;
+    inline for (contract.operations, 0..) |operation, i| {
+        hosts[i] = .{ .name = operation.name, .authority = CodeDB.AuthoritySet.fromBits(operation.authority_bits) };
+        names[i] = operation.name;
+    }
+    const bundle = try CodeDB.add(b, codedb_tools, .{
+        .tier = .trusted,
+        .host_bindings = &hosts,
+        .sources = &.{
+            .{ .name = "counter", .source = b.path("examples/turn/counter.rb"), .source_name = "turn/counter.rb", .host_bindings = &names },
+            .{ .name = "fresh_probe", .source = b.path("examples/turn/fresh_probe.rb"), .source_name = "turn/fresh_probe.rb", .host_bindings = &names },
+        },
+    });
+    const module = b.createModule(.{
+        .root_source_file = b.path("examples/effects_turn.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    module.addImport("mruby", mruby_mod);
+    module.addImport("turn_manifest", bundle.manifest);
+    const example = b.addExecutable(.{ .name = "effects-turn", .root_module = module });
+    check_step.dependOn(&example.step);
+    b.installArtifact(example);
+    b.step("run-effects-turn", "run a fresh strict turn with data-only effects and explicit commit").dependOn(&b.addRunArtifact(example).step);
+    const turn_tests = b.step("test-effects-turn", "test fresh strict turns, data-only effects, commit/discard and terminal replay");
+    for ([_][]const u8{ "src/strict_turn_tests.zig", "src/strict_turn_lifecycle_tests.zig", "src/strict_turn_contract_tests.zig" }) |path| {
+        const tests_module = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        tests_module.addImport("turn_example", module);
+        tests_module.addImport("mruby", mruby_mod);
+        tests_module.addImport("turn_manifest", bundle.manifest);
+        const tests = b.addTest(.{ .root_module = tests_module });
+        check_step.dependOn(&tests.step);
+        turn_tests.dependOn(&b.addRunArtifact(tests).step);
+    }
+    strict_step.dependOn(turn_tests);
+}
+
+fn addWorkerExample(
+    b: *std.Build,
+    mruby_mod: *std.Build.Module,
+    codedb_tools: CodeDB.Tools,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sanitize_thread: bool,
+    sanitize_c: ?std.zig.SanitizeC,
+    check_step: *std.Build.Step,
+    strict_step: *std.Build.Step,
+) !void {
+    const contract = @import("examples/worker/contract.zig");
+    var hosts: [contract.operations.len]CodeDB.HostBinding = undefined;
+    var names: [contract.operations.len][]const u8 = undefined;
+    inline for (contract.operations, 0..) |operation, i| {
+        hosts[i] = .{ .name = operation.name, .authority = CodeDB.AuthoritySet.fromBits(operation.authority_bits) };
+        names[i] = operation.name;
+    }
+    const bundle = try CodeDB.add(b, codedb_tools, .{
+        .tier = .trusted,
+        .host_bindings = &hosts,
+        .sources = &.{.{ .name = "app", .source = b.path("examples/worker/app.rb"), .source_name = "worker/app.rb", .host_bindings = &names }},
+    });
+    const contract_module = b.createModule(.{
+        .root_source_file = b.path("examples/worker/contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const child = effectWorker(b, mruby_mod, b.path("tools/effects_worker.zig"), .{
+        .name = "effects-worker-child",
+        .manifest = bundle.manifest,
+        .contract = contract_module,
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    check_step.dependOn(&child.step);
+    b.installArtifact(child);
+    const host_module = b.createModule(.{
+        .root_source_file = b.path("examples/effects_worker.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    host_module.addImport("mruby", mruby_mod);
+    host_module.addImport("worker_manifest", bundle.manifest);
+    host_module.addImport("worker_contract", contract_module);
+    const host = b.addExecutable(.{ .name = "effects-worker", .root_module = host_module });
+    check_step.dependOn(&host.step);
+    b.installArtifact(host);
+    const run = b.addRunArtifact(host);
+    run.addArtifactArg(child);
+    b.step("run-effects-worker", "run strict application code in a confined child with a host effect broker").dependOn(&run.step);
+
+    const config = b.addOptions();
+    config.addOptionPath("worker_executable", child.getEmittedBin());
+    for ([_][]const u8{ "unknown", "denied", "reordered", "duplicate", "exit_after_effect", "forged_result", "dropped_record", "wrong_arity", "trailing_output", "crash_after_finish", "forged_terminal", "malformed_diagnostic", "spoofed_diagnostic", "schema_arguments", "turn_result", "turn_state" }) |mode| {
+        const fault_options = b.addOptions();
+        fault_options.addOption([]const u8, "mode", mode);
+        const module = b.createModule(.{
+            .root_source_file = b.path("examples/worker/fault_worker.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        module.addImport("mruby", mruby_mod);
+        module.addImport("worker_manifest", bundle.manifest);
+        module.addImport("worker_contract", contract_module);
+        module.addOptions("worker_fault_config", fault_options);
+        const fixture = b.addExecutable(.{ .name = b.fmt("effect-worker-{s}-fixture", .{mode}), .root_module = module });
+        check_step.dependOn(&fixture.step);
+        config.addOptionPath(b.fmt("{s}_executable", .{mode}), fixture.getEmittedBin());
+    }
+    const probe_module = b.createModule(.{
+        .root_source_file = b.path("examples/worker/confinement_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    probe_module.addImport("mruby", mruby_mod);
+    probe_module.addCSourceFile(.{ .file = b.path("examples/worker/confinement_probe.c"), .flags = &.{ "-Wall", "-Wextra" } });
+    const probe = b.addExecutable(.{ .name = "effect-worker-confinement-probe", .root_module = probe_module });
+    check_step.dependOn(&probe.step);
+    config.addOptionPath("confinement_executable", probe.getEmittedBin());
+    const test_module = b.createModule(.{
+        .root_source_file = b.path("src/strict_worker_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    test_module.addImport("mruby", mruby_mod);
+    test_module.addImport("worker_example", host_module);
+    test_module.addOptions("worker_test_config", config);
+    const tests = b.addTest(.{ .root_module = test_module });
+    check_step.dependOn(&tests.step);
+    const test_step = b.step("test-effects-worker", "test host-only adapters, broker validation, child cleanup and OS confinement");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+    // Run codec tests in the mruby module itself so Zig discovers their test
+    // declarations and all runtime feature/configuration imports remain shared.
+    const diagnostic_tests = b.addTest(.{
+        .root_module = mruby_mod,
+        .filters = &.{"worker diagnostic"},
+    });
+    check_step.dependOn(&diagnostic_tests.step);
+    test_step.dependOn(&b.addRunArtifact(diagnostic_tests).step);
+    const process_module = b.createModule(.{
+        .root_source_file = b.path("src/effect_worker_process_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    process_module.addCSourceFile(.{
+        .file = b.path("src/effect_worker_process.c"),
+        .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
+    });
+    const process_tests = b.addTest(.{ .root_module = process_module });
+    check_step.dependOn(&process_tests.step);
+    test_step.dependOn(&b.addRunArtifact(process_tests).step);
+    if (target.result.os.tag == .linux) {
+        const orphan_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        orphan_module.addCSourceFiles(.{
+            .files = &.{ "src/effect_worker_process.c", "src/effect_worker_process_orphan_test.c" },
+            .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
+        });
+        const orphan = b.addExecutable(.{ .name = "effect-worker-orphan-test", .root_module = orphan_module });
+        check_step.dependOn(&orphan.step);
+        const run_orphan = b.addRunArtifact(orphan);
+        run_orphan.addArg("--test");
+        test_step.dependOn(&run_orphan.step);
+    }
+    strict_step.dependOn(test_step);
+}
+
+fn addEffectSchemaTests(
+    b: *std.Build,
+    mruby_mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sanitize_thread: bool,
+    sanitize_c: ?std.zig.SanitizeC,
+    check_step: *std.Build.Step,
+    effects_step: *std.Build.Step,
+) void {
+    const module = b.createModule(.{ .root_source_file = b.path("src/effect_schema.zig"), .target = target, .optimize = optimize });
+    const tests = b.addTest(.{ .root_module = module });
+    check_step.dependOn(&tests.step);
+    const step = b.step("test-effects-schema", "test operation schema normalization, identity and inert validation");
+    step.dependOn(&b.addRunArtifact(tests).step);
+    const turn_schema_module = b.createModule(.{ .root_source_file = b.path("src/turn_contract.zig"), .target = target, .optimize = optimize });
+    const turn_schema_tests = b.addTest(.{ .root_module = turn_schema_module });
+    check_step.dependOn(&turn_schema_tests.step);
+    step.dependOn(&b.addRunArtifact(turn_schema_tests).step);
+    const validation_module = b.createModule(.{
+        .root_source_file = b.path("src/effect_schema_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    validation_module.addImport("mruby", mruby_mod);
+    const validation_tests = b.addTest(.{ .root_module = validation_module });
+    check_step.dependOn(&validation_tests.step);
+    step.dependOn(&b.addRunArtifact(validation_tests).step);
+    effects_step.dependOn(step);
+}
+
+fn addReservationExample(
+    b: *std.Build,
+    mruby_mod: *std.Build.Module,
+    codedb_tools: CodeDB.Tools,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sanitize_thread: bool,
+    sanitize_c: ?std.zig.SanitizeC,
+    check_step: *std.Build.Step,
+    strict_step: *std.Build.Step,
+) !void {
+    const contract = @import("examples/reservation/contract.zig");
+    var hosts: [contract.operations.len]CodeDB.HostBinding = undefined;
+    var names: [contract.operations.len][]const u8 = undefined;
+    inline for (contract.operations, 0..) |operation, i| {
+        hosts[i] = .{ .name = operation.name, .authority = CodeDB.AuthoritySet.fromBits(operation.authority_bits) };
+        names[i] = operation.name;
+    }
+    const bundle = try CodeDB.add(b, codedb_tools, .{
+        .tier = .trusted,
+        .host_bindings = &hosts,
+        .sources = &.{.{ .name = "app", .source = b.path("examples/reservation/app.rb"), .source_name = "reservation/app.rb", .host_bindings = &names }},
+    });
+    const contract_module = b.createModule(.{ .root_source_file = b.path("examples/reservation/contract.zig"), .target = target, .optimize = optimize });
+    const child = effectWorker(b, mruby_mod, b.path("tools/effects_worker.zig"), .{
+        .name = "effects-reservation-child",
+        .manifest = bundle.manifest,
+        .contract = contract_module,
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    check_step.dependOn(&child.step);
+    b.installArtifact(child);
+    const changed_contract = b.createModule(.{ .root_source_file = b.path("examples/reservation/contract_v2.zig"), .target = target, .optimize = optimize });
+    const changed_child = effectWorker(b, mruby_mod, b.path("tools/effects_worker.zig"), .{
+        .name = "effects-reservation-schema-fixture",
+        .manifest = bundle.manifest,
+        .contract = changed_contract,
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    check_step.dependOn(&changed_child.step);
+    const changed_turn_contract = b.createModule(.{ .root_source_file = b.path("examples/reservation/turn_contract_v2.zig"), .target = target, .optimize = optimize });
+    const changed_turn_child = effectWorker(b, mruby_mod, b.path("tools/effects_worker.zig"), .{
+        .name = "effects-reservation-turn-schema-fixture",
+        .manifest = bundle.manifest,
+        .contract = changed_turn_contract,
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    check_step.dependOn(&changed_turn_child.step);
+    const module = b.createModule(.{
+        .root_source_file = b.path("examples/effects_reservation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    module.addImport("mruby", mruby_mod);
+    module.addImport("reservation_manifest", bundle.manifest);
+    module.addImport("reservation_contract", contract_module);
+    const host = b.addExecutable(.{ .name = "effects-reservation", .root_module = module });
+    check_step.dependOn(&host.step);
+    b.installArtifact(host);
+    const run = b.addRunArtifact(host);
+    run.addArtifactArg(child);
+    b.step("run-effects-reservation", "run typed reservation operations in a confined worker").dependOn(&run.step);
+    const options = b.addOptions();
+    options.addOptionPath("worker_executable", child.getEmittedBin());
+    options.addOptionPath("changed_worker_executable", changed_child.getEmittedBin());
+    options.addOptionPath("changed_turn_worker_executable", changed_turn_child.getEmittedBin());
+    const tests_module = b.createModule(.{
+        .root_source_file = b.path("examples/reservation/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    tests_module.addImport("mruby", mruby_mod);
+    tests_module.addImport("reservation_example", module);
+    tests_module.addOptions("reservation_test_config", options);
+    const tests = b.addTest(.{ .root_module = tests_module });
+    check_step.dependOn(&tests.step);
+    const step = b.step("test-effects-reservation", "test typed arguments, outcomes, rollback and schema-bound replay");
+    step.dependOn(&b.addRunArtifact(tests).step);
+    strict_step.dependOn(step);
+}
+
+fn addDurableExample(
+    b: *std.Build,
+    mruby_mod: *std.Build.Module,
+    codedb_tools: CodeDB.Tools,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sanitize_thread: bool,
+    sanitize_c: ?std.zig.SanitizeC,
+    check_step: *std.Build.Step,
+    strict_step: *std.Build.Step,
+    enabled: bool,
+    worker_supported: bool,
+) !void {
+    const run_step = b.step("run-effects-durable", "run durable SQLite turns, retry recovery, replay and outbox delivery");
+    const test_step = b.step("test-effects-durable", "test durable turns and process-crash recovery");
+    if (!enabled or !worker_supported) {
+        const unavailable = b.addFail(if (!enabled)
+            "durable example requires -Deffects-strict=true -Dsqlite-effects=true"
+        else
+            "durable example requires strict effect worker support (Linux/macOS x86_64 or aarch64)");
+        run_step.dependOn(&unavailable.step);
+        test_step.dependOn(&unavailable.step);
+        return;
+    }
+    const sqlite = b.lazyDependency("sqlite", .{}) orelse return;
+    const contract = @import("examples/durable/contract.zig");
+    var hosts: [contract.operations.len]CodeDB.HostBinding = undefined;
+    var names: [contract.operations.len][]const u8 = undefined;
+    inline for (contract.operations, 0..) |operation, i| {
+        hosts[i] = .{ .name = operation.name, .authority = CodeDB.AuthoritySet.fromBits(operation.authority_bits) };
+        names[i] = operation.name;
+    }
+    const bundle = try CodeDB.add(b, codedb_tools, .{
+        .tier = .trusted,
+        .host_bindings = &hosts,
+        .sources = &.{.{ .name = "inventory", .source = b.path("examples/durable/inventory.rb"), .source_name = "durable/inventory.rb", .host_bindings = &names }},
+    });
+    const bundle_v2 = try CodeDB.add(b, codedb_tools, .{
+        .tier = .trusted,
+        .host_bindings = &hosts,
+        .sources = &.{.{ .name = "inventory-v2", .source = b.path("examples/durable/inventory_v2.rb"), .source_name = "durable/inventory_v2.rb", .host_bindings = &names }},
+    });
+    const contract_module = b.createModule(.{ .root_source_file = b.path("examples/durable/contract.zig"), .target = target, .optimize = optimize });
+    const contract_v2_module = b.createModule(.{ .root_source_file = b.path("examples/durable/contract_v2.zig"), .target = target, .optimize = optimize });
+    contract_v2_module.addImport("durable_original_contract", contract_module);
+    const child = effectWorker(b, mruby_mod, b.path("tools/effects_worker.zig"), .{
+        .name = "effects-durable-child",
+        .manifest = bundle.manifest,
+        .contract = contract_module,
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    check_step.dependOn(&child.step);
+    b.installArtifact(child);
+    const child_v2 = effectWorker(b, mruby_mod, b.path("tools/effects_worker.zig"), .{
+        .name = "effects-durable-child-v2",
+        .manifest = bundle_v2.manifest,
+        .contract = contract_v2_module,
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    check_step.dependOn(&child_v2.step);
+    b.installArtifact(child_v2);
+    const changed_contract_module = b.createModule(.{ .root_source_file = b.path("examples/durable/contract_schema_fixture.zig"), .target = target, .optimize = optimize });
+    changed_contract_module.addImport("durable_original_contract", contract_module);
+    const host_module = durableHostModule(b, mruby_mod, durableApplicationsModule(b, mruby_mod, target, optimize, sanitize_thread, sanitize_c, bundle.manifest, bundle_v2.manifest, contract_module, contract_v2_module), contract_module, target, optimize, sanitize_thread, sanitize_c, sqlite);
+    const fixture_host_module = durableHostModule(b, mruby_mod, durableApplicationsModule(b, mruby_mod, target, optimize, sanitize_thread, sanitize_c, bundle.manifest, bundle_v2.manifest, changed_contract_module, contract_v2_module), changed_contract_module, target, optimize, sanitize_thread, sanitize_c, sqlite);
+    const demo_module = b.createModule(.{
+        .root_source_file = b.path("examples/effects_durable.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    demo_module.addImport("mruby", mruby_mod);
+    demo_module.addImport("durable_host", host_module);
+    demo_module.addImport("durable_contract", contract_module);
+    const demo = b.addExecutable(.{ .name = "effects-durable", .root_module = demo_module });
+    check_step.dependOn(&demo.step);
+    b.installArtifact(demo);
+    const run = b.addRunArtifact(demo);
+    run.addArtifactArg(child);
+    run.addArtifactArg(child_v2);
+    run.addPassthruArgs();
+    run_step.dependOn(&run.step);
+
+    const fixture_module = b.createModule(.{
+        .root_source_file = b.path("examples/durable/crash_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    fixture_module.addImport("mruby", mruby_mod);
+    fixture_module.addImport("durable_host", host_module);
+    fixture_module.addImport("durable_contract", contract_module);
+    fixture_module.addCSourceFile(.{
+        .file = b.path("examples/durable/crash_supervisor.c"),
+        .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
+    });
+    const fixture = b.addExecutable(.{ .name = "effects-durable-crash-fixture", .root_module = fixture_module });
+    check_step.dependOn(&fixture.step);
+    const identity_fixture_module = b.createModule(.{
+        .root_source_file = b.path("examples/durable/contract_identity_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    identity_fixture_module.addImport("mruby", mruby_mod);
+    identity_fixture_module.addImport("durable_host", fixture_host_module);
+    identity_fixture_module.addImport("durable_contract", changed_contract_module);
+    identity_fixture_module.addCSourceFile(.{
+        .file = b.path("examples/durable/crash_supervisor.c"),
+        .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
+    });
+    const identity_fixture = b.addExecutable(.{ .name = "effects-durable-contract-fixture", .root_module = identity_fixture_module });
+    check_step.dependOn(&identity_fixture.step);
+    const upgrade_fixture_module = b.createModule(.{
+        .root_source_file = b.path("examples/durable/upgrade_crash_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    upgrade_fixture_module.addImport("mruby", mruby_mod);
+    upgrade_fixture_module.addImport("durable_host", host_module);
+    upgrade_fixture_module.addImport("durable_contract", contract_module);
+    upgrade_fixture_module.addCSourceFile(.{
+        .file = b.path("examples/durable/crash_supervisor.c"),
+        .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
+    });
+    const upgrade_fixture = b.addExecutable(.{ .name = "effects-durable-upgrade-fixture", .root_module = upgrade_fixture_module });
+    check_step.dependOn(&upgrade_fixture.step);
+    const config = b.addOptions();
+    config.addOptionPath("worker_executable", child.getEmittedBin());
+    config.addOptionPath("worker_v2_executable", child_v2.getEmittedBin());
+    config.addOptionPath("crash_fixture_executable", fixture.getEmittedBin());
+    config.addOptionPath("changed_contract_fixture_executable", identity_fixture.getEmittedBin());
+    config.addOptionPath("upgrade_crash_fixture_executable", upgrade_fixture.getEmittedBin());
+    const tests_module = b.createModule(.{
+        .root_source_file = b.path("examples/durable/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    tests_module.addImport("mruby", mruby_mod);
+    tests_module.addImport("durable_host", host_module);
+    tests_module.addImport("durable_contract", contract_module);
+    tests_module.addOptions("durable_test_config", config);
+    tests_module.addCSourceFile(.{
+        .file = b.path("examples/durable/crash_supervisor.c"),
+        .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
+    });
+    const tests = b.addTest(.{ .root_module = tests_module });
+    check_step.dependOn(&tests.step);
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+    const upgrade_tests_module = b.createModule(.{
+        .root_source_file = b.path("examples/durable/upgrade_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    upgrade_tests_module.addImport("mruby", mruby_mod);
+    upgrade_tests_module.addImport("durable_host", host_module);
+    upgrade_tests_module.addImport("durable_contract", contract_module);
+    upgrade_tests_module.addOptions("durable_test_config", config);
+    upgrade_tests_module.addCSourceFile(.{
+        .file = b.path("examples/durable/crash_supervisor.c"),
+        .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
+    });
+    const upgrade_tests = b.addTest(.{ .root_module = upgrade_tests_module });
+    check_step.dependOn(&upgrade_tests.step);
+    test_step.dependOn(&b.addRunArtifact(upgrade_tests).step);
+    // The delivery root also discovers sql.zig's focused storage tests. Keep
+    // these explicit; tests in a named dependency module are not test roots.
+    const storage_module = b.createModule(.{
+        .root_source_file = b.path("examples/durable/delivery.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .sanitize_thread = sanitize_thread,
+        .sanitize_c = sanitize_c,
+    });
+    storage_module.addImport("durable_contract", contract_module);
+    storage_module.addIncludePath(sqlite.path(""));
+    storage_module.addCSourceFile(.{
+        .file = sqlite.path("sqlite3.c"),
+        .flags = &.{ "-DSQLITE_THREADSAFE=1", "-DSQLITE_OMIT_LOAD_EXTENSION", "-DSQLITE_DQS=0", "-w" },
+    });
+    storage_module.addCSourceFile(.{
+        .file = b.path("examples/durable/sql_identity.c"),
+        .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
+    });
+    const storage_tests = b.addTest(.{ .root_module = storage_module });
+    check_step.dependOn(&storage_tests.step);
+    test_step.dependOn(&b.addRunArtifact(storage_tests).step);
+    strict_step.dependOn(test_step);
+}
+
+fn addInventoryExample(
+    b: *std.Build,
+    mruby_mod: *std.Build.Module,
+    codedb_tools: CodeDB.Tools,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sanitize_thread: bool,
+    sanitize_c: ?std.zig.SanitizeC,
+    check_step: *std.Build.Step,
+    enabled: bool,
+) !*std.Build.Step {
+    // Deliberately opt-in: the embedding library has no SQLite dependency.
+    const inventory_run_step = b.step("run-effects-inventory", "run SQLite inventory effects and measurements (requires -Dsqlite-effects=true)");
+    const inventory_test_step = b.step("test-effects-inventory", "verify SQLite inventory effects (requires -Dsqlite-effects=true)");
+    if (enabled) {
+        if (b.lazyDependency("sqlite", .{})) |sqlite| {
+            const inventory_contract = @import("examples/inventory/contract.zig");
+            var inventory_hosts: [inventory_contract.operations.len]CodeDB.HostBinding = undefined;
+            var inventory_names: [inventory_contract.operations.len][]const u8 = undefined;
+            inline for (inventory_contract.operations, 0..) |operation, i| {
+                inventory_hosts[i] = .{ .name = operation.name, .authority = CodeDB.AuthoritySet.fromBits(operation.authority_bits) };
+                inventory_names[i] = operation.name;
+            }
+            const inventory_bundle = try CodeDB.add(b, codedb_tools, .{
+                .tier = .trusted,
+                .host_bindings = &inventory_hosts,
+                .sources = &.{.{
+                    .name = "inventory",
+                    .source = b.path("examples/inventory/inventory.rb"),
+                    .source_name = "inventory/inventory.rb",
+                    .host_bindings = &inventory_names,
+                }},
+            });
+            const inventory_mod = b.createModule(.{
+                .root_source_file = b.path("examples/effects_inventory.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .sanitize_thread = sanitize_thread,
+                .sanitize_c = sanitize_c,
+            });
+            inventory_mod.addImport("mruby", mruby_mod);
+            inventory_mod.addImport("inventory_manifest", inventory_bundle.manifest);
+            inventory_mod.addIncludePath(sqlite.path(""));
+            inventory_mod.addCSourceFile(.{
+                .file = sqlite.path("sqlite3.c"),
+                .flags = &.{ "-DSQLITE_THREADSAFE=0", "-DSQLITE_OMIT_LOAD_EXTENSION", "-DSQLITE_DQS=0", "-w" },
+            });
+            const inventory = b.addExecutable(.{ .name = "effects-inventory", .root_module = inventory_mod });
+            check_step.dependOn(&inventory.step);
+            b.installArtifact(inventory);
+            const run_inventory = b.addRunArtifact(inventory);
+            inventory_run_step.dependOn(&run_inventory.step);
+            const test_inventory = b.addRunArtifact(inventory);
+            test_inventory.addArg("--test");
+            inventory_test_step.dependOn(&test_inventory.step);
+        }
+    } else {
+        const disabled = b.addFail("inventory example requires -Dsqlite-effects=true (SQLite is an optional, hash-pinned dependency)");
+        inventory_run_step.dependOn(&disabled.step);
+        inventory_test_step.dependOn(&disabled.step);
+    }
+
+    return inventory_test_step;
+}
+
 fn artifactConfigModule(
     b: *std.Build,
     artifact_config_gen: *std.Build.Step.Compile,
@@ -1160,6 +2324,8 @@ fn artifactConfigModule(
     mruby_package_hash: []const u8,
     final_presym_dir: std.Build.LazyPath,
     no_compiler: bool,
+    effects_strict: bool,
+    effects_integer64: bool,
 ) !*std.Build.Module {
     const pointer_bits = target.ptrBitWidth();
     if (pointer_bits != 32 and pointer_bits != 64) {
@@ -1169,6 +2335,8 @@ fn artifactConfigModule(
     var semantic_defines: std.ArrayList([]const u8) = .empty;
     try semantic_defines.append(arena, "MRB_USE_DEBUG_HOOK");
     if (no_compiler) try semantic_defines.append(arena, "MRZ_NO_COMPILER");
+    if (effects_strict) try semantic_defines.appendSlice(arena, &.{ "MRZ_EFFECTS_STRICT=1", "MRB_NO_STDIO" });
+    if (effects_integer64) try semantic_defines.appendSlice(arena, &.{ "MRB_NO_FLOAT", "MRB_INT64", "MRZ_INTEGER_ONLY=1" });
     try semantic_defines.appendSlice(arena, &.{
         "MRB_STR_LENGTH_MAX=0",
         "MRB_ARY_LENGTH_MAX=0",
@@ -1181,7 +2349,8 @@ fn artifactConfigModule(
         for (gem.defines) |define| try semantic_defines.append(arena, define);
     }
 
-    const generated_configuration = &.{
+    var generated_configuration: std.ArrayList([]const u8) = .empty;
+    try generated_configuration.appendSlice(arena, &.{
         "presym-scanner=v1",
         "presym-define=MRB_PRESYM_SCANNING",
         "presym-target-traits=pointer-width,endian",
@@ -1190,7 +2359,19 @@ fn artifactConfigModule(
         "gem-init-template=v1",
         hash_integer_patch_marker,
         hash_symbol_patch_marker,
-    };
+    });
+    if (effects_integer64) try generated_configuration.append(arena, "effects-integer64-policy=v1");
+    if (effects_strict) {
+        try generated_configuration.append(arena, "effects-strict-native-catalogue=v1");
+        var digest: [32]u8 = undefined;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(@embedFile("build/native_catalogue.zig"));
+        hash.update(@embedFile("tools/patch_mruby_strict.zig"));
+        hash.update(@embedFile("src/strict_native.c"));
+        hash.update(@embedFile("src/strict_native.h"));
+        hash.final(&digest);
+        try generated_configuration.append(arena, try std.fmt.allocPrint(arena, "strict-native-source-digest={x}", .{digest}));
+    }
 
     const run = b.addRunArtifact(artifact_config_gen);
     run.addFileArg(final_presym_dir.path(b, "presym.digest"));
@@ -1204,15 +2385,15 @@ fn artifactConfigModule(
         .little => "little",
         .big => "big",
     });
-    // The pinned mrbconf.h defaults to word boxing, binary64 Float, and
-    // pointer-width Integer. Any future override belongs in these traits.
-    run.addArg(try std.fmt.allocPrint(arena, "{d}", .{pointer_bits}));
-    run.addArg("64");
+    // These traits describe the same numeric flags used by both the host
+    // compiler and target runtime. Zero float bits means Float is absent.
+    run.addArg(try std.fmt.allocPrint(arena, "{d}", .{if (effects_integer64) @as(u16, 64) else pointer_bits}));
+    run.addArg(if (effects_integer64) "0" else "64");
     run.addArg("word");
-    run.addArg("true");
+    run.addArg(if (effects_integer64) "false" else "true");
     try addIdentitySequenceArgs(run, arena, semantic_defines.items);
     try addIdentitySequenceArgs(run, arena, ordered_gems.items);
-    try addIdentitySequenceArgs(run, arena, generated_configuration);
+    try addIdentitySequenceArgs(run, arena, generated_configuration.items);
 
     const generated_config = run.addOutputFileArg("artifact_config.zig");
     return b.createModule(.{ .root_source_file = generated_config });
@@ -1360,6 +2541,7 @@ fn presymHeaders(
     defines: []const []const u8,
     root: std.Build.LazyPath,
     triple: []const u8,
+    extra_include_dirs: []const std.Build.LazyPath,
 ) !std.Build.LazyPath {
     const include = try root.join(arena, "include");
     const run = b.addRunArtifact(presym_gen);
@@ -1367,6 +2549,7 @@ fn presymHeaders(
         const cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-E", "-P", "-DMRB_PRESYM_SCANNING" });
         cmd.addArg("-target");
         cmd.addArg(triple);
+        for (extra_include_dirs) |dir| cmd.addPrefixedDirectoryArg("-I", dir);
         cmd.addPrefixedDirectoryArg("-I", include);
         for (in.includes) |dir| {
             cmd.addPrefixedDirectoryArg("-I", try root.join(arena, dir));
@@ -1403,6 +2586,62 @@ const JoinPart = union(enum) {
     str: []const u8,
     file: std.Build.LazyPath,
 };
+
+const PatchedHostSource = struct { path: []const u8, file: std.Build.LazyPath };
+
+fn patchIntegerHostSources(b: *std.Build, root: std.Build.LazyPath, patcher: *std.Build.Step.Compile) ![]const PatchedHostSource {
+    const paths = [_][]const u8{
+        "src/numeric.c",
+        "src/string.c",
+        "mrbgems/mruby-compiler/core/codegen.c",
+        "mrbgems/mruby-compiler/core/y.tab.c",
+    };
+    const result = try b.allocator.alloc(PatchedHostSource, paths.len);
+    for (paths, result) |path, *source| {
+        const run = b.addRunArtifact(patcher);
+        run.addArg(path);
+        run.addFileArg(root.path(b, path));
+        source.* = .{ .path = path, .file = run.addOutputFileArg(std.fs.path.basename(path)) };
+        run.addArg("integer-host");
+    }
+    return result;
+}
+
+fn patchedHostSource(sources_to_check: []const PatchedHostSource, path: []const u8) ?std.Build.LazyPath {
+    for (sources_to_check) |source| if (std.mem.eql(u8, source.path, path)) return source.file;
+    return null;
+}
+
+const StrictSources = struct {
+    tool: *std.Build.Step.Compile,
+    core: [sources.core_srcs.len]std.Build.LazyPath,
+    include: std.Build.LazyPath,
+};
+
+fn patchMrubyStrict(b: *std.Build, root: std.Build.LazyPath, patched_hash: std.Build.LazyPath) !StrictSources {
+    const patcher = hostTool(b, "tools/patch_mruby_strict.zig");
+    const catalogue = b.createModule(.{
+        .root_source_file = b.path("build/native_catalogue.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    patcher.root_module.addImport("native_catalogue", catalogue);
+    var result: StrictSources = undefined;
+    result.tool = patcher;
+    for (sources.core_srcs, 0..) |path, index| {
+        const run = b.addRunArtifact(patcher);
+        run.addArg(path);
+        run.addFileArg(if (std.mem.eql(u8, path, "src/hash.c")) patched_hash else root.path(b, path));
+        result.core[index] = run.addOutputFileArg(std.fs.path.basename(path));
+    }
+    const header = b.addRunArtifact(patcher);
+    header.addArg("include/mruby.h");
+    header.addFileArg(root.path(b, "include/mruby.h"));
+    const headers = b.addWriteFiles();
+    _ = headers.addCopyFile(header.addOutputFileArg("mruby.h"), "mruby.h");
+    result.include = headers.getDirectory();
+    return result;
+}
 
 fn patchMrubyHash(
     b: *std.Build,
