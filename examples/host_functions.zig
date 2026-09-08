@@ -1,7 +1,7 @@
 //! Calling Zig from Ruby: methods with typed arguments, blocks, and Zig
 //! state wrapped in Ruby objects.
 //!
-//!     zig build run-host-functions
+//!     zig build run-host_functions
 
 const std = @import("std");
 const mruby = @import("mruby");

@@ -53,6 +53,7 @@ deploy the matching `mruby-worker` executable produced by the build.
 
 | Document | Contents |
 | --- | --- |
+| [tutorials/](docs/tutorials/README.md) | guided walk-through series from first embedding to the durable host |
 | [getting-started.md](docs/getting-started.md) | dependency setup, build options (gems, allocator), feature manifest, dev commands, running CI locally |
 | [safe-api.md](docs/safe-api.md) | embedding API: evaluation, exceptions, host functions, data wrapping, collections, lifetimes and roots, threading |
 | [sandboxing.md](docs/sandboxing.md) | policies and presets, gas/deadline/memory limits, termination, lifecycle and sealing, threat model |
