@@ -1,5 +1,9 @@
 # Getting started and build options
 
+New to the project? Walk the [tutorial series](tutorials/README.md) first —
+it reads the example ladder from first embedding to the durable host. This
+document is the reference for setup and build options.
+
 mruby-zig embeds [mruby](https://mruby.org) 4.0 in Zig applications. One
 `zig build` fetches the mruby 4.0.0 source (hash-pinned), generates its
 presym tables and core bytecode, compiles everything with `zig cc`, and
