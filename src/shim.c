@@ -1435,6 +1435,7 @@ struct mrz_sandbox_context {
   mrb_value (*observer)(struct mrb_state*, const void*, const void*, void*);
 };
 
+#ifdef MRB_USE_DEBUG_HOOK
 static void
 mrz_code_fetch_trampoline(struct mrb_state *mrb,
                           const struct mrb_irep *irep,
@@ -1447,6 +1448,7 @@ mrz_code_fetch_trampoline(struct mrb_state *mrb,
   mrb_value exception = context->observer(mrb, irep, pc, regs);
   if (!mrb_nil_p(exception)) mrb_exc_raise(mrb, exception);
 }
+#endif
 
 /* mrb->ud auxiliary pointer (sandbox backreference and hook observer). */
 void *mrz_get_ud(mrb_state *mrb) {
@@ -1455,12 +1457,22 @@ void *mrz_get_ud(mrb_state *mrb) {
   return context == NULL ? NULL : context->userdata;
 }
 
+/* Attach the sandbox backreference and, where the interpreter was built with
+ * the per-instruction hook, the observer trampoline that enforces its limits.
+ *
+ * Without MRB_USE_DEBUG_HOOK the mrb_state has no hook field and no observer
+ * can run. The backreference is still installed, because mrz_get_ud is used
+ * by callbacks that do not depend on the hook. Nothing in-tree reaches this
+ * function in that configuration: sandbox.zig refuses to compile without the
+ * hook, so an unenforced isolate cannot be constructed. */
 void
 mrz_set_sandbox_context(mrb_state *mrb, struct mrz_sandbox_context *context)
 {
   mrb->ud = context;
+#ifdef MRB_USE_DEBUG_HOOK
   mrb->code_fetch_hook =
     context == NULL ? NULL : mrz_code_fetch_trampoline;
+#endif
 }
 
 /* irep of an irep-proc (for snapshot dump) */

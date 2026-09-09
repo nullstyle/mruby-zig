@@ -2,6 +2,18 @@
 
 ## 0.5.0 (2026-10-07)
 
+- `-Ddebug-hook` makes mruby's per-instruction hook (`MRB_USE_DEBUG_HOOK`)
+  optional. It stays on by default. The hook adds a NULL-guarded call site to
+  mruby's `NEXT` macro, so bytecode dispatch tests a function pointer once per
+  instruction; upstream mruby ships it disabled, and an embedding that only
+  uses `Vm` never installs an observer. `-Ddebug-hook=false` removes it, and
+  with it the sandbox: gas metering, call-depth caps and termination delivery
+  run from that hook alone, so `features.has_debug_hook` and
+  `features.sandbox_supported` become false and `sandbox.BootstrapIsolate.spawn`
+  (with the strict turn, effects worker and one-shot worker layers above it)
+  fails to compile with an explanation rather than running unenforced. The hook
+  participates in compatibility identity. See docs/getting-started.md.
+
 Experimental explicit effects (see docs/effects.md):
 
 - Durable ledgers now keep a tamper-evident history chain: every committed

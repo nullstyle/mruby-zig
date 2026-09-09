@@ -162,9 +162,31 @@ pub fn build(b: *std.Build) !void {
     const numeric_flags: []const []const u8 = if (effects_integer64) integer64_flags else &.{};
     const explicit_no_compiler = b.option(bool, "no-compiler", "omit the target Ruby parser/code generator; retain build-time mrbc");
     const no_compiler = explicit_no_compiler orelse effects_strict;
+    // MRB_USE_DEBUG_HOOK adds a NULL-guarded call site to mruby's NEXT macro,
+    // so every bytecode dispatch tests a function pointer. It is what the
+    // sandbox uses to meter gas, cap call depth and deliver terminations, and
+    // it is on by default because that enforcement is the safe default.
+    //
+    // An embedder that only uses `Vm` never installs an observer and pays the
+    // per-instruction test for nothing. `-Ddebug-hook=false` removes it. The
+    // sandbox is then unavailable rather than unenforced: `sandbox.Isolate`
+    // and the strict/effects layers built on it fail to compile with an
+    // explanation, so a build cannot silently lose its limits.
+    const debug_hook = b.option(
+        bool,
+        "debug-hook",
+        "compile mruby's per-instruction hook (default true; required by the sandbox, gas metering and effects)",
+    ) orelse true;
     if (effects_strict and !no_compiler) {
         std.debug.print("error: -Deffects-strict=true requires -Dno-compiler=true\n", .{});
         return error.StrictEffectsRequiresNoCompiler;
+    }
+    // Every strict artifact runs application code inside an isolate, so the
+    // profile has nothing left to build without the hook. Refuse the pair here
+    // rather than letting each strict step fail on its own.
+    if (effects_strict and !debug_hook) {
+        std.debug.print("error: -Deffects-strict=true requires the per-instruction hook; omit -Ddebug-hook=false\n", .{});
+        return error.StrictEffectsRequiresDebugHook;
     }
     const sqlite_effects = b.option(bool, "sqlite-effects", "build optional SQLite inventory and durable effects examples") orelse false;
     const sanitize_thread = b.option(bool, "sanitize-thread", "enable ThreadSanitizer") orelse false;
@@ -241,9 +263,13 @@ pub fn build(b: *std.Build) !void {
     for (selected_gems) |gem| {
         available_authority = available_authority.unionWith(gem.authority);
     }
+    // The worker controller executes its request inside a sandbox isolate, so
+    // an absent hook makes it unsupported in the same fail-closed sense as an
+    // unsupported target: no worker artifact, no fixtures, and
+    // `features.worker_process_supported` reads false downstream.
     const worker_decision = authority.workerDecision(
         available_authority,
-        worker_target_supported and !effects_strict,
+        worker_target_supported and !effects_strict and debug_hook,
         allow_worker_ambient_authority,
     );
     var gem_defines: std.ArrayList([]const u8) = .empty;
@@ -425,7 +451,7 @@ pub fn build(b: *std.Build) !void {
     const lib_scan_defines = defines: {
         var d: std.ArrayList([]const u8) = .empty;
         try d.appendSlice(arena, gem_defines.items);
-        try d.append(arena, "-DMRB_USE_DEBUG_HOOK");
+        if (debug_hook) try d.append(arena, "-DMRB_USE_DEBUG_HOOK");
         if (no_compiler) try d.append(arena, "-DMRZ_NO_COMPILER");
         if (effects_strict) try d.appendSlice(arena, &.{ "-DMRZ_EFFECTS_STRICT=1", "-DMRB_NO_STDIO" });
         try d.appendSlice(arena, numeric_flags);
@@ -447,7 +473,9 @@ pub fn build(b: *std.Build) !void {
         try f.append(arena, "-w");
         // Enables mrb->code_fetch_hook (NULL-guarded per-instruction call
         // site) used by the sandboxing layer for limits and termination.
-        try f.append(arena, "-DMRB_USE_DEBUG_HOOK");
+        // Off under -Ddebug-hook=false, which also makes the sandbox
+        // unavailable rather than unenforced.
+        if (debug_hook) try f.append(arena, "-DMRB_USE_DEBUG_HOOK");
         if (no_compiler) try f.append(arena, "-DMRZ_NO_COMPILER");
         if (effects_strict) try f.appendSlice(arena, &.{ "-DMRZ_EFFECTS_STRICT=1", "-DMRB_NO_STDIO" });
         try f.appendSlice(arena, numeric_flags);
@@ -460,7 +488,8 @@ pub fn build(b: *std.Build) !void {
 
     const shim_flags = flags: {
         var f: std.ArrayList([]const u8) = .empty;
-        try f.appendSlice(arena, &.{ "-Wall", "-Wextra", "-DMRB_USE_DEBUG_HOOK" });
+        try f.appendSlice(arena, &.{ "-Wall", "-Wextra" });
+        if (debug_hook) try f.append(arena, "-DMRB_USE_DEBUG_HOOK");
         if (no_compiler) try f.append(arena, "-DMRZ_NO_COMPILER");
         if (effects_strict) try f.appendSlice(arena, &.{ "-DMRZ_EFFECTS_STRICT=1", "-DMRB_NO_STDIO" });
         try f.appendSlice(arena, numeric_flags);
@@ -511,6 +540,7 @@ pub fn build(b: *std.Build) !void {
         no_compiler,
         effects_strict,
         effects_integer64,
+        debug_hook,
     );
     mruby_mod.addImport("artifact_config", artifact_config);
     // Comptime feature manifest: everything here is known at configure time
@@ -552,6 +582,7 @@ pub fn build(b: *std.Build) !void {
         build_features.addOption(bool, "worker_process_supported", worker_decision.enabled);
         build_features.addOption([]const u8, "gem_set", gem_set);
         build_features.addOption(bool, "has_compiler", !no_compiler);
+        build_features.addOption(bool, "debug_hook", debug_hook);
         build_features.addOption(bool, "effects_strict", effects_strict);
         build_features.addOption(bool, "effects_integer64", effects_integer64);
         build_features.addOption(bool, "effects_worker_supported", effects_worker_supported);
@@ -783,7 +814,9 @@ pub fn build(b: *std.Build) !void {
     }
 
     const test_step = b.step("test", "run unit and integration tests for the selected profile");
-    if (!no_compiler) {
+    // The integration suite spawns isolates throughout, so it is a sandbox-tier
+    // root even though most of what it covers is not.
+    if (!no_compiler and debug_hook) {
         // Tests.
         const test_mod = b.createModule(.{
             .root_source_file = b.path("src/tests.zig"),
@@ -926,23 +959,27 @@ pub fn build(b: *std.Build) !void {
 
     // C materialization fuzz target: the same inputs driven through
     // Isolate.importValue inside a live, memory-capped isolate.
-    const state_materialize_fuzz_mod = b.createModule(.{
-        .root_source_file = b.path("src/state_materialize_fuzz.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = sanitize_thread,
-        .sanitize_c = sanitize_c,
-    });
-    state_materialize_fuzz_mod.addImport("mruby", mruby_mod);
-    const state_materialize_fuzz_tests = b.addTest(.{ .root_module = state_materialize_fuzz_mod });
-    check_step.dependOn(&state_materialize_fuzz_tests.step);
-    const run_state_materialize_fuzz_tests = b.addRunArtifact(state_materialize_fuzz_tests);
-    test_step.dependOn(&run_state_materialize_fuzz_tests.step);
     const fuzz_state_materialize_step = b.step(
         "fuzz-state-materialize",
         "fuzz StateCapsule admission and C materialization through a live isolate",
     );
-    fuzz_state_materialize_step.dependOn(&run_state_materialize_fuzz_tests.step);
+    if (debug_hook) {
+        const state_materialize_fuzz_mod = b.createModule(.{
+            .root_source_file = b.path("src/state_materialize_fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        state_materialize_fuzz_mod.addImport("mruby", mruby_mod);
+        const state_materialize_fuzz_tests = b.addTest(.{ .root_module = state_materialize_fuzz_mod });
+        check_step.dependOn(&state_materialize_fuzz_tests.step);
+        const run_state_materialize_fuzz_tests = b.addRunArtifact(state_materialize_fuzz_tests);
+        test_step.dependOn(&run_state_materialize_fuzz_tests.step);
+        fuzz_state_materialize_step.dependOn(&run_state_materialize_fuzz_tests.step);
+    } else {
+        fuzz_state_materialize_step.dependOn(&sandboxUnavailable(b, "fuzz-state-materialize").step);
+    }
 
     if (!no_compiler) {
         // The integration suite above roots at src/tests.zig and pulls in the
@@ -981,7 +1018,7 @@ pub fn build(b: *std.Build) !void {
     const run_worker_protocol_tests = b.addRunArtifact(worker_protocol_tests);
     test_step.dependOn(&run_worker_protocol_tests.step);
 
-    if (!no_compiler) {
+    if (!no_compiler and debug_hook) {
         // A real producer and consumer executable exchange the encoded capsule
         // through captured stdout/stdin. They are separately linked OS processes;
         // the consumer restores into a new Isolate and checks the complete graph.
@@ -1024,13 +1061,21 @@ pub fn build(b: *std.Build) !void {
             "transfer a StateCapsule between producer and consumer processes",
         );
         process_fixture_step.dependOn(&run_capsule_consumer.step);
-    } else {
+    } else if (no_compiler) {
         unsupportedCompilerStep(b, "test-state-capsule-process", "transfer a source-produced StateCapsule between processes");
+    } else {
+        sandboxUnavailableStep(b, "test-state-capsule-process", "transfer a StateCapsule between producer and consumer processes");
     }
 
+    // Only the sandbox example leaves `Vm` for an isolate; the others stay on
+    // the plain embedding API and build without the hook.
+    if (!debug_hook) sandboxUnavailableStep(b, "run-sandbox", "run the sandbox example");
+    const ex_names: []const []const u8 = if (debug_hook)
+        &.{ "quickstart", "host_functions", "exceptions", "sandbox" }
+    else
+        &.{ "quickstart", "host_functions", "exceptions" };
     if (!no_compiler) {
         // Examples.
-        const ex_names = [_][]const u8{ "quickstart", "host_functions", "exceptions", "sandbox" };
         for (ex_names) |ex_name| {
             const ex_mod = b.createModule(.{
                 .root_source_file = b.path(b.fmt("examples/{s}.zig", .{ex_name})),
@@ -1050,53 +1095,60 @@ pub fn build(b: *std.Build) !void {
             run_step.dependOn(&run_cmd.step);
         }
     } else {
-        for ([_][]const u8{ "quickstart", "host_functions", "exceptions", "sandbox" }) |name| {
+        for (ex_names) |name| {
             unsupportedCompilerStep(b, b.fmt("run-{s}", .{name}), b.fmt("run the {s} example", .{name}));
         }
     }
 
-    // Use the runtime operation catalogue for CodeDB's host authority metadata
-    // as well, so the demo cannot silently describe different operations.
-    const effect_contract = @import("examples/effects/contract.zig");
-    var effect_hosts: [effect_contract.operations.len]CodeDB.HostBinding = undefined;
-    var effect_names: [effect_contract.operations.len][]const u8 = undefined;
-    inline for (effect_contract.operations, 0..) |operation, i| {
-        effect_hosts[i] = .{
-            .name = operation.name,
-            .authority = CodeDB.AuthoritySet.fromBits(operation.authority_bits),
-        };
-        effect_names[i] = operation.name;
-    }
-    const effects_bundle = try CodeDB.add(b, codedb_tools, .{
-        .tier = .trusted,
-        .host_bindings = &effect_hosts,
-        .sources = &.{.{
-            .name = "announce",
-            .source = b.path("examples/effects/announce.rb"),
-            .source_name = "effects/announce.rb",
-            .host_bindings = &effect_names,
-        }},
-    });
-    const effects_demo_mod = b.createModule(.{
-        .root_source_file = b.path("examples/effects_demo.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = sanitize_thread,
-        .sanitize_c = sanitize_c,
-    });
-    effects_demo_mod.addImport("mruby", mruby_mod);
-    effects_demo_mod.addImport("effects_manifest", effects_bundle.manifest);
-    const effects_demo = b.addExecutable(.{ .name = "effects-demo", .root_module = effects_demo_mod });
-    check_step.dependOn(&effects_demo.step);
-    b.installArtifact(effects_demo);
-    const run_effects_demo = b.addRunArtifact(effects_demo);
     const effects_demo_step = b.step("run-effects-demo", "run explicit effects with live, fixed, recording, and replay adapters");
-    effects_demo_step.dependOn(&run_effects_demo.step);
     const effects_test_step = b.step("test-effects", "test explicit effect enforcement and record/replay");
-    addEffectDataTests(b, mruby_mod, target, optimize, sanitize_thread, sanitize_c, check_step, effects_test_step);
+    // Effect adapters mediate what application code inside an isolate may do,
+    // so the demo and the tests that execute Ruby are sandbox-tier. The inert
+    // receipt and schema codecs below never create a VM.
+    if (debug_hook) {
+        // Use the runtime operation catalogue for CodeDB's host authority metadata
+        // as well, so the demo cannot silently describe different operations.
+        const effect_contract = @import("examples/effects/contract.zig");
+        var effect_hosts: [effect_contract.operations.len]CodeDB.HostBinding = undefined;
+        var effect_names: [effect_contract.operations.len][]const u8 = undefined;
+        inline for (effect_contract.operations, 0..) |operation, i| {
+            effect_hosts[i] = .{
+                .name = operation.name,
+                .authority = CodeDB.AuthoritySet.fromBits(operation.authority_bits),
+            };
+            effect_names[i] = operation.name;
+        }
+        const effects_bundle = try CodeDB.add(b, codedb_tools, .{
+            .tier = .trusted,
+            .host_bindings = &effect_hosts,
+            .sources = &.{.{
+                .name = "announce",
+                .source = b.path("examples/effects/announce.rb"),
+                .source_name = "effects/announce.rb",
+                .host_bindings = &effect_names,
+            }},
+        });
+        const effects_demo_mod = b.createModule(.{
+            .root_source_file = b.path("examples/effects_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        effects_demo_mod.addImport("mruby", mruby_mod);
+        effects_demo_mod.addImport("effects_manifest", effects_bundle.manifest);
+        const effects_demo = b.addExecutable(.{ .name = "effects-demo", .root_module = effects_demo_mod });
+        check_step.dependOn(&effects_demo.step);
+        b.installArtifact(effects_demo);
+        const run_effects_demo = b.addRunArtifact(effects_demo);
+        effects_demo_step.dependOn(&run_effects_demo.step);
+        addEffectDataTests(b, mruby_mod, target, optimize, sanitize_thread, sanitize_c, check_step, effects_test_step);
+        effects_test_step.dependOn(&run_effects_demo.step);
+    } else {
+        effects_demo_step.dependOn(&sandboxUnavailable(b, "run-effects-demo").step);
+    }
     addEffectInspector(b, mruby_mod, target, optimize, sanitize_thread, sanitize_c, check_step, effects_test_step);
     addEffectSchemaTests(b, mruby_mod, target, optimize, sanitize_thread, sanitize_c, check_step, effects_test_step);
-    effects_test_step.dependOn(&run_effects_demo.step);
     const effect_trace_tests_mod = b.createModule(.{
         .root_source_file = b.path("src/effect_trace.zig"),
         .target = target,
@@ -1115,7 +1167,7 @@ pub fn build(b: *std.Build) !void {
     check_step.dependOn(&effect_invocation_tests.step);
     const run_effect_invocation_tests = b.addRunArtifact(effect_invocation_tests);
     effects_test_step.dependOn(&run_effect_invocation_tests.step);
-    if (!no_compiler) {
+    if (!no_compiler and debug_hook) {
         const effects_tests_mod = b.createModule(.{
             .root_source_file = b.path("src/effect_tests.zig"),
             .target = target,
@@ -1131,7 +1183,7 @@ pub fn build(b: *std.Build) !void {
     }
     test_step.dependOn(effects_test_step);
 
-    _ = try addInventoryExample(b, mruby_mod, codedb_tools, target, optimize, sanitize_thread, sanitize_c, check_step, sqlite_effects);
+    _ = try addInventoryExample(b, mruby_mod, codedb_tools, target, optimize, sanitize_thread, sanitize_c, check_step, sqlite_effects, debug_hook);
     const strict_turn_required = b.addFail("strict turn example requires -Deffects-strict=true");
     b.step("run-effects-turn", "run the fresh strict turn example (requires -Deffects-strict=true)").dependOn(&strict_turn_required.step);
     b.step("test-effects-turn", "test fresh strict turns (requires -Deffects-strict=true)").dependOn(&strict_turn_required.step);
@@ -1143,32 +1195,40 @@ pub fn build(b: *std.Build) !void {
     b.step("run-effects-durable", "run durable strict effects (requires -Deffects-strict=true -Dsqlite-effects=true)").dependOn(&durable_required.step);
     b.step("test-effects-durable", "test durable strict effects (requires -Deffects-strict=true -Dsqlite-effects=true)").dependOn(&durable_required.step);
 
-    // Package examples/tests must work with every selectable linked profile.
-    // Applications default to the stricter worker tier in addCodeDB.
-    const codedb_bundle = try CodeDB.add(b, codedb_tools, .{ .tier = .trusted, .sources = &.{
-        .{ .name = "accumulate", .source = b.path("examples/codedb/accumulate.rb") },
-        .{ .name = "dispatch", .source = b.path("examples/codedb/dispatch.rb") },
-        .{ .name = "invoice", .source = b.path("examples/codedb/invoice.rb"), .source_name = "billing/invoice.rb", .dependencies = &.{"billing"}, .entrypoint = false },
-        .{ .name = "billing", .source = b.path("examples/codedb/billing.rb"), .dependencies = &.{"discounts"} },
-        .{ .name = "discounts", .source = b.path("examples/codedb/discounts.rb"), .entrypoint = false },
-    } });
-    const codedb_demo_mod = b.createModule(.{
-        .root_source_file = b.path("examples/codedb_demo.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = sanitize_thread,
-        .sanitize_c = sanitize_c,
-    });
-    codedb_demo_mod.addImport("mruby", mruby_mod);
-    codedb_demo_mod.addImport("codedb_manifest", codedb_bundle.manifest);
-    const codedb_demo = b.addExecutable(.{ .name = "codedb-demo", .root_module = codedb_demo_mod });
-    check_step.dependOn(&codedb_demo.step);
-    b.installArtifact(codedb_demo);
-    const run_codedb_demo = b.addRunArtifact(codedb_demo);
     const codedb_step = b.step("run-codedb-demo", "run the CodeDB build-time compilation demo");
-    codedb_step.dependOn(&run_codedb_demo.step);
     const codedb_test_step = b.step("test-codedb", "test CodeDB generation, metadata, and policy admission");
-    if (!no_compiler) {
+    // Bundle generation is a build-time step and stays available; loading a
+    // bundle is not, because admission and execution happen in an isolate. The
+    // envelope, graph and authority tests below cover generation on their own.
+    if (debug_hook) {
+        // Package examples/tests must work with every selectable linked profile.
+        // Applications default to the stricter worker tier in addCodeDB.
+        const codedb_bundle = try CodeDB.add(b, codedb_tools, .{ .tier = .trusted, .sources = &.{
+            .{ .name = "accumulate", .source = b.path("examples/codedb/accumulate.rb") },
+            .{ .name = "dispatch", .source = b.path("examples/codedb/dispatch.rb") },
+            .{ .name = "invoice", .source = b.path("examples/codedb/invoice.rb"), .source_name = "billing/invoice.rb", .dependencies = &.{"billing"}, .entrypoint = false },
+            .{ .name = "billing", .source = b.path("examples/codedb/billing.rb"), .dependencies = &.{"discounts"} },
+            .{ .name = "discounts", .source = b.path("examples/codedb/discounts.rb"), .entrypoint = false },
+        } });
+        const codedb_demo_mod = b.createModule(.{
+            .root_source_file = b.path("examples/codedb_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        codedb_demo_mod.addImport("mruby", mruby_mod);
+        codedb_demo_mod.addImport("codedb_manifest", codedb_bundle.manifest);
+        const codedb_demo = b.addExecutable(.{ .name = "codedb-demo", .root_module = codedb_demo_mod });
+        check_step.dependOn(&codedb_demo.step);
+        b.installArtifact(codedb_demo);
+        const run_codedb_demo = b.addRunArtifact(codedb_demo);
+        codedb_step.dependOn(&run_codedb_demo.step);
+        codedb_test_step.dependOn(&run_codedb_demo.step);
+    } else {
+        codedb_step.dependOn(&sandboxUnavailable(b, "run-codedb-demo").step);
+    }
+    if (!no_compiler and debug_hook) {
         var test_sources: std.ArrayList(CodeDB.Source) = .empty;
         for ([_][]const u8{ "answer", "source", "trace", "loop" }) |name| {
             try test_sources.append(arena, .{
@@ -1235,41 +1295,44 @@ pub fn build(b: *std.Build) !void {
         codedb_test_step.dependOn(&run_codedb_tests.step);
     }
 
-    var runtime_sources: std.ArrayList(CodeDB.Source) = .empty;
-    for ([_][]const u8{ "answer", "loop", "random", "reseed", "eval", "init", "job", "depth", "memory", "ensure_loop", "input", "raise" }) |name| {
-        try runtime_sources.append(arena, .{
-            .name = name,
-            .source = b.path(b.fmt("src/tests_runtime_only/{s}.rb", .{name})),
-            .source_name = b.fmt("runtime/{s}.rb", .{name}),
-            .entrypoint = !std.mem.eql(u8, name, "init"),
-            .dependencies = if (std.mem.eql(u8, name, "job")) &.{"init"} else &.{},
-        });
-    }
-    const runtime_bundle = try CodeDB.add(b, codedb_tools, .{ .tier = .trusted, .sources = runtime_sources.items });
-    const runtime_tests_mod = b.createModule(.{
-        .root_source_file = b.path("src/runtime_only_tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = sanitize_thread,
-        .sanitize_c = sanitize_c,
-    });
-    runtime_tests_mod.addImport("mruby", mruby_mod);
-    runtime_tests_mod.addImport("codedb_runtime_manifest", runtime_bundle.manifest);
-    const runtime_config = b.addOptions();
-    runtime_config.addOption(bool, "expected_no_compiler", no_compiler);
-    if (worker_executable) |executable| {
-        runtime_config.addOptionPath("worker_executable", executable.getEmittedBin());
-    } else {
-        runtime_config.addOption([]const u8, "worker_executable", "");
-    }
-    runtime_tests_mod.addOptions("runtime_only_config", runtime_config);
-    const runtime_tests = b.addTest(.{ .root_module = runtime_tests_mod });
-    check_step.dependOn(&runtime_tests.step);
-    const run_runtime_tests = b.addRunArtifact(runtime_tests);
     const runtime_test_step = b.step("test-runtime-only", "test artifact-only execution with the selected compiler profile");
-    runtime_test_step.dependOn(&run_runtime_tests.step);
-    codedb_test_step.dependOn(runtime_test_step);
-    codedb_test_step.dependOn(&run_codedb_demo.step);
+    if (debug_hook) {
+        var runtime_sources: std.ArrayList(CodeDB.Source) = .empty;
+        for ([_][]const u8{ "answer", "loop", "random", "reseed", "eval", "init", "job", "depth", "memory", "ensure_loop", "input", "raise" }) |name| {
+            try runtime_sources.append(arena, .{
+                .name = name,
+                .source = b.path(b.fmt("src/tests_runtime_only/{s}.rb", .{name})),
+                .source_name = b.fmt("runtime/{s}.rb", .{name}),
+                .entrypoint = !std.mem.eql(u8, name, "init"),
+                .dependencies = if (std.mem.eql(u8, name, "job")) &.{"init"} else &.{},
+            });
+        }
+        const runtime_bundle = try CodeDB.add(b, codedb_tools, .{ .tier = .trusted, .sources = runtime_sources.items });
+        const runtime_tests_mod = b.createModule(.{
+            .root_source_file = b.path("src/runtime_only_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .sanitize_c = sanitize_c,
+        });
+        runtime_tests_mod.addImport("mruby", mruby_mod);
+        runtime_tests_mod.addImport("codedb_runtime_manifest", runtime_bundle.manifest);
+        const runtime_config = b.addOptions();
+        runtime_config.addOption(bool, "expected_no_compiler", no_compiler);
+        if (worker_executable) |executable| {
+            runtime_config.addOptionPath("worker_executable", executable.getEmittedBin());
+        } else {
+            runtime_config.addOption([]const u8, "worker_executable", "");
+        }
+        runtime_tests_mod.addOptions("runtime_only_config", runtime_config);
+        const runtime_tests = b.addTest(.{ .root_module = runtime_tests_mod });
+        check_step.dependOn(&runtime_tests.step);
+        const run_runtime_tests = b.addRunArtifact(runtime_tests);
+        runtime_test_step.dependOn(&run_runtime_tests.step);
+        codedb_test_step.dependOn(runtime_test_step);
+    } else {
+        runtime_test_step.dependOn(&sandboxUnavailable(b, "test-runtime-only").step);
+    }
     test_step.dependOn(codedb_test_step);
 
     // A test-only observer gates the same worker execution path while an
@@ -1370,7 +1433,9 @@ pub fn build(b: *std.Build) !void {
     const run_codedb_authority_tests = b.addRunArtifact(codedb_authority_tests);
     codedb_test_step.dependOn(&run_codedb_authority_tests.step);
 
-    if (!no_compiler) {
+    // The benchmarks measure isolate execution against the plain VM, so they
+    // are a sandbox-tier consumer even though half of what they time is not.
+    if (!no_compiler and debug_hook) {
         // Benchmarks.
         const bench_mod = b.createModule(.{
             .root_source_file = b.path("tools/bench.zig"),
@@ -1387,8 +1452,10 @@ pub fn build(b: *std.Build) !void {
         run_bench_cmd.step.dependOn(b.getInstallStep());
         const bench_step = b.step("run-bench", "run the runtime benchmarks");
         bench_step.dependOn(&run_bench_cmd.step);
-    } else {
+    } else if (no_compiler) {
         unsupportedCompilerStep(b, "run-bench", "run source-driven runtime benchmarks");
+    } else {
+        sandboxUnavailableStep(b, "run-bench", "run the runtime benchmarks");
     }
 }
 
@@ -1399,6 +1466,17 @@ fn unsupportedCompilerStep(b: *std.Build, name: []const u8, description: []const
     const step = b.step(name, description);
     const failure = b.addFail(b.fmt("{s} requires the target Ruby compiler; omit -Dno-compiler", .{name}));
     step.dependOn(&failure.step);
+}
+
+/// Failure for a step whose artifacts reach `sandbox.Isolate`, which cannot be
+/// compiled without mruby's per-instruction hook. Use this where the step
+/// already exists; `sandboxUnavailableStep` declares one that does not.
+fn sandboxUnavailable(b: *std.Build, name: []const u8) *std.Build.Step.Fail {
+    return b.addFail(b.fmt("{s} requires the per-instruction hook; omit -Ddebug-hook=false", .{name}));
+}
+
+fn sandboxUnavailableStep(b: *std.Build, name: []const u8, description: []const u8) void {
+    b.step(name, description).dependOn(&sandboxUnavailable(b, name).step);
 }
 
 const ScanInput = struct {
@@ -1514,7 +1592,8 @@ fn buildStrict(
         b.step("run-effects-reservation", "run typed domain effects").dependOn(&unavailable.step);
         b.step("test-effects-reservation", "test typed domain effects").dependOn(&unavailable.step);
     }
-    const inventory_tests = try addInventoryExample(b, mruby_mod, codedb_tools, target, optimize, sanitize_thread, sanitize_c, check_step, sqlite_effects);
+    // Reaching buildStrict already implies the per-instruction hook.
+    const inventory_tests = try addInventoryExample(b, mruby_mod, codedb_tools, target, optimize, sanitize_thread, sanitize_c, check_step, sqlite_effects, true);
     if (sqlite_effects) strict_step.dependOn(inventory_tests);
     try addDurableExample(b, mruby_mod, codedb_tools, target, optimize, sanitize_thread, sanitize_c, check_step, strict_step, sqlite_effects, effects_worker_supported);
 }
@@ -2363,11 +2442,12 @@ fn addInventoryExample(
     sanitize_c: ?std.zig.SanitizeC,
     check_step: *std.Build.Step,
     enabled: bool,
+    debug_hook: bool,
 ) !*std.Build.Step {
     // Deliberately opt-in: the embedding library has no SQLite dependency.
     const inventory_run_step = b.step("run-effects-inventory", "run SQLite inventory effects and measurements (requires -Dsqlite-effects=true)");
     const inventory_test_step = b.step("test-effects-inventory", "verify SQLite inventory effects (requires -Dsqlite-effects=true)");
-    if (enabled) {
+    if (enabled and debug_hook) {
         if (b.lazyDependency("sqlite", .{})) |sqlite| {
             const inventory_contract = @import("examples/inventory/contract.zig");
             var inventory_hosts: [inventory_contract.operations.len]CodeDB.HostBinding = undefined;
@@ -2411,7 +2491,10 @@ fn addInventoryExample(
             inventory_test_step.dependOn(&test_inventory.step);
         }
     } else {
-        const disabled = b.addFail("inventory example requires -Dsqlite-effects=true (SQLite is an optional, hash-pinned dependency)");
+        const disabled = b.addFail(if (!enabled)
+            "inventory example requires -Dsqlite-effects=true (SQLite is an optional, hash-pinned dependency)"
+        else
+            "inventory example requires the per-instruction hook; omit -Ddebug-hook=false");
         inventory_run_step.dependOn(&disabled.step);
         inventory_test_step.dependOn(&disabled.step);
     }
@@ -2430,6 +2513,7 @@ fn artifactConfigModule(
     no_compiler: bool,
     effects_strict: bool,
     effects_integer64: bool,
+    debug_hook: bool,
 ) !*std.Build.Module {
     const pointer_bits = target.ptrBitWidth();
     if (pointer_bits != 32 and pointer_bits != 64) {
@@ -2437,7 +2521,7 @@ fn artifactConfigModule(
     }
 
     var semantic_defines: std.ArrayList([]const u8) = .empty;
-    try semantic_defines.append(arena, "MRB_USE_DEBUG_HOOK");
+    if (debug_hook) try semantic_defines.append(arena, "MRB_USE_DEBUG_HOOK");
     if (no_compiler) try semantic_defines.append(arena, "MRZ_NO_COMPILER");
     if (effects_strict) try semantic_defines.appendSlice(arena, &.{ "MRZ_EFFECTS_STRICT=1", "MRB_NO_STDIO" });
     if (effects_integer64) try semantic_defines.appendSlice(arena, &.{ "MRB_NO_FLOAT", "MRB_INT64", "MRZ_INTEGER_ONLY=1" });

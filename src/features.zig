@@ -20,7 +20,8 @@
 //!
 //! The manifest is generated per build: `-Dgem-set`, `-Dwith-gems`, and
 //! `-Dwithout-gems` change `gems`/`gem_set`/`custom_selection`, and the
-//! compiler profile is exposed as `has_compiler`. The strict native profile
+//! compiler profile is exposed as `has_compiler`, and the per-instruction
+//! hook as `has_debug_hook` (`-Ddebug-hook`). The strict native profile
 //! is exposed as `effects_strict`; its optional integer-only profile is
 //! `effects_integer64`. Compatibility identity includes these profiles,
 //! the presym table, native catalogue, and target traits.
@@ -114,7 +115,13 @@ pub const endian: std.lang.Endian = @import("builtin").target.cpu.arch.endian();
 
 /// The instruction-level debug hook (`MRB_USE_DEBUG_HOOK`) is compiled in.
 /// The sandbox's gas/deadline/termination machinery is built on it.
-pub const has_debug_hook: bool = true;
+///
+/// On by default. `-Ddebug-hook=false` removes the hook's call site from
+/// mruby's `NEXT` macro, so bytecode dispatch stops testing a function
+/// pointer once per instruction. That also removes the sandbox: with the
+/// hook absent `sandbox_supported` is false and the sandbox tier refuses to
+/// compile, so a build cannot end up with unenforced isolates.
+pub const has_debug_hook: bool = config.debug_hook;
 
 /// The mruby compiler (parser + codegen) is linked in, so `Vm.loadString`
 /// and the RITE compilers are available. False with `-Dno-compiler`; the

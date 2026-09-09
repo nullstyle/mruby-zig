@@ -158,6 +158,7 @@ compiled for a compiler-enabled target cannot be substituted.
 
 `features.has_compiler` is false; `features.has_debug_hook` remains true. Gas,
 deadlines, termination, and native deterministic RNG setup remain available.
+
 The runtime-only profile installs the CodeDB demo and, on supported eligible
 platforms, `mruby-worker`. The source-driven REPL, ordinary examples, benchmark,
 and capsule-process source fixture are omitted; invoking their run steps reports
@@ -165,6 +166,54 @@ that a compiler is required. `test` and `check` use the artifact execution
 suite plus compiler-independent tests. `test-runtime-only` runs that same
 artifact suite under either compiler profile.
 
+## Hook-free profile
+
+`-Ddebug-hook=false` compiles mruby without `MRB_USE_DEBUG_HOOK`. The hook adds
+a NULL-guarded call site to mruby's `NEXT` macro, so with it compiled in every
+bytecode dispatch tests a function pointer. Upstream mruby ships it disabled;
+this package enables it by default because the sandbox is built on it.
+
+The sandbox meters gas, caps call depth and delivers terminations from that
+hook and from nowhere else. Removing it therefore removes the sandbox rather
+than weakening it: `features.sandbox_supported` and `features.has_debug_hook`
+become false, and `sandbox.BootstrapIsolate.spawn` — with the strict turn,
+effects worker and one-shot worker layers above it — fails to compile with an
+explanation. A build cannot end up holding an isolate that enforces nothing.
+
+Use it only for an embedding that runs trusted Ruby through `Vm` directly and
+never constructs an isolate.
+
+The hook-free profile installs the REPL and the plain examples; the sandbox
+example, `mruby-worker`, the CodeDB and effects demos, the benchmark and the
+capsule-process fixtures are omitted, and invoking their run or test steps
+reports that the hook is required. `check` and `test` cover what remains,
+including the VM-free effects inspector and schema tests and the build-time
+CodeDB bundle tests. `-Deffects-strict=true` is refused at configure time,
+because every strict artifact runs application code in an isolate.
+
+```sh
+mise x -- zig build -Ddebug-hook=false -Doptimize=ReleaseFast
+mise x -- zig build check -Ddebug-hook=false
+```
+
+```zig
+const dep = b.dependency("mruby", .{
+    .target = target,
+    .optimize = optimize,
+    .@"debug-hook" = false,
+});
+```
+
+The hook participates in compatibility identity, so artifacts built for a
+hooked target are not substitutable into a hook-free one. Branch on it with
+`comptime` rather than assuming either profile:
+
+```zig
+comptime {
+    if (!mruby.features.sandbox_supported)
+        @compileError("this application requires the sandbox tier");
+}
+```
 ## Strict effects profile
 
 `-Deffects-strict=true` selects a core-only minimal runtime without a target

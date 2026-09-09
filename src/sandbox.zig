@@ -2249,6 +2249,20 @@ pub const BootstrapIsolate = struct {
     /// afterwards. Register host methods on `vm` before `seal()` when
     /// freezing the object model.
     pub fn spawn(policy: Policy) !BootstrapIsolate {
+        // The sandbox's gas meter, call-depth cap and termination delivery all
+        // run from the per-instruction hook. Without it an isolate would look
+        // like a sandbox and enforce nothing, so this is a build error rather
+        // than a weaker sandbox. Lazy analysis means an embedder that only
+        // uses `Vm` never reaches it.
+        comptime {
+            if (!features.has_debug_hook) @compileError(
+                "mruby-zig: the sandbox tier requires the per-instruction hook, " ++
+                    "which this build omitted with -Ddebug-hook=false. Gas limits, " ++
+                    "call-depth caps and terminations cannot be enforced without it. " ++
+                    "Build with -Ddebug-hook=true (the default) to use sandbox.Isolate, " ++
+                    "or use mruby.Vm directly if you do not need those limits.",
+            );
+        }
         return .{ .state = try IsolateState.create(policy) };
     }
 
