@@ -10,3 +10,4 @@ zig-pkg/
 
 # macOS
 .DS_Store
+.zig-global-cache/

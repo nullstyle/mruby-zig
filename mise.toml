@@ -7,3 +7,6 @@ zig = "0.17.0"
 description = "Run the Linux GitHub Actions jobs locally with act"
 tools = { act = "0.2.89" }
 run = "act push --workflows .github/workflows/ci.yml"
+
+[env]
+ZIG_GLOBAL_CACHE_DIR = "{{config_root}}/.zig-global-cache"
