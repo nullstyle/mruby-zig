@@ -19,7 +19,7 @@ bytecode, compiles everything with `zig cc`, and hands you a `mruby` module.
 
 ## Status
 
-Pre-release. Pinned to **Zig 0.17.0-dev.1978+c961124d9** via
+Pre-release. Pinned to **Zig 0.17.0** via
 [mise](https://mise.jdx.dev). Trusted and semi-trusted embedding is the
 supported in-process use. A first one-shot worker tier adds a fresh process,
 hard wall/CPU supervision, and optional Linux address-space ceilings; it is

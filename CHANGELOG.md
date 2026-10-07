@@ -70,6 +70,16 @@ Security review follow-up:
   documented in docs/workers.md, this claims pipe-closure and CPU-ceiling
   exits after controller death — not general orphan wall-time containment.
 
+Toolchain:
+
+- Zig is pinned to the 0.17.0 release (was `0.17.0-dev.1978+c961124d9`).
+  No build-logic changes were required; the one source change is that
+  `mruby.features.endian` now names `std.lang.Endian` instead of the
+  `std.builtin` alias deprecated by the release (same underlying type).
+  The Zig version is not a compatibility input: CodeDB manifests and
+  RITE envelopes are byte-identical under both toolchains, so existing
+  artifacts and capsules remain valid.
+
 ## 0.4.0 (2026-09-04)
 
 Security review:

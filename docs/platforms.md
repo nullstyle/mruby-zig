@@ -33,9 +33,9 @@
   and selected gems. It is independent of the target support flags and does
   not claim that an in-process policy or operating system has removed the
   reported authority.
-- **Zig is pinned** to `0.17.0-dev.1978+c961124d9` via mise (`.mise.toml`).
-  A tagged mruby-zig release can stop building under a moving Zig snapshot,
-  so upgrades are deliberate: bump the pin together with any required
+- **Zig is pinned** to the `0.17.0` release via mise (`.mise.toml`).
+  A tagged mruby-zig release can stop building under a different Zig
+  version, so upgrades are deliberate: bump the pin together with any required
   build/API compatibility fixes, in their own change.
 - **libc is linked**; the default process allocator is the thread-safe
   `std.heap.c_allocator` (see [getting-started.md](getting-started.md)).

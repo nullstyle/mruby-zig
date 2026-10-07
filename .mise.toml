@@ -1,7 +1,7 @@
 # Toolchain used by CI and release validation. Upgrade deliberately together
 # with build/API compatibility fixes rather than following a moving snapshot.
 [tools]
-zig = "0.17.0-dev.1978+c961124d9"
+zig = "0.17.0"
 
 [tasks.ci]
 description = "Run the Linux GitHub Actions jobs locally with act"

@@ -8,9 +8,9 @@ dependencies.**
 
 ## Requirements
 
-Pre-release, pinned to **Zig 0.17.0-dev.1978+c961124d9** via
+Pre-release, pinned to **Zig 0.17.0** via
 [mise](https://mise.jdx.dev) (`.mise.toml`). `mise install` installs the
-pinned snapshot; `mise x -- zig build test` runs through it. Supported
+pinned release; `mise x -- zig build test` runs through it. Supported
 platforms are listed in [platforms.md](platforms.md).
 
 ## Quickstart

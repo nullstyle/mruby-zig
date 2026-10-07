@@ -108,7 +108,7 @@ pub const rite_vm_version: []const u8 = artifact_config.rite_vm_version;
 pub const pointer_bits: u16 = config.pointer_bits;
 
 /// Target byte order, from the compiling target.
-pub const endian: std.builtin.Endian = @import("builtin").target.cpu.arch.endian();
+pub const endian: std.lang.Endian = @import("builtin").target.cpu.arch.endian();
 
 /// The instruction-level debug hook (`MRB_USE_DEBUG_HOOK`) is compiled in.
 /// The sandbox's gas/deadline/termination machinery is built on it.
