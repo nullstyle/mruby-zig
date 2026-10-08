@@ -1454,22 +1454,24 @@ test "sandbox: wall-clock deadline" {
 test "sandbox: deadline is arbitrated after final native work" {
     var boot = try sandbox.BootstrapIsolate.spawn(.{ .limits = .{
         .gas = .{ .per_execution = 10_000 },
-        .wall_time_ns = 1 * std.time.ns_per_ms,
+        .wall_time_ns = 50 * std.time.ns_per_ms,
     } });
     defer boot.deinit();
     const cls = try boot.vm().defineClass("DeadlineNative", null);
     try cls.defineMethod("wait", struct {
         fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
             _ = self;
-            sandbox.sleepNs(5 * std.time.ns_per_ms);
+            sandbox.sleepNs(200 * std.time.ns_per_ms);
             return m.intValue(1);
         }
     }.call);
+    // Build the receiver in the trusted bootstrap window: seal() starts the
+    // lifetime deadline clock, and parsing after it races the budget on
+    // loaded runners (the failure mode this guard exists to exercise is the
+    // deadline expiring inside the native sleep, not inside test setup).
+    const receiver = try boot.vm().loadString("DeadlineNative.new");
     const iso = try boot.seal();
     defer iso.deinit();
-    // Trusted bootstrap outside an execution generation gives call() a
-    // receiver without starting the isolate lifetime deadline first.
-    const receiver = try sandbox.internalVm(iso).loadString("DeadlineNative.new");
 
     try std.testing.expectError(error.DeadlineExceeded, iso.call(receiver, "wait", .{}));
 }
