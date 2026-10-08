@@ -52,6 +52,9 @@ const no_c_fuzz_coverage = "-fno-sanitize-coverage=trace-pc-guard,trace-cmp,trac
 const rite_compatibility_epoch: u32 = 3;
 const hash_integer_patch_marker = "mruby-hash-rinteger-value-hash=v1";
 const hash_symbol_patch_marker = "mruby-hash-symbol-name-hash=v1";
+/// throw.h patch: clang-on-MinGW uses the typed setjmp path instead of
+/// GCC's untyped __builtin_setjmp (see tools/patch_mruby_throw.zig).
+const throw_patch_marker = "mruby-throw-clang-setjmp=v1";
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
@@ -146,6 +149,15 @@ pub fn build(b: *std.Build) !void {
     const file_join = hostTool(b, "tools/file_join.zig");
     const hash_patcher = hostTool(b, "tools/patch_mruby_hash.zig");
     const patched_hash = patchMrubyHash(b, arena, hash_patcher, root);
+    const throw_patcher = hostTool(b, "tools/patch_mruby_throw.zig");
+    // The patched throw.h rides an include directory placed before the
+    // dependency's own include root, the same override mechanism the
+    // presym directory uses for mruby/presym/id.h.
+    const patched_throw_dir = blk: {
+        const run = b.addRunArtifact(throw_patcher);
+        run.addFileArg(root.join(arena, "include/mruby/throw.h") catch @panic("OOM"));
+        break :blk run.addOutputDirectoryArg("throw-include");
+    };
 
     // ============================= stage 1 =================================
     // Presym headers for the host mrbc build: scan core (with allocf.c),
@@ -158,7 +170,7 @@ pub fn build(b: *std.Build) !void {
     try addTreeFiles(arena, &mrbc_scan, root, &sources.compiler_srcs, "compiler");
     try addTreeFiles(arena, &mrbc_scan, root, &sources.mrbc_srcs, "mrbc");
 
-    const mrbc_presym_dir = try presymHeaders(b, presym_gen, arena, mrbc_scan.items, &.{}, root, host_triple);
+    const mrbc_presym_dir = try presymHeaders(b, presym_gen, arena, mrbc_scan.items, &.{}, root, host_triple, patched_throw_dir);
 
     // ============================= stage 2 =================================
     const mrbc_mod = b.createModule(.{
@@ -280,7 +292,7 @@ pub fn build(b: *std.Build) !void {
         try d.appendSlice(arena, ro_data_flags);
         break :defines d.items;
     };
-    const lib_presym_dir = try presymHeaders(b, presym_gen, arena, lib_scan.items, lib_scan_defines, root, triple);
+    const lib_presym_dir = try presymHeaders(b, presym_gen, arena, lib_scan.items, lib_scan_defines, root, triple, patched_throw_dir);
 
     // ============================= stage 5 =================================
     // The `mruby` module carries the entire C library (core + compiler +
@@ -429,6 +441,7 @@ pub fn build(b: *std.Build) !void {
             mruby_mod.linkSystemLibrary("pthread", .{ .use_pkg_config = .no });
         }
     }
+    mruby_mod.addIncludePath(patched_throw_dir);
     mruby_mod.addIncludePath(try root.join(arena, "include"));
     mruby_mod.addIncludePath(lib_presym_dir);
     for (gem_include_dirs.items) |dir| mruby_mod.addIncludePath(dir);
@@ -599,6 +612,7 @@ pub fn build(b: *std.Build) !void {
             .file = b.path("src/test_seams.c"),
             .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
         });
+        test_mod.addIncludePath(patched_throw_dir);
         test_mod.addIncludePath(try root.join(arena, "include"));
         test_mod.addIncludePath(lib_presym_dir);
         const test_config = b.addOptions();
@@ -1215,6 +1229,7 @@ fn artifactConfigModule(
         "gem-init-template=v1",
         hash_integer_patch_marker,
         hash_symbol_patch_marker,
+        throw_patch_marker,
     };
 
     const run = b.addRunArtifact(artifact_config_gen);
@@ -1385,6 +1400,7 @@ fn presymHeaders(
     defines: []const []const u8,
     root: std.Build.LazyPath,
     triple: []const u8,
+    patched_throw_dir: std.Build.LazyPath,
 ) !std.Build.LazyPath {
     const include = try root.join(arena, "include");
     const run = b.addRunArtifact(presym_gen);
@@ -1392,6 +1408,7 @@ fn presymHeaders(
         const cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-E", "-P", "-DMRB_PRESYM_SCANNING" });
         cmd.addArg("-target");
         cmd.addArg(triple);
+        cmd.addPrefixedDirectoryArg("-I", patched_throw_dir);
         cmd.addPrefixedDirectoryArg("-I", include);
         for (in.includes) |dir| {
             cmd.addPrefixedDirectoryArg("-I", try root.join(arena, dir));

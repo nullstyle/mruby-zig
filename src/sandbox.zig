@@ -271,10 +271,13 @@ const uncovered_wait_limit = 4096;
 /// clock_gettime(CLOCK_MONOTONIC); QueryPerformanceCounter on Windows).
 pub fn monotonicNs() i128 {
     if (@import("builtin").os.tag == .windows) {
+        // 0.17 moved the QPC bindings to ntdll (RtlQueryPerformanceCounter
+        // returns BOOL; the historical kernel32 wrapper is gone from std).
+        const ntdll = std.os.windows.ntdll;
         var counter: std.os.windows.LARGE_INTEGER = undefined;
-        if (std.os.windows.QueryPerformanceCounter(&counter) != 0) {
+        if (ntdll.RtlQueryPerformanceCounter(&counter).toBool()) {
             var freq: std.os.windows.LARGE_INTEGER = undefined;
-            if (std.os.windows.QueryPerformanceFrequency(&freq) != 0 and freq != 0) {
+            if (ntdll.RtlQueryPerformanceFrequency(&freq).toBool() and freq != 0) {
                 return @divFloor(
                     @as(i128, counter) * std.time.ns_per_s,
                     @as(i128, freq),
@@ -292,7 +295,14 @@ pub fn monotonicNs() i128 {
 /// supervisors around `Isolate.terminate`.
 pub fn sleepNs(ns: u64) void {
     if (@import("builtin").os.tag == .windows) {
-        std.os.windows.Sleep(@intCast(@divTrunc(ns, std.time.ns_per_ms)));
+        // 0.17 dropped the kernel32 Sleep wrapper from std; NtDelayExecution
+        // is the same primitive kernel32's SleepEx forwards to. The
+        // interval is negative 100ns units (a relative wait).
+        const units: std.os.windows.LARGE_INTEGER = -@as(
+            std.os.windows.LARGE_INTEGER,
+            @intCast(@divTrunc(ns, 100)),
+        );
+        _ = std.os.windows.ntdll.NtDelayExecution(.FALSE, &units);
         return;
     }
     var empty: std.c.timespec = undefined;
