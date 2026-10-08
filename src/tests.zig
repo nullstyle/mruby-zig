@@ -301,6 +301,9 @@ test "error diagnostics preserve the pending exception until the next operation"
 test "syntax errors are ruby exceptions" {
     const vm = try mruby.Vm.init();
     defer vm.deinit();
+    // Note: this test's exception message ("line 1:9: syntax error ...")
+    // prints to stderr in every full-suite run. It is expected noise, not
+    // a failure of whichever test's output it happens to sit beside.
     try std.testing.expectError(error.RubyException, vm.loadString("def oops("));
 }
 
@@ -551,6 +554,104 @@ test "keyword arguments reach zig methods" {
         const class_name = try exc.className(std.testing.allocator);
         defer std.testing.allocator.free(class_name);
         try std.testing.expectEqualStrings("RuntimeError", class_name);
+    }
+}
+
+test "singleton methods defined on single objects" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    _ = try vm.defineClass("SingletonHost", null);
+    const receiver = try vm.loadString("SingletonHost.new");
+
+    try receiver.defineMethod("bump", struct {
+        fn call(m: *mruby.Vm, self: mruby.Value, by: i64) anyerror!mruby.Value {
+            // `self` is the singleton receiver, not the class: bump a
+            // per-object ivar through the safe layer to prove it.
+            const current = try m.getIvar(self, "@count");
+            const n = if (current.isNil()) 0 else try current.asInt();
+            const next = n + by;
+            try m.setIvar(self, "@count", try m.intValue(next));
+            return m.intValue(next);
+        }
+    }.call);
+    try receiver.defineMethod("describe", struct {
+        fn call(m: *mruby.Vm, self: mruby.Value, kw: mruby.KwArgs(struct {
+            prefix: []const u8,
+        })) anyerror!mruby.Value {
+            const current = try m.getIvar(self, "@count");
+            const n = if (current.isNil()) 0 else try current.asInt();
+            var buf: [64]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{s}{d}", .{ kw.values.prefix, n }) catch
+                return m.raise("RuntimeError", "describe buffer overflow");
+            return m.stringValue(text);
+        }
+    }.call);
+
+    // The methods live on this instance only, with `self` bound to it and
+    // per-object ivar state persisting across calls.
+    try std.testing.expectEqual(@as(i64, 7), try (try vm.call(receiver, "bump", .{7})).asInt());
+    try std.testing.expectEqual(@as(i64, 9), try (try vm.call(receiver, "bump", .{2})).asInt());
+    // Keyword arguments reach singleton methods too (invoked from Ruby:
+    // Zig-side keyword calls are the deferred roadmap item; setGlobal
+    // takes the name without the '$').
+    try vm.setGlobal("singleton_receiver", receiver);
+    const described = vm.loadString("$singleton_receiver.describe(prefix: 'count=')") catch |err| {
+        const exc = vm.lastError() orelse return err;
+        const cn = try exc.className(std.testing.allocator);
+        defer std.testing.allocator.free(cn);
+        const msg = try exc.message(std.testing.allocator);
+        defer std.testing.allocator.free(msg);
+        std.debug.print("describe call failed: {s}: {s}\n", .{ cn, msg });
+        return err;
+    };
+    try std.testing.expectEqualStrings("count=9", try described.asString());
+
+    // Other instances of the same class do not respond.
+    try std.testing.expectError(error.RubyException, vm.loadString("SingletonHost.new.bump(1)"));
+    try std.testing.expectError(error.RubyException, vm.loadString("SingletonHost.new.describe(prefix: 'x')"));
+
+    // Immediates cannot carry singleton methods (mruby TypeError).
+    try std.testing.expectError(error.RubyException, (try vm.intValue(1)).defineMethod("nope", struct {
+        fn call(m: *mruby.Vm, self: mruby.Value) anyerror!mruby.Value {
+            _ = m;
+            return self;
+        }
+    }.call));
+    {
+        const exc = vm.lastError().?;
+        const class_name = try exc.className(std.testing.allocator);
+        defer std.testing.allocator.free(class_name);
+        try std.testing.expectEqualStrings("TypeError", class_name);
+    }
+}
+
+test "stored procs are callable from zig" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    // Lambdas check arity; procs do not (Ruby semantics).
+    const lambda = try vm.loadString("lambda { |a, b| a * b + 1 }");
+    const result = try vm.call(lambda, "call", .{ try vm.intValue(6), try vm.intValue(7) });
+    try std.testing.expectEqual(@as(i64, 43), try result.asInt());
+    try std.testing.expectError(error.RubyException, vm.call(lambda, "call", .{try vm.intValue(1)}));
+
+    // A lambda created from a block keeps its captured self (`lambda` is
+    // available in every gem profile; `proc` needs mruby-proc-ext).
+    const handler = try vm.loadString(
+        \\Class.new do
+        \\  def make; lambda { secret * 2 }; end
+        \\  def secret; 21; end
+        \\end.new.make
+    );
+    const called = try vm.call(handler, "call", .{});
+    try std.testing.expectEqual(@as(i64, 42), try called.asInt());
+
+    // Non-lambda procs tolerate extra arguments (mruby-proc-ext only).
+    if (test_config.has_core_language_suite) {
+        const sloppy = try vm.loadString("proc { |a| a }");
+        const r = try vm.call(sloppy, "call", .{ try vm.intValue(9), try vm.intValue(1) });
+        try std.testing.expectEqual(@as(i64, 9), try r.asInt());
     }
 }
 
@@ -1448,12 +1549,6 @@ test "concurrent VMs on separate threads" {
     }
     for (threads) |t| t.join();
     for (results) |result| if (result) |err| return err;
-}
-
-test "init failure diagnostics are queryable" {
-    // Simulated by checking the API shape; a real InitFailure needs a
-    // misconfigured gem set, which the build now rejects at configure time.
-    _ = mruby.Vm.lastInitFailure();
 }
 
 // ---- sandboxing ---------------------------------------------------------------

@@ -36,22 +36,6 @@
 int mrz_gc_arena_save(mrb_state *mrb) { return mrb_gc_arena_save(mrb); }
 void mrz_gc_arena_restore(mrb_state *mrb, int idx) { mrb_gc_arena_restore(mrb, idx); }
 
-/* Test seam for the post-protection OOM path in StateCapsule materialization.
- * Fill every arena slot with an existing live object without allocating; the
- * returned index lets the test restore the caller's arena afterward. */
-int mrz_artifact_test_fill_arena(mrb_state *mrb) {
-  int previous = mrb->gc.arena_idx;
-#ifdef MRB_GC_FIXED_ARENA
-  int capacity = MRB_GC_ARENA_SIZE;
-#else
-  int capacity = mrb->gc.arena_capa;
-#endif
-  while (mrb->gc.arena_idx < capacity) {
-    mrb->gc.arena[mrb->gc.arena_idx++] = (struct RBasic*)mrb->object_class;
-  }
-  return previous;
-}
-
 /* ---- exceptions (mrb->exc field access) ---- */
 
 mrb_value mrz_exc_value(mrb_state *mrb) {
@@ -780,7 +764,9 @@ mrz_protected_define_const(mrb_state *mrb, struct RClass *klass,
 enum mrz_method_kind {
   MRZ_METHOD_INSTANCE = 0,
   MRZ_METHOD_CLASS = 1,
-  MRZ_METHOD_MODULE_FUNCTION = 2
+  MRZ_METHOD_MODULE_FUNCTION = 2,
+  /* klass is unused; recv carries the singleton-method receiver. */
+  MRZ_METHOD_SINGLETON = 3
 };
 
 struct mrz_define_method_context {
@@ -790,6 +776,7 @@ struct mrz_define_method_context {
   mrb_func_t function;
   mrb_aspec aspec;
   uint8_t kind;
+  mrb_value recv;
 };
 
 static mrb_value
@@ -811,6 +798,19 @@ mrz_define_method_body(mrb_state *mrb, void *data)
       mrb_define_module_function_id(mrb, context->klass, name,
                                     context->function, context->aspec);
       break;
+    case MRZ_METHOD_SINGLETON:
+      /* Mirrors mruby's TypeError for `def obj.meth` on immediates. */
+      if (mrb_immediate_p(context->recv)) {
+        mrb_raise(mrb, E_TYPE_ERROR,
+                  "can't define singleton method for an immediate value");
+      }
+      mrb_define_singleton_method_id(mrb, mrb_obj_ptr(context->recv), name,
+                                     context->function, context->aspec);
+      /* Defining the method allocates the receiver's singleton class,
+       * arena-rooted only inside this protection frame; mrb_protect_error
+       * pops those slots and re-roots only the result. Return the
+       * receiver: rooted here, it keeps the singleton class reachable. */
+      return context->recv;
     default:
       return mrb_nil_value();
   }
@@ -824,7 +824,18 @@ mrz_protected_define_method(mrb_state *mrb, struct RClass *klass,
                             uint8_t kind)
 {
   struct mrz_define_method_context context = {
-    klass, name, name_length, function, aspec, kind
+    klass, name, name_length, function, aspec, kind, mrb_nil_value()
+  };
+  return mrz_protect_result(mrb, mrz_define_method_body, &context, NULL);
+}
+
+mrb_bool
+mrz_protected_define_singleton_method(mrb_state *mrb, mrb_value recv,
+                                      const char *name, size_t name_length,
+                                      mrb_func_t function, mrb_aspec aspec)
+{
+  struct mrz_define_method_context context = {
+    NULL, name, name_length, function, aspec, MRZ_METHOD_SINGLETON, recv
   };
   return mrz_protect_result(mrb, mrz_define_method_body, &context, NULL);
 }

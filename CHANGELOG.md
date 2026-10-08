@@ -4,6 +4,25 @@
 
 Safe API:
 
+- **Breaking:** `Vm.lastInitFailure` (process-global, thread-unsafe) is
+  replaced by `Vm.initWithFailure(?*InitFailure)`: pass a caller-owned
+  `Vm.InitFailure` and read `message()` after `error.InitFailed`.
+  Migration: replace `Vm.lastInitFailure()` with a struct passed to
+  `initWithFailure`; `Vm.init()` is unchanged.
+- Methods can be defined on a single object — Ruby's `def obj.meth` —
+  via `Value.defineMethod`, with the same derived-signature rules as
+  `Class.defineMethod` (keyword arguments included). The callback's
+  `self` is the object; immediates raise TypeError, mirroring mruby. The
+  protection trampoline returns the receiver so `mrb_protect_error`'s
+  arena restore keeps the freshly allocated singleton class reachable.
+- Stored procs are callable from Zig through the existing
+  `vm.call(proc, "call", ...)` path with full lambda/proc semantics
+  (arity-checked lambdas, captured-`self` procs); now documented and
+  covered by tests.
+- The `mrz_artifact_test_fill_arena` test seam moved from the shipped
+  `src/shim.c` into `src/test_seams.c`, compiled only into this
+  repository's test binary; consumers of the `mruby` module no longer
+  link it.
 - Zig methods can now take Ruby keyword arguments: a `KwArgs(T)` callback
   parameter carries a plain struct whose fields are the keywords.
   Non-optional fields are required keywords (mruby raises `ArgumentError`

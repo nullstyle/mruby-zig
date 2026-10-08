@@ -18,17 +18,18 @@ profile as its strongest adoption pitch.
 - [x] Keyword arguments, Ruby → Zig (`KwArgs(T)`, shipped 2026-10-08).
 - [ ] Keyword arguments, Zig → Ruby (`CallOptions.kwargs`). See the
       analysis below; needs its own reviewed change.
-- [ ] Per-object singleton methods (`Value.defineMethod`; class-level
-      exists via `defineClassMethod`).
-- [ ] Calling/yielding a Proc value (`mrb_yield` path is bound raw in
-      `mruby.c`; surface it safely).
+- [x] Per-object singleton methods (`Value.defineMethod`, 2026-10-08).
+- [x] Calling a stored Proc from Zig — `vm.call(proc, "call", ...)`
+      covers it with full lambda/proc semantics; documented and tested
+      (2026-10-08). A dedicated `mrb_yield`-based entry point remains
+      unnecessary unless a need for yield-with-explicit-self appears.
 - [ ] Symbol-cached dispatch (`Vm.callSymbol`) — interning is protected
       but repeated per call today.
 - [ ] Named public error sets on `Vm` methods (inferred `!` today).
-- [ ] Replace the process-global `lastInitFailure` with owned
-      diagnostics (also fix its vacuous test).
-- [ ] Remove the test seam `mrz_artifact_test_fill_arena` from shipped
-      shim builds or gate it behind a test-only build flag.
+- [x] Replace the process-global `lastInitFailure` with owned
+      diagnostics (`Vm.initWithFailure`, 2026-10-08).
+- [x] Move the test seam `mrz_artifact_test_fill_arena` out of the
+      shipped shim into a test-only C source (2026-10-08).
 
 ### A2. mruby 4.1 / Prism migration
 

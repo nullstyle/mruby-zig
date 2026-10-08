@@ -120,6 +120,21 @@ _ = try vm.loadString("ZigMath.new.connect(host: 'db', port: 9443, timeout: 30)"
 keywords from Zig (`CallOptions`) is not modeled yet — see the roadmap
 note in `docs/plans/adoption-and-assurance.md`.
 
+Methods can also be defined on a single object — Ruby's `def obj.meth` —
+with the same derived-signature rules (keyword arguments included). The
+callback's `self` is that object; immediates (nil/true/false/integers/
+symbols) raise TypeError, mirroring mruby:
+
+```zig
+const receiver = try vm.loadString("Greeter.new");
+try receiver.defineMethod("bump", struct {
+    fn call(vm: *mruby.Vm, self: mruby.Value, by: i64) anyerror!mruby.Value {
+        _ = self;
+        return vm.intValue(by);
+    }
+}.call);
+```
+
 `defineMethodRaw` (plus `defineClassMethodRaw` / `defineModuleFunctionRaw`)
 takes an explicit `mrb_get_args` format string for protocols the derived
 form does not model — for example the `S` (String value) spec, or optional
@@ -168,6 +183,15 @@ _ = try vm.callWithOptions(items, "each", .{}, .{ .block = double });
 The positional argument tuple has no fixed eight-argument cap.
 `callWithOptions` additionally accepts an optional Ruby block and enforces the
 same VM ownership rule for that block.
+
+Stored procs are ordinary `Value`s — call them with `call` on `"call"`,
+which preserves Ruby's lambda/proc semantics (lambdas check arity; procs
+keep their captured `self` and tolerate extra arguments):
+
+```zig
+const lambda = try vm.loadString("lambda { |a, b| a * b + 1 }");
+const r = try vm.call(lambda, "call", .{ try vm.intValue(6), try vm.intValue(7) });  // => 43
+```
 
 ## Typed collections and conversions
 

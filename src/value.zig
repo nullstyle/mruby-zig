@@ -109,6 +109,13 @@ pub const Value = struct {
         if (!c.mrz_hash_p(self.v)) return error.TypeMismatch;
         return .{ .inner = self };
     }
+
+    /// Define a method on this single object — Ruby's `def obj.meth`
+    /// (see `class.zig defineSingletonMethod` for the rules). The
+    /// callback's `self` is the object; immediates raise TypeError.
+    pub fn defineMethod(self: Value, name: []const u8, comptime func: anytype) !void {
+        return @import("class.zig").defineSingletonMethod(self, name, func);
+    }
 };
 
 /// A typed view over a Ruby Array. It has the same arena lifetime as its

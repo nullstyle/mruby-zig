@@ -374,6 +374,16 @@ pub extern fn mrz_protected_define_const(
     name_length: usize,
     value: mrb_value,
 ) bool;
+/// Define a singleton method on one object (Ruby `def obj.meth`). The
+/// trampoline raises TypeError for immediate values, mirroring mruby.
+pub extern fn mrz_protected_define_singleton_method(
+    mrb: *mrb_state,
+    recv: mrb_value,
+    name: [*]const u8,
+    name_length: usize,
+    func: mrb_func_t,
+    aspec: mrb_aspec,
+) bool;
 pub const MRZ_METHOD_INSTANCE: u8 = 0;
 pub const MRZ_METHOD_CLASS: u8 = 1;
 pub const MRZ_METHOD_MODULE_FUNCTION: u8 = 2;

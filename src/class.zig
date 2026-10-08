@@ -322,6 +322,24 @@ pub const Class = struct {
     }
 };
 
+/// Define a method on one object — a Ruby `def obj.meth` singleton method
+/// visible only on that instance (`Value.defineMethod`). The callback's
+/// `self` is the object. Immediates (nil/true/false/integers/symbols)
+/// raise TypeError, mirroring mruby; the same derived-signature rules as
+/// `Class.defineMethod` apply, keyword arguments included.
+pub fn defineSingletonMethod(recv: Value, name: []const u8, comptime func: anytype) !void {
+    const sig = comptime deriveSignature(func);
+    const wrap = WrapDerived(func);
+    if (!c.mrz_protected_define_singleton_method(
+        recv.mrb,
+        recv.v,
+        name.ptr,
+        name.len,
+        wrap.cCall,
+        aspec(sig.fmt, sig.kw),
+    )) return error.RubyException;
+}
+
 fn classFromRaw(mrb: *c.mrb_state, value: c.mrb_value) !Class {
     if (!c.mrz_class_p(value) and !c.mrz_module_p(value))
         return error.UnknownClass;

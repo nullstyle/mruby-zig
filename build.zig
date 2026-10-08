@@ -577,6 +577,13 @@ pub fn build(b: *std.Build) !void {
         });
         test_mod.addImport("mruby", mruby_mod);
         test_mod.addImport("authority_manifest", authority_manifest_mod);
+        // Test-only C seams; consumers of the mruby module never link these.
+        test_mod.addCSourceFile(.{
+            .file = b.path("src/test_seams.c"),
+            .flags = &.{ "-Wall", "-Wextra", no_c_fuzz_coverage },
+        });
+        test_mod.addIncludePath(try root.join(arena, "include"));
+        test_mod.addIncludePath(lib_presym_dir);
         const test_config = b.addOptions();
         test_config.addOption(bool, "has_core_language_suite", hasAllGemsExcept(selected_gems, &gems_mod.standard, &.{
             "mruby-enumerator",

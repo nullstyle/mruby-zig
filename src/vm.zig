@@ -67,19 +67,33 @@ pub const Vm = struct {
         return registry.get(mrb) orelse @panic("mruby-zig: mrb_state has no registered Vm");
     }
 
-    /// Diagnostics for the most recent `error.InitFailed`, best-effort and
-    /// thread-unsafe (only meaningful immediately after a failed `init`).
-    var init_failure_buf: [256]u8 = undefined;
-    var init_failure_len: usize = 0;
+    /// Best-effort Ruby-level diagnostic for a failed `initWithFailure`,
+    /// owned by the caller rather than process-global state: pass a pointer
+    /// to one and read `message()` after `error.InitFailed`.
+    pub const InitFailure = struct {
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+
+        /// The Ruby-level "class: message" behind the failure (empty when
+        /// the failure was not exception-related or did not fit).
+        pub fn message(self: *const InitFailure) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
 
     /// Create a new interpreter. Fails on out-of-memory or if initialization
-    /// raises (e.g. a misconfigured gem set — see `lastInitFailure` for the
-    /// Ruby-level reason; see `mruby.alloc.setAllocator` for the allocator).
+    /// raises (see `mruby.alloc.setAllocator` for the allocator).
     pub fn init() !*Vm {
+        return Vm.initWithFailure(null);
+    }
+
+    /// Like `init`, with a caller-owned diagnostic filled when
+    /// initialization raises (`error.InitFailed`).
+    pub fn initWithFailure(failure: ?*InitFailure) !*Vm {
         const mrb = c.mrb_open() orelse return error.OutOfMemory;
         errdefer c.mrb_close(mrb);
         if (!c.mrz_nil_p(c.mrz_exc_value(mrb))) {
-            captureInitFailure(mrb);
+            if (failure) |f| captureInitFailure(mrb, f);
             return error.InitFailed;
         }
         const vm = try alloc_mod.gpa.create(Vm);
@@ -94,28 +108,22 @@ pub const Vm = struct {
         return vm;
     }
 
-    /// The Ruby-level "class: message" behind the last `error.InitFailed`
-    /// (empty if the failure was not exception-related).
-    pub fn lastInitFailure() []const u8 {
-        return init_failure_buf[0..init_failure_len];
-    }
-
-    fn captureInitFailure(mrb: *c.mrb_state) void {
+    fn captureInitFailure(mrb: *c.mrb_state, failure: *InitFailure) void {
         const exc = RubyError.fromValue(mrb, c.mrz_exc_value(mrb));
         const cls = exc.className(alloc_mod.gpa) catch {
-            init_failure_len = 0;
+            failure.len = 0;
             return;
         };
         defer alloc_mod.gpa.free(cls);
         const msg = exc.message(alloc_mod.gpa) catch {
-            init_failure_len = 0;
+            failure.len = 0;
             return;
         };
         defer alloc_mod.gpa.free(msg);
-        if (std.fmt.bufPrint(&init_failure_buf, "{s}: {s}", .{ cls, msg })) |written| {
-            init_failure_len = written.len;
+        if (std.fmt.bufPrint(&failure.buf, "{s}: {s}", .{ cls, msg })) |written| {
+            failure.len = written.len;
         } else |_| {
-            init_failure_len = 0;
+            failure.len = 0;
         }
     }
 
