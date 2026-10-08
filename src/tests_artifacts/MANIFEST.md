@@ -10,6 +10,7 @@ Zig (`0.17.0-dev.1978+c961124d9`; v0.3.0 itself tracked `master`, so the
 compiling snapshot is the current pin, not the one v0.3.0 was developed
 against). Generation scripts are reproduced in this file's history.
 
+| `rite_image_4_0_0.bin` | typed RITE image | `input ? 1 : 2`, source_name `fixture41.rb`; produced by the 4.0.0 toolchain at main@ea953ff (2026-10-08), shasum 707cb7b6cb19967d90c75077c85b812872b698c8237d040d0b53562647ba8b23 | rejected with `IncompatibleRiteImage`: the 4.1 migration changed the fingerprint (package hash, presym digest, compiler ident HSMK) |
 | File | Kind | Producer script / graph | Expected current-build verdict |
 | --- | --- | --- | --- |
 | `rite_image_v0_3_0.bin` | typed RITE image | `$input ? 1 : 2`, source_name `fixture.rb`, no application fingerprint | rejected with `IncompatibleRiteImage`: the compatibility fingerprint (presym digest, semantic defines, gems) changed after 0.3.0 |

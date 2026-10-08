@@ -13,15 +13,12 @@ assert(-7 / 2 == -4, "floor division")
 assert(3.0 / 2 == 1.5, "float division")
 assert((1 << 62).to_s == "4611686018427387904", "shift beyond inline fixnum")
 
-# Integer literals beyond the int32 pool range are pooled as BIGINT and
-# raise RangeError at load time unless the mruby-bigint gem is enabled
-# (deliberately not part of this gem set); computed values are fine.
+# mruby 4.1 parses full int64 literals natively (the bigint gem is only
+# needed beyond signed 64-bit); 4.0 pooled int32-overflow literals and
+# raised RangeError at load time.
 assert(2147483647 == (2 ** 31) - 1, "max int32 literal")
-begin
-  eval("2147483648")
-  raise "expected literal RangeError"
-rescue RangeError
-end
+assert(2147483648 == (2 ** 31), "int32-boundary literal")
+assert(4611686018427387903 == (2 ** 62) - 1, "large literal value")
 big = 1 << 62
 assert((big - 1).to_s == "4611686018427387903", "heap integer arithmetic")
 begin

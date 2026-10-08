@@ -1793,18 +1793,33 @@ test "sandbox: RITE compilers reject embedded NUL in source" {
     );
 }
 
-test "sandbox: legacy raw RITE retains its null source-name semantics" {
+test "sandbox: unnamed RITE source reports the eval-style name" {
     const image = try mruby.sandbox.compile("__FILE__");
     defer mruby.alloc.gpa.free(image);
     const iso = try spawnSealed(.{});
     defer iso.deinit();
-    try std.testing.expectEqualStrings("(null)", try (try iso.runImage(image)).asString());
+    // mruby 4.1's compat layer names unnamed sources "-e" where 4.0
+    // recorded "(null)"; RITE filenames are semantic content, not format.
+    try std.testing.expectEqualStrings("-e", try (try iso.runImage(image)).asString());
 }
 
 // ---- cross-version artifact fixtures --------------------------------------
 // Byte fixtures produced by the v0.3.0 tag (see
 // src/tests_artifacts/MANIFEST.md). These pin the current build's
 // admission and restoration behavior against real older-producer bytes.
+
+test "cross-version: 4.0.0-produced RITE image is rejected under 4.1" {
+    // Produced by the 4.0.0 toolchain at main@ea953ff (same source text
+    // and source name as the v0.3.0 fixture; see tests_artifacts/MANIFEST).
+    // The fingerprint changed with the 4.1 migration (package hash, presym
+    // digest, HSMK compiler ident), so admission must reject it by
+    // classification, never parse or execute it.
+    const bytes = @embedFile("tests_artifacts/rite_image_4_0_0.bin");
+    const iso = try spawnSealed(.{});
+    defer iso.deinit();
+    try std.testing.expectError(error.IncompatibleRiteImage, iso.runRite(.{ .bytes = bytes }));
+    try std.testing.expect(iso.lastError() == null);
+}
 
 test "cross-version: v0.3.0 RITE image is rejected without execution" {
     const bytes = @embedFile("tests_artifacts/rite_image_v0_3_0.bin");

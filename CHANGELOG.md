@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased (mruby-4.1-rc2-integration branch)
+
+Upstream:
+
+- The dependency moves to mruby 4.1.0-rc2 (Prism parser) with a second
+  pinned dependency on ruby/prism at the submodule commit; Prism's
+  template-generated sources are vendored under vendor/prism with a
+  provenance MANIFEST (deterministic, SHA-256-pinned, regen is a
+  maintenance-only procedure) to keep the build Ruby-free. The host mrbc
+  redesign (self-contained tool, no core objects), the HSMK0000 compiler
+  ident (now a fingerprint input), the `-e` unnamed-source name, and
+  int64 literal support are recorded in MIGRATION.md. This branch holds
+  the migration until 4.1.0 final ships; main stays on 4.0.0 per the
+  stable-only pin policy.
+
 ## Unreleased
 
 Workers (assurance track B1):

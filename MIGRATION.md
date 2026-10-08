@@ -1,4 +1,4 @@
-# mruby 4.1.0-rc2 integration — state and frontier
+# mruby 4.1.0-rc2 integration — COMPLETE (against rc2)
 
 Branch: `mruby-4.1-rc2-integration` (from main @ ea953ff). Main stays on
 4.0.0 until 4.1.0 final ships (stable-only pin policy); when it does, the
@@ -42,7 +42,39 @@ zon pin moves to the final tag and these notes drive the reconciliation.
   compatibility fingerprint still changes via package hash + presym
   digest, so 4.0 artifacts are rejected by construction.
 
-## Frontier (exact, as of the last `zig build check`)
+## Resolved since the first checkpoint
+
+The link frontier dissolved without a shim rewrite: `mruby_compat.c`
+exports the entire 4.0 parse API (`mrb_parse_nstring`,
+`mrb_load_nstring_cxt`, `mrb_ccontext_*`, `mrb_generate_code`, ...) as
+shims over mrc — but ONLY under `MRC_TARGET_MRUBY`, so the fix was
+compiling every mrc translation unit with the prism defines and include
+roots (the define also selects the `mrc_ccontext` layout; it must be
+uniform across TUs, exactly as upstream's rake warns).
+
+Drifts found and fixed during bring-up:
+- RITE compiler ident is now `HSMK0000` (mrc_dump.h redefines
+  RITE_COMPILER_NAME "HSMK"; 4.0 wrote MATZ0000). rite_envelope accepts
+  and writes HSMK0000, and the ident is a fingerprint input
+  (`rite-compiler-ident=HSMK`).
+- Unnamed compiles now record the source name `-e` where 4.0 recorded
+  `(null)`; the suite test renamed accordingly.
+- mruby 4.1 parses full int64 literals natively; the numerics suite's
+  int32-overflow RangeError expectation replaced with value assertions.
+- Prism needs `ext/` on the include path (`prism/extension.h`) and its
+  `src/util/*.c` (the rake's recursive glob).
+
+Verified: `zig build check` and the full test matrix green (default,
+ReleaseSafe, minimal gem set, no-compiler) on macOS, and 380/380 steps
+on native aarch64 Linux (including the B1 seccomp suite against the 4.1
+runtime). The audited hash patch's literal contexts still match 4.1's
+hash.c (the patcher fails loudly on drift, so a green build is the
+proof). A 4.0.0-produced RITE fixture
+(`src/tests_artifacts/rite_image_4_0_0.bin`, produced by main@ea953ff)
+is rejected by classification through the typed API; raw `runImage`
+bytes from 4.0 fail loudly as loader errors rather than misexecuting.
+
+## Original frontier (kept for the record)
 
 1. **shim.c parse-path rewrite** — the remaining link errors are the 4.0
    C parse API consumed by our trampolines: mrb_parser_free,

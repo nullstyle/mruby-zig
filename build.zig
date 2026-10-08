@@ -52,6 +52,10 @@ const no_c_fuzz_coverage = "-fno-sanitize-coverage=trace-pc-guard,trace-cmp,trac
 const rite_compatibility_epoch: u32 = 3;
 const hash_integer_patch_marker = "mruby-hash-rinteger-value-hash=v1";
 const hash_symbol_patch_marker = "mruby-hash-symbol-name-hash=v1";
+/// The compiler identity recorded in RITE headers. mruby 4.1's mrc dumper
+/// writes "HSMK" where 4.0 wrote "MATZ"; participating in the fingerprint
+/// keeps a future ident change from silently accepting old artifacts.
+const rite_compiler_ident_marker = "rite-compiler-ident=HSMK";
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
@@ -335,6 +339,7 @@ pub fn build(b: *std.Build) !void {
         if (no_compiler) try d.append(arena, "-DMRZ_NO_COMPILER");
         try d.appendSlice(arena, portable_container_flags);
         try d.appendSlice(arena, ro_data_flags);
+        if (!no_compiler) try d.appendSlice(arena, &prism_defines);
         break :defines d.items;
     };
     const lib_presym_dir = try presymHeaders(
@@ -471,21 +476,31 @@ pub fn build(b: *std.Build) !void {
     for (sources.core_srcs) |path| {
         if (!std.mem.eql(u8, path, "src/hash.c")) try lib_files.append(arena, path);
     }
-    if (!no_compiler) {
-        try lib_files.appendSlice(arena, &sources.compiler_srcs);
-        try lib_files.append(arena, sources.compiler_compat_src);
-    }
+    // The mrc glue (compiler_srcs + mruby_compat.c) compiles separately
+    // from the plain C sources: it needs the prism include roots and the
+    // MRC_TARGET_MRUBY/PRISM_* defines, which also select the 4.0
+    // compatibility API in mruby_compat.c and the mrc_ccontext layout —
+    // every mrc translation unit must see the same set.
+    var compiler_lib_files: std.ArrayList([]const u8) = .empty;
     for (selected_gems) |g| try lib_files.appendSlice(arena, g.c_srcs);
     mruby_mod.addCSourceFiles(.{ .root = root, .files = lib_files.items, .flags = lib_flags });
     if (!no_compiler) {
-        // Prism: hand-written sources from the pinned dependency plus the
-        // vendored template-generated sources, under the same flags.
+        // Prism + mrc glue: hand-written prism sources from the pinned
+        // dependency, the vendored template-generated sources, and the
+        // compiler gem's own sources all share the prism flags/includes.
         const lib_prism_flags: []const []const u8 = blk: {
             var f: std.ArrayList([]const u8) = .empty;
             try f.appendSlice(arena, lib_flags);
             try f.appendSlice(arena, &prism_defines);
             break :blk f.items;
         };
+        try compiler_lib_files.appendSlice(arena, &sources.compiler_srcs);
+        try compiler_lib_files.append(arena, sources.compiler_compat_src);
+        mruby_mod.addCSourceFiles(.{
+            .root = root,
+            .files = compiler_lib_files.items,
+            .flags = lib_prism_flags,
+        });
         mruby_mod.addCSourceFiles(.{
             .root = prism_root,
             .files = &sources.prism_srcs,
@@ -1308,6 +1323,7 @@ fn artifactConfigModule(
         "gem-init-template=v1",
         hash_integer_patch_marker,
         hash_symbol_patch_marker,
+        rite_compiler_ident_marker,
     };
 
     const run = b.addRunArtifact(artifact_config_gen);

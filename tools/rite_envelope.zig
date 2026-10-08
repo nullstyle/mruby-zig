@@ -307,7 +307,7 @@ fn prepare(
 /// remains responsible for loading every generated image.
 fn validateRiteHeaders(bytes: []const u8) !void {
     try artifact.validateRawRite(bytes);
-    if (bytes.len < 40 or !std.mem.eql(u8, bytes[12..20], "MATZ0000")) return error.InvalidArtifact;
+    if (bytes.len < 40 or !std.mem.eql(u8, bytes[12..20], "HSMK0000")) return error.InvalidArtifact;
     var offset: usize = 20;
     var found_irep = false;
     while (offset < bytes.len) {
@@ -442,7 +442,7 @@ fn testRite() [40]u8 {
     var bytes: [40]u8 = @splat(0);
     @memcpy(bytes[0..8], "RITE0400");
     std.mem.writeInt(u32, bytes[8..12], bytes.len, .big);
-    @memcpy(bytes[12..20], "MATZ0000");
+    @memcpy(bytes[12..20], "HSMK0000");
     @memcpy(bytes[20..24], "IREP");
     std.mem.writeInt(u32, bytes[24..28], 12, .big);
     @memcpy(bytes[28..32], artifact_config.rite_vm_version);
