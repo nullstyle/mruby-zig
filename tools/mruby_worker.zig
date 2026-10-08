@@ -54,51 +54,98 @@ fn run(init: std.process.Init, comptime Observer: type) !u8 {
     var stdout_file = protocol_file.writer(init.io, &stdout_buffer);
     const writer = &stdout_file.interface;
 
-    var request_header_bytes: [protocol.request_header_len]u8 = undefined;
-    reader.readSliceAll(&request_header_bytes) catch {
-        return sendSimple(writer, .worker_error, .none, .invalid_request, null);
-    };
-    const request = protocol.decodeRequest(&request_header_bytes) catch {
-        return sendSimple(writer, .worker_error, .none, .invalid_request, null);
-    };
+    // Session state: process limits (RLIMITs can only tighten, seccomp is
+    // one-way) install once from the first request; a session request is
+    // framed by its exact declared lengths and processed without waiting
+    // for end-of-input, and stdin EOF after at least one completed request
+    // ends the session gracefully.
+    var session_started = false;
+    var limits_installed = false;
+    var address_space_limited: bool = false;
+    var allocation_failures_before: usize = 0;
 
-    if (!validProcessLimits(request.process)) {
-        return sendSimple(writer, .worker_error, .bootstrap, .invalid_request, null);
-    }
-    if (applyProcessLimits(request.process)) |failure| {
-        return sendSimple(writer, .worker_error, .bootstrap, failure, null);
-    }
-    const address_space_limited = effectiveAddressSpaceLimited() orelse {
-        return sendSimple(
-            writer,
-            .worker_error,
-            .bootstrap,
-            .process_limit_setup_failed,
-            null,
-        );
-    };
-    const allocation_failures_before = mruby.alloc.backingAllocationFailures();
+    while (true) {
+        var request_header_bytes: [protocol.request_header_len]u8 = undefined;
+        request_header_bytes[0] = reader.takeByte() catch |err| switch (err) {
+            error.EndOfStream => return if (session_started) 0 else sendSimple(
+                writer,
+                .worker_error,
+                .none,
+                .invalid_request,
+                null,
+            ),
+            error.ReadFailed => return sendSimple(writer, .worker_error, .none, .invalid_request, null),
+        };
+        reader.readSliceAll(request_header_bytes[1..]) catch {
+            return sendSimple(writer, .worker_error, .none, .invalid_request, null);
+        };
+        const request = protocol.decodeRequest(&request_header_bytes) catch {
+            return sendSimple(writer, .worker_error, .none, .invalid_request, null);
+        };
+        if (request.session) session_started = true;
 
-    const body_len = request.bodyLen() catch {
-        return sendSimple(writer, .worker_error, .none, .invalid_request, null);
-    };
-    const encoded_body = init.gpa.alloc(u8, body_len) catch {
-        return sendSimple(
-            writer,
-            if (address_space_limited) .limit else .worker_error,
-            .bootstrap,
-            if (address_space_limited) .address_space_exceeded else .out_of_memory,
-            null,
-        );
-    };
-    defer init.gpa.free(encoded_body);
+        if (!validProcessLimits(request.process)) {
+            return sendSimple(writer, .worker_error, .bootstrap, .invalid_request, null);
+        }
+        if (!limits_installed) {
+            if (applyProcessLimits(request.process)) |failure| {
+                return sendSimple(writer, .worker_error, .bootstrap, failure, null);
+            }
+            address_space_limited = effectiveAddressSpaceLimited() orelse {
+                return sendSimple(
+                    writer,
+                    .worker_error,
+                    .bootstrap,
+                    .process_limit_setup_failed,
+                    null,
+                );
+            };
+            allocation_failures_before = mruby.alloc.backingAllocationFailures();
+            limits_installed = true;
+        }
 
-    try Observer.reached(.request_body);
-    reader.readSliceAll(encoded_body) catch {
-        return sendSimple(writer, .worker_error, .none, .invalid_request, null);
-    };
-    _ = reader.takeByte() catch |err| switch (err) {
-        error.EndOfStream => return execute(
+        const body_len = request.bodyLen() catch {
+            return sendSimple(writer, .worker_error, .none, .invalid_request, null);
+        };
+        const encoded_body = init.gpa.alloc(u8, body_len) catch {
+            return sendSimple(
+                writer,
+                if (address_space_limited) .limit else .worker_error,
+                .bootstrap,
+                if (address_space_limited) .address_space_exceeded else .out_of_memory,
+                null,
+            );
+        };
+        defer init.gpa.free(encoded_body);
+
+        try Observer.reached(.request_body);
+        reader.readSliceAll(encoded_body) catch {
+            return sendSimple(writer, .worker_error, .none, .invalid_request, null);
+        };
+
+        if (!request.session) {
+            // One-shot framing: the controller closes its end of stdin
+            // after the body, so end-of-stream is the go signal and any
+            // trailing byte is a protocol violation.
+            _ = reader.takeByte() catch |err| switch (err) {
+                error.EndOfStream => return execute(
+                    init.gpa,
+                    writer,
+                    request,
+                    encoded_body,
+                    address_space_limited,
+                    allocation_failures_before,
+                    Observer,
+                ),
+                error.ReadFailed => return sendSimple(writer, .worker_error, .none, .internal_error, null),
+            };
+            return sendSimple(writer, .worker_error, .none, .invalid_request, null);
+        }
+
+        // Session requests execute immediately and the loop continues; a
+        // response was already written and flushed, so the next header (or
+        // end-of-input) follows.
+        _ = try execute(
             init.gpa,
             writer,
             request,
@@ -106,10 +153,8 @@ fn run(init: std.process.Init, comptime Observer: type) !u8 {
             address_space_limited,
             allocation_failures_before,
             Observer,
-        ),
-        error.ReadFailed => return sendSimple(writer, .worker_error, .none, .internal_error, null),
-    };
-    return sendSimple(writer, .worker_error, .none, .invalid_request, null);
+        );
+    }
 }
 
 fn isolateProtocolOutput(io: std.Io) !std.Io.File {

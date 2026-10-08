@@ -4401,6 +4401,247 @@ test "worker: syscall confinement is surfaced where unsupported" {
     );
 }
 
+fn sessionValueOf(report: *mruby.worker.Report) !i64 {
+    const destination = try spawnSealed(.{});
+    defer destination.deinit();
+    switch (report.outcome) {
+        .value => |capsule| {
+            const restored = try destination.importValue(capsule.view(), .{});
+            return restored.asInt();
+        },
+        else => return error.UnexpectedWorkerOutcome,
+    }
+}
+
+test "worker session: many requests over one persistent helper" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    var image_a = try sandbox.compileRite(std.testing.allocator, "40 + 2", .{});
+    defer image_a.deinit(std.testing.allocator);
+    var image_b = try sandbox.compileRite(std.testing.allocator, "6 * 7", .{});
+    defer image_b.deinit(std.testing.allocator);
+    var image_c = try sandbox.compileRite(std.testing.allocator, "40 - 40", .{});
+    defer image_c.deinit(std.testing.allocator);
+
+    var session = try mruby.worker.Session.start(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{},
+    );
+    defer session.deinit(std.testing.io);
+
+    {
+        var report = try session.runRite(std.testing.io, .{ .image = image_a.view() });
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(i64, 42), try sessionValueOf(&report));
+    }
+    {
+        var report = try session.runRite(std.testing.io, .{ .image = image_b.view() });
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(i64, 42), try sessionValueOf(&report));
+    }
+    {
+        var report = try session.runRite(std.testing.io, .{ .image = image_c.view() });
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(i64, 0), try sessionValueOf(&report));
+    }
+    try std.testing.expectEqual(@as(usize, 3), session.requestCount());
+    try std.testing.expect(!session.closed());
+}
+
+test "worker session: ruby exceptions and limits do not end the session" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    var ok = try sandbox.compileRite(std.testing.allocator, "1", .{});
+    defer ok.deinit(std.testing.allocator);
+    var boom = try sandbox.compileRite(std.testing.allocator, "raise 'session survives'", .{});
+    defer boom.deinit(std.testing.allocator);
+    var spin = try sandbox.compileRite(std.testing.allocator, "while true; end", .{});
+    defer spin.deinit(std.testing.allocator);
+
+    var session = try mruby.worker.Session.start(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{},
+    );
+    defer session.deinit(std.testing.io);
+
+    {
+        var report = try session.runRite(std.testing.io, .{ .image = boom.view() });
+        defer report.deinit(std.testing.allocator);
+        switch (report.outcome) {
+            .ruby_exception => |exc| try std.testing.expectEqualStrings(
+                "RuntimeError",
+                exc.class_name,
+            ),
+            else => return error.UnexpectedWorkerOutcome,
+        }
+    }
+    {
+        var report = try session.runRite(std.testing.io, .{
+            .image = spin.view(),
+            .policy = .{ .limits = .{ .gas = .{ .per_execution = 2_000 } } },
+        });
+        defer report.deinit(std.testing.allocator);
+        switch (report.outcome) {
+            .limit => |kind| try std.testing.expectEqual(
+                mruby.worker.LimitKind.sandbox_gas,
+                kind,
+            ),
+            else => return error.UnexpectedWorkerOutcome,
+        }
+    }
+    {
+        var report = try session.runRite(std.testing.io, .{ .image = ok.view() });
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(i64, 1), try sessionValueOf(&report));
+    }
+    try std.testing.expectEqual(@as(usize, 3), session.requestCount());
+}
+
+test "worker session: rejected artifacts keep the session usable" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    var ok = try sandbox.compileRite(std.testing.allocator, "5", .{});
+    defer ok.deinit(std.testing.allocator);
+
+    var session = try mruby.worker.Session.start(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{},
+    );
+    defer session.deinit(std.testing.io);
+
+    {
+        var report = try session.runRite(std.testing.io, .{
+            .image = .{ .bytes = "not a rite image" },
+        });
+        defer report.deinit(std.testing.allocator);
+        switch (report.outcome) {
+            .artifact_rejected => {},
+            else => return error.UnexpectedWorkerOutcome,
+        }
+    }
+    {
+        var report = try session.runRite(std.testing.io, .{ .image = ok.view() });
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(i64, 5), try sessionValueOf(&report));
+    }
+}
+
+test "worker session: input capsules cross per request" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    const source = try spawnSealed(.{});
+    defer source.deinit();
+    var input_capsule = try source.exportValue(
+        std.testing.allocator,
+        try source.run("20 + 1"),
+        .{},
+    );
+    defer input_capsule.deinit(std.testing.allocator);
+
+    var image = try sandbox.compileRite(std.testing.allocator, "$input * 2", .{});
+    defer image.deinit(std.testing.allocator);
+
+    var session = try mruby.worker.Session.start(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{},
+    );
+    defer session.deinit(std.testing.io);
+    var i: i64 = 1;
+    while (i <= 3) : (i += 1) {
+        var report = try session.runRite(std.testing.io, .{
+            .image = image.view(),
+            .input = .{ .capsule = input_capsule.view() },
+        });
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(i64, 42), try sessionValueOf(&report));
+    }
+}
+
+test "worker pool: checkout, exhaustion, and return" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    var image = try sandbox.compileRite(std.testing.allocator, "7", .{});
+    defer image.deinit(std.testing.allocator);
+
+    var pool = try mruby.worker.Pool.init(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{},
+        2,
+    );
+    defer pool.deinit(std.testing.io);
+
+    const a = pool.acquire() orelse return error.PoolExhaustedUnexpectedly;
+    const b = pool.acquire() orelse return error.PoolExhaustedUnexpectedly;
+    try std.testing.expect(pool.acquire() == null);
+
+    {
+        var report = try a.runRite(std.testing.io, .{ .image = image.view() });
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(i64, 7), try sessionValueOf(&report));
+    }
+    pool.release(a);
+    const c = pool.acquire() orelse return error.PoolExhaustedUnexpectedly;
+    try std.testing.expect(c == a);
+
+    {
+        var report = try b.runRite(std.testing.io, .{ .image = image.view() });
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(i64, 7), try sessionValueOf(&report));
+    }
+    pool.release(b);
+    pool.release(c);
+    try std.testing.expectEqual(@as(usize, 2), pool.available());
+}
+
+test "worker session: a lifetime cpu ceiling is bounded per process" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    var spin = try sandbox.compileRite(std.testing.allocator, "while true; end", .{});
+    defer spin.deinit(std.testing.allocator);
+    var one = try sandbox.compileRite(std.testing.allocator, "1", .{});
+    defer one.deinit(std.testing.allocator);
+
+    var session = try mruby.worker.Session.start(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        // One second of lifetime CPU: the first request spins it away; the
+        // soft ceiling delivers SIGXCPU and the process dies, so a second
+        // exchange reports the session as closed.
+        .{ .cpu_seconds = 1 },
+    );
+    {
+        _ = session.runRite(std.testing.io, .{
+            .image = spin.view(),
+            .wall_time_ns = 10 * std.time.ns_per_s,
+        }) catch {};
+    }
+    // The helper either died on SIGXCPU during the spin or closes on the
+    // next exchange; both paths must surface a closed session rather than
+    // hanging.
+    var session_dead = session.closed();
+    if (!session_dead) {
+        _ = session.runRite(std.testing.io, .{
+            .image = one.view(),
+            .wall_time_ns = 10 * std.time.ns_per_s,
+        }) catch {
+            session_dead = true;
+        };
+    }
+    try std.testing.expect(session_dead or session.closed());
+    session.deinit(std.testing.io);
+}
+
 test "worker: typed capsule input and output cross a fresh process" {
     if (!mruby.worker.supported) return error.SkipZigTest;
 

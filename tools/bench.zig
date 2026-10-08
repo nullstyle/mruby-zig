@@ -279,8 +279,76 @@ pub fn main(init: std.process.Init) !u8 {
     try benchGasHookCost(w);
     try benchCapsuleRoundtrip(w, gpa);
     try benchWorkerRite(init, gpa, w);
+    try benchWorkerSessionRite(init, gpa, w);
 
     return 0;
+}
+
+/// The same exchange over a persistent session: the spawn is paid once,
+/// so the per-op cost isolates IPC + execution from process creation.
+fn benchWorkerSessionRite(init: std.process.Init, gpa: std.mem.Allocator, out: *std.Io.Writer) !void {
+    if (comptime !mruby.features.worker_process_supported) {
+        try out.print("{s:<32} {s:>10}    {s:>12}\n", .{ "worker-session-rite (amortized)", "skipped", "unsupported" });
+        return;
+    }
+    const self_path = std.process.executablePathAlloc(init.io, gpa) catch return;
+    defer gpa.free(self_path);
+    const dir = std.fs.path.dirname(self_path) orelse return;
+    const worker_path = try std.fs.path.join(gpa, &.{ dir, "mruby-worker" });
+    defer gpa.free(worker_path);
+
+    std.Io.Dir.accessAbsolute(init.io, worker_path, .{}) catch {
+        try out.print("{s:<32} {s:>10}    {s:>12}\n", .{ "worker-session-rite (amortized)", "skipped", "no helper" });
+        return;
+    };
+
+    var image = try mruby.sandbox.compileRite(gpa, "$input + 1", .{});
+    defer image.deinit(gpa);
+
+    const producer = try spawnSealed(mruby.sandbox.Policy.trusted(.{}));
+    defer producer.deinit();
+    const count = try producer.run("count = 41");
+    var input_capsule = try producer.exportValue(gpa, count, .{});
+    defer input_capsule.deinit(gpa);
+
+    var session = try mruby.worker.Session.start(init.io, gpa, worker_path, .{
+        .cpu_seconds = 120,
+    });
+    defer session.deinit(init.io);
+
+    const request: mruby.worker.SessionRequest = .{
+        .image = image.view(),
+        .input = .{ .capsule = input_capsule.view() },
+        .policy = mruby.sandbox.Policy.restricted(.{
+            .limits = .{ .gas = .{ .per_execution = 1_000_000 } },
+        }),
+        .wall_time_ns = 10 * std.time.ns_per_s,
+    };
+
+    // Warmup + correctness check.
+    {
+        var rep = try session.runRite(init.io, request);
+        defer rep.deinit(gpa);
+        switch (rep.outcome) {
+            .value => {},
+            else => return error.UnexpectedWorkerOutcome,
+        }
+    }
+
+    const clock = mruby.sandbox.monotonicNs;
+    const reps = 100;
+    var ops: usize = 0;
+    const start_ns = clock();
+    for (0..reps) |_| {
+        var rep = try session.runRite(init.io, request);
+        defer rep.deinit(gpa);
+        switch (rep.outcome) {
+            .value => {},
+            else => return error.UnexpectedWorkerOutcome,
+        }
+        ops += 1;
+    }
+    try report(out, "worker-session-rite (amortized)", .{ .ops = ops, .ns_total = @intCast(clock() - start_ns) });
 }
 
 /// One-shot worker-process roundtrip (spawn + IPC + execute + reap),

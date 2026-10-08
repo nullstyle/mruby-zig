@@ -102,12 +102,18 @@ today.
 - Explicitly out of scope for B1: network namespaces, uid separation,
   cgroups. Those are B3+.
 
-### B2. Worker economics
+### B2. Worker economics (shipped 2026-10-08)
 
-Persistent/pooled workers with a multi-shot protocol extension (the
-one-shot 1.7ms spawn tax dominates roundtrips today). Protocol grows a
-versioned hello; controller keeps the kill-then-reap and cancellation
-discipline per pooled child.
+Persistent sessions + pooling shipped: a session presence bit frames
+multi-shot requests by exact length (no protocol version bump needed;
+same-tree pairing), the helper loops with a fresh isolate per request
+and treats stdin EOF as graceful shutdown, and `Session`/`Pool` carry
+lifetime-vs-per-request limit semantics (RLIMITs install once;
+per-exchange budgets come from the sandbox policy + controller-side I/O
+deadline). Benchmarked 6689 -> 1359 us/op (4.9x) on the reference
+machine. Deferred follow-up: a protocol hello with feature negotiation
+only becomes necessary if the controller and helper can come from
+different builds.
 
 ### B3. Platform honesty + hardening depth
 

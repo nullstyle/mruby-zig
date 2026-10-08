@@ -138,6 +138,8 @@ pub const RunError = std.mem.Allocator.Error || error{
     BrokenPipeProtectionUnavailable,
     ProcessLimitSetupFailed,
     WorkerFailed,
+    SessionClosed,
+    SessionBusy,
     ConcurrencyUnavailable,
     Canceled,
 };
@@ -356,6 +358,19 @@ fn writeRequest(
     input: ?[]const u8,
 ) TimedIoError!void {
     defer file.close(io);
+    try writeSessionRequest(io, file, deadline, header, image, input);
+}
+
+/// Write one request without closing the stream: persistent sessions keep
+/// stdin open for the next request; end-of-input is the shutdown signal.
+fn writeSessionRequest(
+    io: std.Io,
+    file: std.Io.File,
+    deadline: std.Io.Clock.Timestamp,
+    header: *const [protocol.request_header_len]u8,
+    image: []const u8,
+    input: ?[]const u8,
+) TimedIoError!void {
     try writeAllUntil(io, file, header, deadline);
     try writeAllUntil(io, file, image, deadline);
     if (input) |bytes| try writeAllUntil(io, file, bytes, deadline);
@@ -398,7 +413,34 @@ fn readResponse(
     const body: ?[]u8 = if (body_len == 0) null else try allocator.alloc(u8, body_len);
     errdefer if (body) |bytes| allocator.free(bytes);
     if (body) |bytes| try readAllUntil(io, file, bytes, deadline);
+    // A one-shot helper exits after its response, so end-of-stream here
+    // proves no trailing bytes exist. A session helper keeps the pipe open
+    // for the next response, so the check would block until the deadline;
+    // exact declared lengths make it unnecessary.
     if (try readByteUntil(io, file, deadline) != null) return error.ProtocolMismatch;
+    return .{ .header = response_header, .body = body };
+}
+
+fn readSessionResponse(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: std.Io.File,
+    deadline: std.Io.Clock.Timestamp,
+    max_value_len: usize,
+) ExchangeError!RawResponse {
+    var response_bytes: [protocol.response_header_len]u8 = undefined;
+    try readAllUntil(io, file, &response_bytes, deadline);
+    const response_header = protocol.decodeResponse(&response_bytes) catch |err| return switch (err) {
+        error.BodyTooLarge, error.LengthOverflow => error.ResponseTooLarge,
+        else => error.ProtocolMismatch,
+    };
+    const body_len = responseBodyLengthForAllocation(response_header, max_value_len) catch |err| return switch (err) {
+        error.BodyTooLarge, error.LengthOverflow => error.ResponseTooLarge,
+        else => error.ProtocolMismatch,
+    };
+    const body: ?[]u8 = if (body_len == 0) null else try allocator.alloc(u8, body_len);
+    errdefer if (body) |bytes| allocator.free(bytes);
+    if (body) |bytes| try readAllUntil(io, file, bytes, deadline);
     return .{ .header = response_header, .body = body };
 }
 
@@ -615,6 +657,335 @@ fn processLimitReport(kind: LimitKind, peak_rss: ?usize) Report {
         .process_peak_rss_bytes = peak_rss,
     };
 }
+
+// ---------------------------------------------------------------------------
+// persistent sessions
+// ---------------------------------------------------------------------------
+
+/// Lifetime process limits for a persistent session helper. The CPU
+/// ceiling is RLIMIT-based and therefore cumulative for the whole process
+/// (RLIMITs cannot be raised once installed); per-exchange compute control
+/// comes from each request's sandbox policy plus the per-exchange
+/// `SessionRequest.wall_time_ns` I/O deadline. There is no session-level
+/// wall clock: the process ends when the controller closes stdin, a
+/// lifetime CPU ceiling trips, or an exchange fails.
+pub const SessionLimits = struct {
+    cpu_seconds: u32 = 300,
+    address_space: AddressSpaceLimit = .unbounded,
+    confine_syscalls: bool = false,
+};
+
+/// One exchange over a persistent session. The sandbox policy is applied
+/// per request inside a fresh isolate; process-level ceilings stay at the
+/// session's lifetime values.
+pub const SessionRequest = struct {
+    image: artifact.RiteImageView,
+    input: ?Input = null,
+    output_schema: ?artifact.Schema = null,
+    policy: sandbox.Policy = .{},
+    /// Controller-side deadline for this request/response exchange.
+    wall_time_ns: u64 = 30 * std.time.ns_per_s,
+};
+
+/// A persistent helper process serving sequential requests. Each
+/// `runRite` sends one session request and waits for its response; the
+/// spawn cost is paid once at `start`. One exchange runs at a time. Any
+/// transport, protocol, or timeout failure poisons the session: the
+/// helper is killed and reaped immediately and later calls return
+/// `error.SessionClosed`. `deinit` performs a graceful shutdown (close
+/// stdin, wait, kill on grace expiry).
+pub const Session = struct {
+    allocator: std.mem.Allocator,
+    child: std.process.Child,
+    pid: std.posix.pid_t,
+    input_file: std.Io.File,
+    output_file: std.Io.File,
+    lifetime: SessionLimits,
+    requests: usize = 0,
+    broken: bool = false,
+    busy: bool = false,
+
+    /// Spawn a session helper. The first request installs the lifetime
+    /// process limits inside the helper.
+    pub fn start(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        worker_executable: []const u8,
+        lifetime: SessionLimits,
+    ) RunError!Session {
+        if (comptime !supported) return error.UnsupportedPlatform;
+        if ((!std.fs.path.isAbsolute(worker_executable) and
+            std.mem.indexOfScalar(u8, worker_executable, '/') == null) or
+            std.mem.indexOfScalar(u8, worker_executable, 0) != null or
+            lifetime.cpu_seconds == 0)
+        {
+            return error.InvalidOptions;
+        }
+        switch (lifetime.address_space) {
+            .unbounded => {},
+            .bytes => |bytes| {
+                if (bytes == 0) return error.InvalidOptions;
+                if (builtin.os.tag == .macos) return error.HardMemoryLimitUnavailable;
+            },
+        }
+        if (lifetime.confine_syscalls and builtin.os.tag != .linux) {
+            return error.SyscallFilterUnavailable;
+        }
+        if (!childWaitOwnershipAvailable()) return error.ChildReapingUnavailable;
+        if (!brokenPipeProtected()) return error.BrokenPipeProtectionUnavailable;
+
+        var child = try spawnWorker(allocator, worker_executable);
+        const pid = child.id.?;
+        const input_file = child.stdin.?;
+        child.stdin = null;
+        const output_file = child.stdout.?;
+        child.stdout = null;
+        _ = io; // spawn itself needs no io; exchanges do
+        return .{
+            .allocator = allocator,
+            .child = child,
+            .pid = pid,
+            .input_file = input_file,
+            .output_file = output_file,
+            .lifetime = lifetime,
+        };
+    }
+
+    /// Execute one request over the session. Inputs are borrowed; the
+    /// returned report owns its capsule or diagnostics. Per-request peak
+    /// RSS is not observable without process exit and is reported as null.
+    pub fn runRite(session: *Session, io: std.Io, request: SessionRequest) RunError!Report {
+        if (session.broken) return error.SessionClosed;
+        if (session.busy) return error.SessionBusy;
+        session.busy = true;
+        defer session.busy = false;
+
+        if (request.image.bytes.len == 0 or
+            request.wall_time_ns == 0 or
+            request.policy.artifacts.limits.capsule.max_encoded_bytes > protocol.max_body_len)
+        {
+            return error.InvalidOptions;
+        }
+        if (request.input) |input| {
+            if (input.capsule.bytes.len == 0) return error.InvalidOptions;
+        }
+        if (request.policy.limits.gas != null and request.policy.limits.instructions != null) {
+            return error.InvalidOptions;
+        }
+        if (request.policy.artifacts.application != null) {
+            return error.UnsupportedApplicationBootstrap;
+        }
+
+        const request_header = protocol.encodeRequest(.{
+            .image_len = request.image.bytes.len,
+            .input_len = if (request.input) |input| input.capsule.bytes.len else null,
+            .policy = try encodePolicy(request.policy),
+            .input_schema = if (request.input) |input| encodeSchema(input.accepted_schema) else null,
+            .output_schema = encodeSchema(request.output_schema),
+            .session = true,
+            .process = .{
+                .wall_time_ns = request.wall_time_ns,
+                .cpu_seconds = session.lifetime.cpu_seconds,
+                .address_space = switch (session.lifetime.address_space) {
+                    .unbounded => .unbounded,
+                    .bytes => |bytes| .{ .bytes = bytes },
+                },
+                .syscalls = if (session.lifetime.confine_syscalls) .filtered else .unconfined,
+            },
+        }) catch |err| return switch (err) {
+            error.BodyTooLarge, error.LengthOverflow => error.RequestTooLarge,
+            else => error.InvalidOptions,
+        };
+
+        const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+            .raw = std.Io.Duration.fromNanoseconds(@intCast(request.wall_time_ns)),
+            .clock = .boot,
+        });
+
+        const old_cancel_protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(old_cancel_protection);
+
+        var write_future = std.Io.concurrent(io, writeSessionRequest, .{
+            io,
+            session.input_file,
+            deadline,
+            &request_header,
+            request.image.bytes,
+            if (request.input) |input| input.capsule.bytes else null,
+        }) catch {
+            return error.ConcurrencyUnavailable;
+        };
+        var write_finished = false;
+        defer if (!write_finished) {
+            write_future.cancel(io) catch {};
+        };
+
+        var raw_response = readSessionResponse(
+            io,
+            session.allocator,
+            session.output_file,
+            deadline,
+            request.policy.artifacts.limits.capsule.max_encoded_bytes,
+        ) catch |err| {
+            // The exchange failed: framing or the helper is gone. End the
+            // helper now so nothing is left running until deinit.
+            session.fail(io);
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Timeout => error.TransportFailure,
+                error.Canceled => error.Canceled,
+                error.TransportFailure => error.TransportFailure,
+                error.ProtocolMismatch => error.ProtocolMismatch,
+                error.ResponseTooLarge => error.ResponseTooLarge,
+            };
+        };
+        defer raw_response.deinit(session.allocator);
+
+        var write_failure: ?TimedIoError = null;
+        write_future.await(io) catch |err| {
+            write_failure = err;
+        };
+        write_finished = true;
+
+        const write_failure_allowed = if (write_failure) |err|
+            err == error.TransportFailure and
+                responseMayPrecedeRequestBody(raw_response.header)
+        else
+            true;
+        if (!write_failure_allowed) {
+            session.fail(io);
+            return error.TransportFailure;
+        }
+
+        session.requests += 1;
+        return decodeReport(
+            session.allocator,
+            &raw_response,
+            request.output_schema,
+            request.policy.artifacts.limits.capsule,
+            null,
+        );
+    }
+
+    /// Number of completed exchanges.
+    pub fn requestCount(session: *const Session) usize {
+        return session.requests;
+    }
+
+    /// True once an exchange failed; the helper is gone and only `deinit`
+    /// remains meaningful.
+    pub fn closed(session: *const Session) bool {
+        return session.broken;
+    }
+
+    fn fail(session: *Session, io: std.Io) void {
+        session.broken = true;
+        if (session.child.id != null) {
+            terminateAndReap(io, &session.child, session.pid);
+        }
+    }
+
+    /// Graceful shutdown: closing stdin signals end-of-session; the helper
+    /// exits on its own. A short grace window is followed by the usual
+    /// kill-then-reap so deinit always terminates bounded.
+    pub fn deinit(session: *Session, io: std.Io) void {
+        if (session.child.id != null) {
+            session.input_file.close(io);
+            var waited: bool = false;
+            var remaining: usize = 500;
+            while (remaining > 0) : (remaining -= 1) {
+                const probe = probeChild(session.pid) catch break;
+                if (probe == .exited) {
+                    waited = true;
+                    break;
+                }
+                if (probe == .unavailable) break;
+                sandbox.sleepNs(2 * std.time.ns_per_ms);
+            }
+            if (waited) {
+                _ = session.child.wait(io) catch {};
+            } else {
+                terminateAndReap(io, &session.child, session.pid);
+            }
+        }
+        session.output_file.close(io);
+        session.* = undefined;
+    }
+};
+
+/// A fixed set of pre-started sessions with a free list. The pool itself
+/// is not synchronized; embedders share it across threads behind their
+/// own lock, and each session runs one exchange at a time.
+pub const Pool = struct {
+    allocator: std.mem.Allocator,
+    sessions: []Session,
+    free: []usize,
+    free_len: usize,
+
+    /// Start `size` session helpers eagerly so the spawn cost is paid
+    /// once, up front.
+    pub fn init(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        worker_executable: []const u8,
+        lifetime: SessionLimits,
+        size: usize,
+    ) RunError!Pool {
+        const sessions = try allocator.alloc(Session, size);
+        var started: usize = 0;
+        errdefer {
+            for (sessions[0..started]) |*session| session.deinit(io);
+            allocator.free(sessions);
+        }
+        for (sessions) |*session| {
+            session.* = try Session.start(io, allocator, worker_executable, lifetime);
+            started += 1;
+        }
+        const free = try allocator.alloc(usize, size);
+        for (free, 0..) |*slot, i| slot.* = i;
+        return .{ .allocator = allocator, .sessions = sessions, .free = free, .free_len = size };
+    }
+
+    /// Take an idle session, or null when every session is checked out.
+    /// Broken sessions are skipped (their slot stays occupied until
+    /// `deinit`).
+    pub fn acquire(pool: *Pool) ?*Session {
+        while (pool.free_len > 0) {
+            const index = pool.free[pool.free_len - 1];
+            pool.free_len -= 1;
+            const session = &pool.sessions[index];
+            if (session.broken) continue;
+            return session;
+        }
+        return null;
+    }
+
+    /// Return a session to the pool. Broken sessions are not reused.
+    pub fn release(pool: *Pool, session: *Session) void {
+        if (session.broken) return;
+        const base = @intFromPtr(&pool.sessions[0]);
+        const offset = @intFromPtr(session) - base;
+        std.debug.assert(offset % @sizeOf(Session) == 0);
+        const index = offset / @sizeOf(Session);
+        std.debug.assert(index < pool.sessions.len);
+        if (pool.free_len < pool.free.len) {
+            pool.free[pool.free_len] = index;
+            pool.free_len += 1;
+        }
+    }
+
+    pub fn deinit(pool: *Pool, io: std.Io) void {
+        for (pool.sessions) |*session| session.deinit(io);
+        pool.allocator.free(pool.sessions);
+        pool.allocator.free(pool.free);
+        pool.* = undefined;
+    }
+
+    /// Idle sessions available to `acquire`.
+    pub fn available(pool: *const Pool) usize {
+        return pool.free_len;
+    }
+};
 
 fn decodeReport(
     allocator: std.mem.Allocator,

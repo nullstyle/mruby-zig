@@ -125,6 +125,53 @@ and process ceilings are independent; set the sandbox deadline below the
 process deadline when a cooperative failure with sandbox statistics is
 preferable to a hard kill.
 
+## Persistent sessions and pooling
+
+`runRite` pays a full process spawn per request. `mruby.worker.Session`
+amortizes it: `Session.start` spawns one helper, and each `runRite` sends a
+session request and waits for its response over the same pipes — on this
+machine the same exchange drops from ~6.7 ms to ~1.4 ms per op (see
+`docs/benchmarks.md`, `worker-session-rite`).
+
+```zig
+var session = try mruby.worker.Session.start(io, allocator, worker_path, .{
+    .cpu_seconds = 300,
+});
+defer session.deinit(io);
+var report = try session.runRite(io, .{ .image = image.view() });
+```
+
+The contract differences from one-shot execution:
+
+- **Framing.** Session requests are framed by their exact declared lengths
+  (no end-of-input byte); the helper processes each request immediately
+  and waits for the next. Closing the controller's end of stdin is the
+  shutdown signal — `deinit` closes it, waits a bounded grace period, and
+  falls back to the usual kill-then-reap.
+- **Process limits are lifetime limits.** RLIMITs cannot be raised once
+  installed, so `SessionLimits` (cumulative `cpu_seconds`, optional
+  address-space ceiling, optional `confine_syscalls`) install once from
+  the first request and bound the whole process. Per-exchange compute
+  control comes from each request's sandbox policy plus the
+  `SessionRequest.wall_time_ns` controller-side I/O deadline. There is no
+  session-level wall clock.
+- **A fresh isolate per request.** Each request spawns, seals, runs, and
+  destroys its own isolate inside the helper: sandbox gas generations,
+  memory accounting, and loader poisoning are per request, and outcomes
+  (values, Ruby exceptions, limits, artifact rejections) do not affect
+  later requests. Address-space exhaustion is sticky for the session: a
+  helper that hit its ceiling keeps reporting `address_space_exceeded`.
+- **Failure closes the session.** Any transport, protocol, or timeout
+  failure kills and reaps the helper immediately; later calls return
+  `error.SessionClosed`. Per-request peak RSS is not observable without
+  process exit and is reported as null.
+- One exchange runs at a time (`error.SessionBusy` otherwise).
+
+`mruby.worker.Pool` pre-starts a fixed set of sessions and hands them out
+through `acquire`/`release` (null when exhausted; broken sessions are not
+reused). The pool is not synchronized — embedders share it across threads
+behind their own lock.
+
 ## Enforcement and platform contract
 
 Worker availability is fail-closed and visible through separate feature

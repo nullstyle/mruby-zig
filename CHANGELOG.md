@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+Workers (assurance track B2):
+
+- Persistent worker sessions: `mruby.worker.Session.start` spawns one
+  helper that serves sequential requests (`session.runRite`), amortizing
+  the per-request process spawn — the benchmarked roundtrip drops ~4.9x
+  (6689 us to 1359 us per op on the reference machine; see the new
+  `worker-session-rite` bench metric). Session requests are framed by
+  exact declared lengths with a new protocol presence bit; stdin EOF is
+  the graceful shutdown signal. Process limits become lifetime limits
+  (RLIMITs cannot be raised; cumulative cpu_seconds installs once),
+  per-exchange compute control comes from each request's sandbox policy
+  and wall_time_ns I/O deadline, and each request executes in a fresh
+  isolate so outcomes and loader poisoning never leak across requests.
+  Any exchange failure kills and reaps the helper and closes the session
+  (`error.SessionClosed`). `mruby.worker.Pool` pre-starts a fixed set of
+  sessions behind acquire/release with broken-session retirement.
+
 Workers (assurance track B1):
 
 - `ProcessLimits.confine_syscalls = true` installs a Linux seccomp

@@ -133,6 +133,10 @@ pub const RequestHeader = struct {
     input_schema: ?Schema = null,
     output_schema: ?Schema = null,
     process: ProcessLimits = .{},
+    /// Session requests do not wait for stdin EOF as their framing
+    /// (bodies are read to their exact declared lengths) and the helper
+    /// keeps running afterwards.
+    session: bool = false,
 
     pub fn bodyLen(header: RequestHeader) Error!usize {
         return checkedBodyLength(&.{ header.image_len, header.input_len orelse 0 });
@@ -261,7 +265,11 @@ const request_optional = struct {
     const application: u16 = 1 << 7;
     const input_schema: u16 = 1 << 8;
     const output_schema: u16 = 1 << 9;
-    const known: u16 = (1 << 10) - 1;
+    /// Persistent session: process the request immediately (no end-of-
+    /// stdin framing) and wait for the next request; stdin EOF ends the
+    /// session gracefully.
+    const session: u16 = 1 << 10;
+    const known: u16 = (1 << 11) - 1;
 };
 
 const capability_flag = struct {
@@ -391,6 +399,7 @@ pub fn encodeRequest(header: RequestHeader) Error![request_header_len]u8 {
     putU64(bytes[request_offset.gas_limit..][0..8], gas_limit);
 
     var optional_flags: u16 = 0;
+    if (header.session) optional_flags |= request_optional.session;
     if (header.input_len) |_| optional_flags |= request_optional.input;
     if (header.policy.limits.wall_time_ns) |value| {
         optional_flags |= request_optional.sandbox_wall_time;
@@ -461,6 +470,7 @@ pub fn decodeRequest(bytes: []const u8) Error!RequestHeader {
 
     const optional_flags = getU16(bytes[request_offset.optional_flags..][0..2]);
     if (optional_flags & ~request_optional.known != 0) return error.UnknownFlags;
+    const session = has(optional_flags, request_optional.session);
     const capability_flags = bytes[request_offset.capability_flags];
     if (capability_flags & ~capability_flag.known != 0) return error.UnknownFlags;
 
@@ -530,6 +540,7 @@ pub fn decodeRequest(bytes: []const u8) Error!RequestHeader {
     const header: RequestHeader = .{
         .image_len = image_len,
         .input_len = input_len,
+        .session = session,
         .policy = .{
             .limits = .{
                 .gas = gas,
