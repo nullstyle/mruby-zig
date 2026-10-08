@@ -346,6 +346,12 @@ fn applyLinuxProcessLimits(limits: protocol.ProcessLimits) ?protocol.Detail {
             if (!installCeiling(.AS, value)) return .process_limit_setup_failed;
         },
     }
+    // The syscall filter goes in after the ceilings and before any body
+    // allocation: past this point the process cannot open paths, create
+    // sockets or processes, or change privilege at all.
+    if (limits.syscalls == .filtered) {
+        mruby.seccomp.install() catch return .syscall_filter_unavailable;
+    }
     return null;
 }
 
@@ -354,6 +360,9 @@ fn applyMacProcessLimits(limits: protocol.ProcessLimits) ?protocol.Detail {
         .unbounded => {},
         .bytes => return .hard_memory_limit_unavailable,
     }
+    // The controller rejects this pairing before spawning; refuse it here
+    // too so an unfiltered run can never pass silently.
+    if (limits.syscalls == .filtered) return .syscall_filter_unavailable;
     if (!applyCommonProcessLimits(limits.cpu_seconds)) return .process_limit_setup_failed;
     return null;
 }

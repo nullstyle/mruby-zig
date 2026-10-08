@@ -294,14 +294,16 @@ session, arbitrary method call, custom host bootstrap, or explicit terminate
 operation across the process boundary.
 
 The helper is still not a complete hostile-code sandbox. It runs as the same
-OS user and currently has no syscall filter, filesystem jail, network
-namespace, or privilege separation. The build omits the generic helper when
-the selected authority manifest reports filesystem, network, process,
-environment, or arbitrary native-host access, unless the build owner uses the
-explicit ambient-authority override. That gate prevents an accidental worker
-configuration; it does not confine an enabled helper. Authenticate executable
-artifacts and add an external OS/container sandbox where fully hostile code is
-in scope. See [workers.md](workers.md) for the exact platform and enforcement
+OS user and has no filesystem jail, network namespace, or privilege
+separation; a per-request Linux syscall allowlist (`confine_syscalls`,
+[workers.md](workers.md)) is available but not enabled by default. The build
+omits the generic helper when the selected authority manifest reports
+filesystem, network, process, environment, or arbitrary native-host access,
+unless the build owner uses the explicit ambient-authority override. That gate
+prevents an accidental worker configuration; it does not confine an enabled
+helper. Authenticate executable artifacts and add an external OS/container
+sandbox where fully hostile code is in scope. See
+[workers.md](workers.md) for the exact platform and enforcement
 contract.
 
 Run `examples/sandbox.zig` (`zig build run-sandbox`) for a runnable

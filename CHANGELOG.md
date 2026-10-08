@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+Workers (assurance track B1):
+
+- `ProcessLimits.confine_syscalls = true` installs a Linux seccomp
+  allowlist filter in the worker helper before any guest byte runs
+  (`mruby.seccomp`): memory management, I/O on open descriptors, clocks,
+  seed entropy, signal hygiene, and exit are allowed — with `prlimit64`
+  gated to NULL-new-limit reads and `ioctl` to the TCGETS probe — and
+  everything else (path access, sockets, process creation, privilege
+  changes) returns EPERM. The filter
+  is hand-assembled classic BPF built from `std.os.linux.SYS` (per-arch
+  numbers at comptime), gated on `PR_SET_NO_NEW_PRIVS`, and one-way.
+  Non-Linux requests fail closed with `error.SyscallFilterUnavailable`
+  from both the controller and the helper. The worker protocol carries a
+  `syscall mode` byte (previously reserved-zero space); same-tree
+  controller/helper pairing means no interoperability constraint.
+- `mruby.seccomp` exposes the filter (`available`, `install`, program
+  rendering) with unit tests pinning the program shape and the
+  denied-syscall class (open/openat/socket/connect/execve/clone/prctl/
+  seccomp/...); a `seccomp-probe` fixture executable proves EPERM
+  end-to-end on a real kernel, and the worker suite runs a fully confined
+  `runRite` roundtrip on Linux CI.
+
 Safe API:
 
 - Symbol-cached dispatch: `mruby.Symbol` (`Vm.internSymbol`) +

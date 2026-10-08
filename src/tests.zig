@@ -4341,6 +4341,66 @@ test "class: bool 'b' method argument round-trips" {
     try std.testing.expectEqualStrings("no", try no.asString());
 }
 
+test "worker: confined syscalls still complete a full roundtrip" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var image = try sandbox.compileRite(std.testing.allocator, "6 * 7", .{});
+    defer image.deinit(std.testing.allocator);
+    var report = try mruby.worker.runRite(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{
+            .image = image.view(),
+            .process = .{
+                .wall_time_ns = 10 * std.time.ns_per_s,
+                .cpu_seconds = 10,
+                .confine_syscalls = true,
+            },
+        },
+    );
+    defer report.deinit(std.testing.allocator);
+    switch (report.outcome) {
+        .value => |capsule| try std.testing.expect(capsule.encoded.len > 0),
+        else => return error.UnexpectedWorkerOutcome,
+    }
+}
+
+test "worker: the seccomp filter denies path access in a confined process" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const result = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &.{test_config.seccomp_probe},
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.UnexpectedProbeTermination,
+    }
+}
+
+test "worker: syscall confinement is surfaced where unsupported" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+    if (builtin.os.tag == .linux) return error.SkipZigTest;
+
+    var image = try sandbox.compileRite(std.testing.allocator, "1", .{});
+    defer image.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.SyscallFilterUnavailable,
+        mruby.worker.runRite(
+            std.testing.io,
+            std.testing.allocator,
+            test_config.worker_executable,
+            .{
+                .image = image.view(),
+                .process = .{ .confine_syscalls = true },
+            },
+        ),
+    );
+}
+
 test "worker: typed capsule input and output cross a fresh process" {
     if (!mruby.worker.supported) return error.SkipZigTest;
 

@@ -38,6 +38,7 @@ pub const alloc = @import("alloc.zig");
 pub const artifact = @import("artifact.zig");
 pub const sandbox = @import("sandbox.zig");
 pub const worker = @import("worker.zig");
+pub const seccomp = @import("seccomp.zig");
 pub const features = @import("features.zig");
 pub const codedb = @import("codedb.zig");
 

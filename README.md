@@ -22,8 +22,10 @@ bytecode, compiles everything with `zig cc`, and hands you a `mruby` module.
 Pre-release. Pinned to **Zig 0.17.0** via
 [mise](https://mise.jdx.dev). Trusted and semi-trusted embedding is the
 supported in-process use. A first one-shot worker tier adds a fresh process,
-hard wall/CPU supervision, and optional Linux address-space ceilings; it is
-not yet a complete syscall sandbox. See the [threat model](docs/sandboxing.md)
+hard wall/CPU supervision, optional Linux address-space ceilings, and an
+opt-in Linux syscall allowlist (`confine_syscalls`); it is not yet a
+complete OS sandbox (no filesystem jail, network namespace, or privilege
+separation). See the [threat model](docs/sandboxing.md)
 and [worker guide](docs/workers.md). Supported platforms:
 [docs/platforms.md](docs/platforms.md).
 

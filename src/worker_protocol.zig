@@ -114,10 +114,16 @@ pub const AddressSpaceLimit = union(AddressSpaceMode) {
     bytes: usize,
 };
 
+pub const SyscallMode = enum(u8) {
+    unconfined = 0,
+    filtered = 1,
+};
+
 pub const ProcessLimits = struct {
     wall_time_ns: u64 = 30 * std.time.ns_per_s,
     cpu_seconds: u32 = 30,
     address_space: AddressSpaceLimit = .unbounded,
+    syscalls: SyscallMode = .unconfined,
 };
 
 pub const RequestHeader = struct {
@@ -184,6 +190,7 @@ pub const Detail = enum(u16) {
     hard_memory_limit_unavailable = 40,
     process_limit_setup_failed = 41,
     address_space_exceeded = 42,
+    syscall_filter_unavailable = 43,
     internal_error = 255,
 };
 
@@ -309,7 +316,8 @@ const request_offset = struct {
     const gas_mode = 242;
     const capability_flags = 243;
     const address_space_mode = 244;
-    const reserved = 245;
+    const syscall_mode = 245;
+    const reserved = 246;
 };
 
 const response_offset = struct {
@@ -439,6 +447,7 @@ pub fn encodeRequest(header: RequestHeader) Error![request_header_len]u8 {
             putU64(bytes[request_offset.process_address_space_bytes..][0..8], try usizeToWire(value));
         },
     }
+    bytes[request_offset.syscall_mode] = @backingInt(header.process.syscalls);
     return bytes;
 }
 
@@ -512,6 +521,12 @@ pub fn decodeRequest(bytes: []const u8) Error!RequestHeader {
         else => return error.UnknownEnumValue,
     };
 
+    const syscalls: SyscallMode = switch (bytes[request_offset.syscall_mode]) {
+        @backingInt(SyscallMode.unconfined) => .unconfined,
+        @backingInt(SyscallMode.filtered) => .filtered,
+        else => return error.UnknownEnumValue,
+    };
+
     const header: RequestHeader = .{
         .image_len = image_len,
         .input_len = input_len,
@@ -551,6 +566,7 @@ pub fn decodeRequest(bytes: []const u8) Error!RequestHeader {
             .wall_time_ns = getU64(bytes[request_offset.process_wall_time_ns..][0..8]),
             .cpu_seconds = getU32(bytes[request_offset.cpu_seconds..][0..4]),
             .address_space = address_space,
+            .syscalls = syscalls,
         },
     };
     const body_len = try validateRequest(header);

@@ -565,6 +565,23 @@ pub fn build(b: *std.Build) !void {
         unsupportedCompilerStep(b, "run-repl", "interactive mruby REPL");
     }
 
+    const seccomp_mod = b.createModule(.{
+        .root_source_file = b.path("src/seccomp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const seccomp_probe_mod = b.createModule(.{
+        .root_source_file = b.path("tools/seccomp_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    seccomp_probe_mod.addImport("seccomp", seccomp_mod);
+    const seccomp_probe = b.addExecutable(.{
+        .name = "seccomp-probe",
+        .root_module = seccomp_probe_mod,
+    });
+    check_step.dependOn(&seccomp_probe.step);
+
     const test_step = b.step("test", "run unit and integration tests for the selected profile");
     if (!no_compiler) {
         // Tests.
@@ -623,6 +640,7 @@ pub fn build(b: *std.Build) !void {
         } else {
             test_config.addOption([]const u8, "worker_address_space_fixture", "");
         }
+        test_config.addOptionPath("seccomp_probe", seccomp_probe.getEmittedBin());
         test_mod.addOptions("test_config", test_config);
         const unit_tests = b.addTest(.{ .root_module = test_mod });
         check_step.dependOn(&unit_tests.step);

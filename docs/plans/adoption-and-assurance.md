@@ -62,7 +62,17 @@ Semver freeze, migration notes, example gallery, announcements.
 
 ## Track B — assurance frontier
 
-### B1. Linux syscall confinement for workers (design notes)
+### B1. Linux syscall confinement for workers (shipped 2026-10-08)
+
+Implemented as designed: `mruby.seccomp` (hand-assembled classic-BPF
+allowlist from `std.os.linux.SYS`), a `syscall mode` byte in the worker
+protocol, helper installation before any guest byte (fail-closed), and
+controller prevalidation (`error.SyscallFilterUnavailable` off Linux).
+Denials return EPERM rather than killing the process. Tests: program-shape
+and denied-class unit tests (all platforms), the `seccomp-probe` fixture
+and a fully confined `runRite` roundtrip (Linux CI; validated locally in
+an arm64 Linux container). Landlock path restrictions remain the
+follow-up, as do network namespaces and uid separation (B3).
 
 Goal: turn "process and resource isolation" into an OS-enforced boundary.
 Constraints: no new system dependencies — the filter is raw BPF

@@ -195,6 +195,27 @@ declare that option and forward it as
   `error.WorkerFailed`. CPU and address-space ceilings apply to each process,
   not to aggregate usage across a descendant tree; descendants inherit the
   ceilings but receive their own accounting.
+- `ProcessLimits.confine_syscalls = true` (Linux) installs a kernel syscall
+  filter in the helper before any guest byte runs: a classic-BPF
+  `SECCOMP_SET_MODE_FILTER` program (see `mruby.seccomp`) allowing only the
+  runtime surface a worker legitimately needs — memory management, I/O on
+  already-open descriptors, clocks and sleeps, seed entropy, signal
+  hygiene, and exit. Two entries are argument-gated: `prlimit64` only with
+  a NULL new-limit (the helper's own-limit reads; guests cannot adjust
+  ceilings) and `ioctl` only for the `TCGETS` is-a-tty probe. Everything
+  else — opening or creating paths, sockets, process creation, privilege
+  changes — returns `EPERM` to the caller rather than killing the
+  process, so denials are observable from Ruby as `Errno` exceptions. The
+  filter is one-way (`PR_SET_NO_NEW_PRIVS` plus stacked filters can only add
+  restrictions). Non-Linux requests are rejected up front with
+  `error.SyscallFilterUnavailable`, and a helper that cannot install the
+  filter reports it rather than running unconfined. This turns the
+  authority manifest's "no filesystem/network/process gems" decision into
+  an enforced kernel boundary instead of a linked-set promise; the
+  allowlist also covers the helper's own protocol I/O, so a confined
+  roundtrip is functionally identical (`mruby.seccomp`'s tests plus the
+  `worker: confined syscalls` suite pin both the denials and the
+  roundtrip).
 - Controller death is demonstrated end-to-end by
   `zig build test-worker-orphan` (part of `zig build test` and
   `test-runtime-only`, so it runs in both compiler profiles on Linux and

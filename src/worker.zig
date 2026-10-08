@@ -28,6 +28,10 @@ pub const ProcessLimits = struct {
     wall_time_ns: u64 = 30 * std.time.ns_per_s,
     cpu_seconds: u32 = 30,
     address_space: AddressSpaceLimit = .unbounded,
+    /// Install the Linux seccomp allowlist in the helper before any guest
+    /// byte runs (see `mruby.seccomp`). Unsupported elsewhere; surfaced,
+    /// never pretended.
+    confine_syscalls: bool = false,
 };
 
 pub const Input = struct {
@@ -123,6 +127,7 @@ pub const RunError = std.mem.Allocator.Error || error{
     InvalidOptions,
     UnsupportedApplicationBootstrap,
     HardMemoryLimitUnavailable,
+    SyscallFilterUnavailable,
     SpawnFailed,
     TransportFailure,
     ProtocolMismatch,
@@ -209,6 +214,9 @@ pub fn runRite(
             if (builtin.os.tag == .macos) return error.HardMemoryLimitUnavailable;
         },
     }
+    if (request.process.confine_syscalls and builtin.os.tag != .linux) {
+        return error.SyscallFilterUnavailable;
+    }
     if (!childWaitOwnershipAvailable()) return error.ChildReapingUnavailable;
     if (!brokenPipeProtected()) return error.BrokenPipeProtectionUnavailable;
 
@@ -225,6 +233,7 @@ pub fn runRite(
                 .unbounded => .unbounded,
                 .bytes => |bytes| .{ .bytes = bytes },
             },
+            .syscalls = if (request.process.confine_syscalls) .filtered else .unconfined,
         },
     }) catch |err| return switch (err) {
         error.BodyTooLarge, error.LengthOverflow => error.RequestTooLarge,
@@ -681,6 +690,7 @@ fn decodeReport(
         .worker_error => switch (response.header.detail) {
             .out_of_memory => return error.WorkerFailed,
             .hard_memory_limit_unavailable => return error.HardMemoryLimitUnavailable,
+            .syscall_filter_unavailable => return error.SyscallFilterUnavailable,
             .process_limit_setup_failed => return error.ProcessLimitSetupFailed,
             else => return error.WorkerFailed,
         },
