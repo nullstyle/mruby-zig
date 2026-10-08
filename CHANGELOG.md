@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 (2026-10-07)
 
 CodeDB phases 1–5 (see docs/artifacts.md and docs/plans/codedb.md):
 
