@@ -878,6 +878,45 @@ mrz_protected_get_args(mrb_state *mrb, const char *format, void **slots,
   return TRUE;
 }
 
+struct mrz_get_args_kw_context {
+  const char *format;
+  void **slots;
+  const char *const *names;
+  size_t names_len;
+  mrb_sym *syms;
+  mrb_int count;
+};
+
+static mrb_value
+mrz_get_args_kw_body(mrb_state *mrb, void *data)
+{
+  struct mrz_get_args_kw_context *context =
+    (struct mrz_get_args_kw_context*)data;
+  /* Symbol ids are per-mrb_state, so the keyword table is interned here,
+   * inside the protection frame: interning can allocate and therefore
+   * raise, and it must not longjmp out of the Zig callback. */
+  for (size_t i = 0; i < context->names_len; i++) {
+    context->syms[i] = mrb_intern_cstr(mrb, context->names[i]);
+  }
+  context->count = mrb_get_args_a(mrb, context->format, context->slots);
+  return mrb_nil_value();
+}
+
+mrb_bool
+mrz_protected_get_args_kw(mrb_state *mrb, const char *format, void **slots,
+                          const char *const *names, size_t names_len,
+                          mrb_sym *syms_out, mrb_int *out)
+{
+  struct mrz_get_args_kw_context context = {
+    format, slots, names, names_len, syms_out, 0,
+  };
+  if (!mrz_protect_result(mrb, mrz_get_args_kw_body, &context, NULL)) {
+    return FALSE;
+  }
+  if (out != NULL) *out = context.count;
+  return TRUE;
+}
+
 struct mrz_exception_context {
   const char *class_name;
   size_t class_name_length;

@@ -92,6 +92,34 @@ try math.defineMethod("scale", struct {
 }.call);
 ```
 
+Keyword arguments are a `KwArgs(T)` parameter carrying a plain struct:
+each field is a keyword named after it. Non-optional fields are required
+keywords (mruby raises `ArgumentError` when the caller omits one); `?T`
+fields are optional and receive `null`. Required fields must precede
+optional ones, and keyword values convert with the safe-layer semantics
+(checked integers, strict booleans, borrowed strings). Unknown keywords
+are rejected — `**rest` capture is not modeled yet:
+
+```zig
+try math.defineMethod("connect", struct {
+    fn call(vm: *mruby.Vm, self: mruby.Value, kw: mruby.KwArgs(struct {
+        host: []const u8,
+        port: i64,
+        timeout: ?i64,
+    })) anyerror!mruby.Value {
+        _ = self;
+        return vm.intValue(kw.values.port + (kw.values.timeout orelse 0));
+    }
+}.call);
+
+_ = try vm.loadString("ZigMath.new.connect(host: 'db', port: 9443, timeout: 30)");
+```
+
+`KwArgs` follows the positional parameters and may be followed by `Block`
+(`Rest` cannot yet be combined with it). Calling a Zig method with
+keywords from Zig (`CallOptions`) is not modeled yet — see the roadmap
+note in `docs/plans/adoption-and-assurance.md`.
+
 `defineMethodRaw` (plus `defineClassMethodRaw` / `defineModuleFunctionRaw`)
 takes an explicit `mrb_get_args` format string for protocols the derived
 form does not model — for example the `S` (String value) spec, or optional

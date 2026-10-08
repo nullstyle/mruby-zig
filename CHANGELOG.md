@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+Safe API:
+
+- Zig methods can now take Ruby keyword arguments: a `KwArgs(T)` callback
+  parameter carries a plain struct whose fields are the keywords.
+  Non-optional fields are required keywords (mruby raises `ArgumentError`
+  for a missing one); `?T` fields are optional and receive `null` when the
+  keyword is omitted. Keyword names intern inside the existing C
+  protection trampoline (a new `mrz_protected_get_args_kw` shim entry
+  point), values convert through the checked safe-layer conversions, and
+  unknown keywords are rejected (`**rest` capture is not modeled yet).
+  `KwArgs` follows positional parameters and may precede `Block`. Calling
+  a Ruby keyword method *from* Zig is still unsupported — the analysis and
+  options are recorded in docs/plans/adoption-and-assurance.md.
+
+Toolchain:
+
+- `zig build test` no longer flakes on
+  `sandbox: deadline is arbitrated after final native work` under loaded
+  CI runners: the test now builds its receiver before sealing (seal
+  starts the lifetime deadline clock) and uses 50ms/200ms margins.
+
 ## 0.5.0 (2026-10-07)
 
 CodeDB phases 1–5 (see docs/artifacts.md and docs/plans/codedb.md):

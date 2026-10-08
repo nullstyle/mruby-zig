@@ -26,6 +26,17 @@
 //! Optional parameters must follow the required ones; `Rest` and `Block`
 //! come last.
 //!
+//! Keyword arguments are declared as a `KwArgs(T)` parameter, where `T` is
+//! a plain struct: each field is a keyword named after it, non-optional
+//! fields are required keywords, and `?T` fields are optional (`null` when
+//! the keyword was omitted). Required fields must precede optional ones, so
+//! the field order is the mrb_get_args keyword-table order. Keyword values
+//! use the safe-layer conversion semantics (checked integers, strict
+//! booleans, borrowed strings). A missing required keyword or an unknown
+//! keyword raises Ruby `ArgumentError`; `**rest` capture is not modeled yet.
+//! `KwArgs` follows the positional parameters and may be followed by
+//! `Block` (not `Rest`).
+//!
 //! String parameters are **borrowed**: the backing memory lives on the Ruby
 //! heap and is valid only until the callback's next call into the
 //! interpreter; copy anything you keep.
@@ -43,6 +54,7 @@
 
 const std = @import("std");
 const c = @import("c.zig");
+const convert = @import("convert.zig");
 const value_mod = @import("value.zig");
 const vm_mod = @import("vm.zig");
 
@@ -71,6 +83,64 @@ pub const Block = struct {
         return !self.value.isNil();
     }
 };
+
+/// Keyword arguments (`:`): the caller's keywords unmarshalled into the
+/// fields of `T` (see the module docs for the field rules).
+pub fn KwArgs(comptime T: type) type {
+    return struct {
+        pub const mrz_kwargs_marker = true;
+
+        values: T,
+    };
+}
+
+fn isKwArgs(comptime T: type) bool {
+    if (@typeInfo(T) != .@"struct") return false;
+    if (!@hasDecl(T, "mrz_kwargs_marker")) return false;
+    return T.mrz_kwargs_marker;
+}
+
+/// The keyword struct carried by a `KwArgs(T)` parameter.
+fn kwArgsStruct(comptime T: type) type {
+    return @FieldType(T, "values");
+}
+
+/// Comptime validation of a keyword struct: every field maps to a supported
+/// spec, and required fields precede optional ones (mruby's keyword table
+/// requires the required keywords first).
+fn validateKwStruct(comptime T: type) void {
+    const info = @typeInfo(T);
+    if (info != .@"struct") {
+        @compileError("KwArgs parameter must be KwArgs(<plain struct>), got " ++ @typeName(T));
+    }
+    comptime var seen_optional = false;
+    inline for (info.@"struct".field_names, info.@"struct".field_types) |name, ft| {
+        switch (@typeInfo(ft)) {
+            .optional => |opt| {
+                seen_optional = true;
+                _ = specChar(opt.child);
+            },
+            else => {
+                if (seen_optional) {
+                    @compileError("KwArgs field '" ++ name ++ "': required keyword fields must precede optional (?T) fields");
+                }
+                _ = specChar(ft);
+            },
+        }
+    }
+}
+
+fn kwFieldCount(comptime T: type) usize {
+    return @typeInfo(T).@"struct".field_names.len;
+}
+
+fn kwRequiredCount(comptime T: type) usize {
+    comptime var n: usize = 0;
+    inline for (@typeInfo(T).@"struct".field_types) |ft| {
+        if (@typeInfo(ft) != .optional) n += 1;
+    }
+    return n;
+}
 
 pub const Class = struct {
     mrb: *c.mrb_state,
@@ -104,7 +174,7 @@ pub const Class = struct {
             name.ptr,
             name.len,
             wrap.cCall,
-            aspec(sig.fmt),
+            aspec(sig.fmt, sig.kw),
             c.MRZ_METHOD_INSTANCE,
         )) return error.RubyException;
     }
@@ -121,7 +191,7 @@ pub const Class = struct {
             name.ptr,
             name.len,
             wrap.cCall,
-            aspec(fmt),
+            aspec(fmt, null),
             c.MRZ_METHOD_INSTANCE,
         )) return error.RubyException;
     }
@@ -136,7 +206,7 @@ pub const Class = struct {
             name.ptr,
             name.len,
             wrap.cCall,
-            aspec(sig.fmt),
+            aspec(sig.fmt, sig.kw),
             c.MRZ_METHOD_CLASS,
         )) return error.RubyException;
     }
@@ -150,7 +220,7 @@ pub const Class = struct {
             name.ptr,
             name.len,
             wrap.cCall,
-            aspec(fmt),
+            aspec(fmt, null),
             c.MRZ_METHOD_CLASS,
         )) return error.RubyException;
     }
@@ -165,7 +235,7 @@ pub const Class = struct {
             name.ptr,
             name.len,
             wrap.cCall,
-            aspec(sig.fmt),
+            aspec(sig.fmt, sig.kw),
             c.MRZ_METHOD_MODULE_FUNCTION,
         )) return error.RubyException;
     }
@@ -179,7 +249,7 @@ pub const Class = struct {
             name.ptr,
             name.len,
             wrap.cCall,
-            aspec(fmt),
+            aspec(fmt, null),
             c.MRZ_METHOD_MODULE_FUNCTION,
         )) return error.RubyException;
     }
@@ -259,7 +329,7 @@ fn classFromRaw(mrb: *c.mrb_state, value: c.mrb_value) !Class {
     return .{ .mrb = mrb, .class = @ptrCast(@alignCast(ptr)) };
 }
 
-fn aspec(comptime fmt: []const u8) c.mrb_aspec {
+fn aspec(comptime fmt: []const u8, comptime kw: ?type) c.mrb_aspec {
     var req: u32 = 0;
     var opt: u32 = 0;
     var rest = false;
@@ -269,6 +339,12 @@ fn aspec(comptime fmt: []const u8) c.mrb_aspec {
         '|' => optional = true,
         '*' => rest = true,
         '&' => block = true,
+        // The keyword spec contributes MRB_ARGS_KEY below, not a
+        // positional slot: cfunc argument-count checks run against this
+        // aspec (check_argument_count), where a bogus required slot both
+        // rejects keyword-only calls with no keywords and mis-accepts
+        // keyword calls as satisfying a positional requirement.
+        ':' => {},
         else => {
             if (optional) opt += 1 else req += 1;
         },
@@ -278,10 +354,19 @@ fn aspec(comptime fmt: []const u8) c.mrb_aspec {
     if (opt > 0) a |= opt << 13; // MRB_ARGS_OPT
     if (rest) a |= c.MRB_ARGS_REST;
     if (block) a |= c.MRB_ARGS_BLOCK;
+    if (kw) |T| {
+        // MRB_ARGS_KEY(required, dict): the KDICT bit marks the method as
+        // keyword-accepting even when every keyword is optional, so the
+        // caller's keyword hash is never counted as a positional argument.
+        // Unknown-keyword strictness lives in mrb_get_args (rest == null).
+        const required = comptime kwRequiredCount(T);
+        a |= (required & 0x1f) << 2; // MRB_ARGS_KEY count
+        a |= 1 << 1; // MRB_ARGS_KDICT
+    }
     return a;
 }
 
-const Spec = enum { int_, float, boolean, nsymbol, object, zstring, stringval, rstring, block, rest };
+const Spec = enum { int_, float, boolean, nsymbol, object, zstring, stringval, rstring, block, rest, kwargs };
 
 fn parseSpecs(comptime fmt: []const u8) []const Spec {
     comptime var specs: []const Spec = &.{};
@@ -296,6 +381,7 @@ fn parseSpecs(comptime fmt: []const u8) []const Spec {
         's' => specs = specs ++ .{.rstring},
         '&' => specs = specs ++ .{.block},
         '*' => specs = specs ++ .{.rest},
+        ':' => specs = specs ++ .{.kwargs},
         '|' => {},
         else => @compileError("unsupported mrb_get_args format char '" ++ [1]u8{ch} ++ "'"),
     };
@@ -366,7 +452,7 @@ fn ArgSlots(comptime specs: []const Spec) type {
             unreachable;
         }
 
-        fn fillPtrs(self: *Self, ptrs: *[total_slots]?*anyopaque) void {
+        fn fillPtrs(self: *Self, ptrs: *[total_slots]?*anyopaque, kw: ?*anyopaque) void {
             var pi: usize = 0;
             inline for (specs, 0..) |s, i| switch (s) {
                 .int_ => {
@@ -413,6 +499,10 @@ fn ArgSlots(comptime specs: []const Spec) type {
                     ptrs[pi + 1] = @ptrCast(&self.rest_lens[o]);
                     pi += 2;
                 },
+                .kwargs => {
+                    ptrs[pi] = kw;
+                    pi += 1;
+                },
             };
         }
     };
@@ -431,6 +521,7 @@ fn SpecValue(comptime spec: Spec) type {
         .rstring => []const u8,
         .block => Value,
         .rest => Rest,
+        .kwargs => @compileError("kwargs values are built by kwParam, not extractSpec"),
     };
 }
 
@@ -475,6 +566,10 @@ fn extractSpec(
             const p = slots.rests[o] orelse break :blk Rest{ .base = undefined, .mrb = vm.mrb, .len = 0 };
             break :blk Rest{ .base = p, .mrb = vm.mrb, .len = @intCast(slots.rest_lens[o]) };
         },
+        // The derived builder constructs KwArgs parameters from the keyword
+        // value array before extractSpec runs; this arm exists only for
+        // switch exhaustiveness.
+        .kwargs => unreachable,
     };
 }
 
@@ -515,6 +610,8 @@ const DerivedSignature = struct {
     required: usize,
     /// Total number of optional specs (after the `|`).
     optional: usize,
+    /// The keyword struct of a `KwArgs(T)` parameter, if any.
+    kw: ?type,
 };
 
 fn specChar(comptime T: type) []const u8 {
@@ -555,11 +652,14 @@ fn deriveSignature(comptime func: anytype) DerivedSignature {
     comptime var seen_optional = false;
     comptime var seen_rest = false;
     comptime var seen_block = false;
+    comptime var seen_kw = false;
+    comptime var kw: ?type = null;
     inline for (F.param_types[2..]) |p| {
         const T = p.?;
         if (T == Rest) {
             if (seen_rest) @compileError("at most one Rest parameter is allowed");
             if (seen_block) @compileError("Rest must precede Block");
+            if (seen_kw) @compileError("Rest cannot yet be combined with KwArgs");
             fmt = fmt ++ "*";
             seen_rest = true;
             continue;
@@ -570,11 +670,21 @@ fn deriveSignature(comptime func: anytype) DerivedSignature {
             seen_block = true;
             continue;
         }
+        if (comptime isKwArgs(T)) {
+            if (seen_kw) @compileError("at most one KwArgs parameter is allowed");
+            if (seen_rest or seen_block) @compileError("KwArgs must precede Rest and Block");
+            kw = kwArgsStruct(T);
+            validateKwStruct(kw.?);
+            fmt = fmt ++ ":";
+            seen_kw = true;
+            continue;
+        }
         switch (@typeInfo(T)) {
             .optional => |opt| {
                 if (seen_rest or seen_block) {
                     @compileError("optional parameters must precede Rest and Block");
                 }
+                if (seen_kw) @compileError("positional parameters must precede KwArgs");
                 if (!seen_optional) {
                     fmt = fmt ++ "|";
                     seen_optional = true;
@@ -585,15 +695,19 @@ fn deriveSignature(comptime func: anytype) DerivedSignature {
             else => {
                 if (seen_optional) @compileError("required parameters must precede optional parameters");
                 if (seen_rest or seen_block) @compileError("required parameters must precede Rest and Block");
+                if (seen_kw) @compileError("positional parameters must precede KwArgs");
                 fmt = fmt ++ specChar(T);
                 required += 1;
             },
         }
     }
-    return .{ .fmt = fmt, .required = required, .optional = optional };
+    return .{ .fmt = fmt, .required = required, .optional = optional, .kw = kw };
 }
 
 fn Wrap(comptime fmt: []const u8, comptime func: anytype) type {
+    comptime if (std.mem.indexOfScalar(u8, fmt, ':') != null) {
+        @compileError("raw format strings do not model the ':' keyword spec; use a KwArgs(T) parameter with the derived form");
+    };
     return CallbackShell(struct {
         fn invoke(m: *c.mrb_state, self_v: c.mrb_value) !c.mrb_value {
             const vm = Vm.fromMrb(m);
@@ -603,7 +717,7 @@ fn Wrap(comptime fmt: []const u8, comptime func: anytype) type {
 
             var slots: ArgSlots(specs) = ArgSlots(specs).init();
             var ptrs: [ArgSlots(specs).total_slots]?*anyopaque = @splat(null);
-            slots.fillPtrs(&ptrs);
+            slots.fillPtrs(&ptrs, null);
             var parsed: c.mrb_int = 0;
             if (!c.mrz_protected_get_args(
                 m,
@@ -643,28 +757,71 @@ fn Wrap(comptime fmt: []const u8, comptime func: anytype) type {
 /// Marshalling for derived signatures: each parameter receives its declared
 /// type, with `?T` optionals receiving `null` when the caller omitted them
 /// (presence follows from the parsed argument count: optional k is present
-/// iff `argc > required + k`, with Rest absorbing any excess).
+/// iff `argc > required + k`, with Rest absorbing any excess). A `KwArgs(T)`
+/// parameter receives `T` built from the keyword values.
 fn WrapDerived(comptime func: anytype) type {
     const sig = deriveSignature(func);
+    const specs = comptime parseSpecs(sig.fmt);
+    const fmtz = comptime sig.fmt ++ "\x00";
+
+    // Keyword plumbing for a `KwArgs(T)` parameter: field names as C
+    // strings (field order is the keyword-table order; required first is
+    // enforced at derivation), the interned symbol table, and the mrb_kwargs
+    // descriptor pointing at both.
+    const kw_names: ?[if (sig.kw) |T| kwFieldCount(T) else 0][*:0]const u8 = blk: {
+        const T = sig.kw orelse break :blk null;
+        var names: [kwFieldCount(T)][*:0]const u8 = undefined;
+        for (@typeInfo(T).@"struct".field_names, 0..) |name, i| {
+            names[i] = name;
+        }
+        break :blk names;
+    };
+
     return CallbackShell(struct {
         fn invoke(m: *c.mrb_state, self_v: c.mrb_value) !c.mrb_value {
             const vm = Vm.fromMrb(m);
             const self_val = Value{ .mrb = m, .v = self_v };
-            const specs = comptime parseSpecs(sig.fmt);
-            const fmtz = comptime sig.fmt ++ "\x00";
 
             var slots: ArgSlots(specs) = ArgSlots(specs).init();
+            var kw_syms: [if (sig.kw) |T| kwFieldCount(T) else 0]c.mrb_sym = @splat(0);
+            var kw_values: [if (sig.kw) |T| kwFieldCount(T) else 0]c.mrb_value = @splat(c.mrz_nil_value());
+            var kw_desc: c.mrb_kwargs = .{
+                .num = 0,
+                .required = 0,
+                .table = null,
+                .values = null,
+                .rest = null,
+            };
+            if (sig.kw != null) {
+                kw_desc = .{
+                    .num = @intCast(kw_syms.len),
+                    .required = @intCast(comptime kwRequiredCount(sig.kw.?)),
+                    .table = &kw_syms,
+                    .values = &kw_values,
+                    // No **rest capture: unknown keywords raise ArgumentError.
+                    .rest = null,
+                };
+            }
             var ptrs: [ArgSlots(specs).total_slots]?*anyopaque = @splat(null);
-            slots.fillPtrs(&ptrs);
+            slots.fillPtrs(&ptrs, if (sig.kw != null) @ptrCast(&kw_desc) else null);
             var parsed: c.mrb_int = 0;
-            if (!c.mrz_protected_get_args(
+            const ok = if (sig.kw != null) c.mrz_protected_get_args_kw(
+                m,
+                @ptrCast(fmtz.ptr),
+                ptrs[0..].ptr,
+                &kw_names.?,
+                kw_names.?.len,
+                &kw_syms,
+                &parsed,
+            ) else c.mrz_protected_get_args(
                 m,
                 @ptrCast(fmtz.ptr),
                 ptrs[0..].ptr,
                 &parsed,
-            )) return error.RubyException;
+            );
+            if (!ok) return error.RubyException;
 
-            const result: Value = try build(0, vm, &slots, parsed, .{ vm, self_val });
+            const result: Value = try build(0, vm, &slots, &kw_values, parsed, .{ vm, self_val });
             try result.ensureOwnedBy(m);
             return result.v;
         }
@@ -672,23 +829,49 @@ fn WrapDerived(comptime func: anytype) type {
         fn build(
             comptime i: usize,
             vm: *Vm,
-            slots: *ArgSlots(parseSpecs(sig.fmt)),
+            slots: *ArgSlots(specs),
+            kw_values: []const c.mrb_value,
             parsed: c.mrb_int,
             built: anytype,
         ) anyerror!Value {
-            const specs = comptime parseSpecs(sig.fmt);
             if (i == specs.len) return @call(.auto, func, built);
             const F = @typeInfo(@TypeOf(func)).@"fn";
             const P = F.param_types[i + 2].?;
-            const value = extractSpec(specs, i, vm, slots);
-            const wrapped: P = if (@typeInfo(P) == .optional) blk: {
-                const optional_ordinal = i - sig.required;
-                if (parsed > @as(c.mrb_int, @intCast(sig.required)) + @as(c.mrb_int, @intCast(optional_ordinal))) {
-                    break :blk value;
+            const wrapped: P = if (comptime isKwArgs(P)) blk: {
+                break :blk try kwParam(P, vm, kw_values);
+            } else blk: {
+                const value = extractSpec(specs, i, vm, slots);
+                if (@typeInfo(P) == .optional) {
+                    const optional_ordinal = i - sig.required;
+                    if (parsed > @as(c.mrb_int, @intCast(sig.required)) + @as(c.mrb_int, @intCast(optional_ordinal))) {
+                        break :blk value;
+                    }
+                    break :blk null;
                 }
-                break :blk null;
-            } else if (P == Block) Block{ .value = value } else value;
-            return build(i + 1, vm, slots, parsed, built ++ .{wrapped});
+                if (P == Block) break :blk Block{ .value = value };
+                break :blk value;
+            };
+            return build(i + 1, vm, slots, kw_values, parsed, built ++ .{wrapped});
         }
     }.invoke);
+}
+
+/// Build the `KwArgs(T)` argument from the raw keyword values mruby filled
+/// (field order == table order; undef marks an omitted optional keyword).
+fn kwParam(comptime P: type, vm: *Vm, kw_values: []const c.mrb_value) !P {
+    const T = kwArgsStruct(P);
+    var out: T = undefined;
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types, 0..) |name, ft, fi| {
+        // mruby raises for missing required keywords before the callback
+        // runs, so an undef slot here is an omitted optional keyword.
+        if (@typeInfo(ft) == .optional) {
+            @field(out, name) = if (c.mrz_undef_p(kw_values[fi]))
+                null
+            else
+                try convert.fromValue(ft, .{ .mrb = vm.mrb, .v = kw_values[fi] });
+        } else {
+            @field(out, name) = try convert.fromValue(ft, .{ .mrb = vm.mrb, .v = kw_values[fi] });
+        }
+    }
+    return .{ .values = out };
 }

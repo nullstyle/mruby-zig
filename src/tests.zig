@@ -457,6 +457,103 @@ test "define and call zig methods" {
     try std.testing.expectError(error.RubyException, vm.loadString("ZigMath.new.add('a', 'b')"));
 }
 
+test "keyword arguments reach zig methods" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    const Connect = struct {
+        host: []const u8,
+        port: i64,
+        timeout: ?i64,
+        verbose: ?bool,
+    };
+
+    const net = try vm.defineClass("ZigNet", null);
+    try net.defineMethod("connect", struct {
+        fn call(m: *mruby.Vm, self: mruby.Value, kw: mruby.KwArgs(Connect)) anyerror!mruby.Value {
+            _ = self;
+            const k = kw.values;
+            try std.testing.expect(k.verbose orelse false);
+            return m.intValue(k.port + (k.timeout orelse 0));
+        }
+    }.call);
+    try net.defineMethod("scale", struct {
+        fn call(m: *mruby.Vm, self: mruby.Value, base: i64, kw: mruby.KwArgs(struct {
+            factor: i64,
+            label: ?[]const u8,
+        })) anyerror!mruby.Value {
+            _ = self;
+            if (kw.values.label) |label| try std.testing.expectEqualStrings("six", label);
+            return m.intValue(base * kw.values.factor);
+        }
+    }.call);
+    try net.defineMethod("all_optional", struct {
+        fn call(m: *mruby.Vm, self: mruby.Value, kw: mruby.KwArgs(struct {
+            depth: ?i64,
+        })) anyerror!mruby.Value {
+            _ = self;
+            return m.intValue(kw.values.depth orelse -1);
+        }
+    }.call);
+    try net.defineMethod("with_block", struct {
+        fn call(m: *mruby.Vm, self: mruby.Value, kw: mruby.KwArgs(struct {
+            n: i64,
+        }), block: mruby.Block) anyerror!mruby.Value {
+            _ = self;
+            if (!block.isPresent()) return error.MissingBlock;
+            return m.intValue(kw.values.n);
+        }
+    }.call);
+
+    // Required and optional keywords, caller order independent of fields.
+    try std.testing.expectEqual(@as(i64, 9473), try (try vm.loadString(
+        "ZigNet.new.connect(host: 'db', port: 9443, timeout: 30, verbose: true)",
+    )).asInt());
+    try std.testing.expectEqual(@as(i64, 80), try (try vm.loadString(
+        "ZigNet.new.connect(port: 80, host: 'x', verbose: true)",
+    )).asInt());
+    // Positional parameters combine with keywords.
+    try std.testing.expectEqual(@as(i64, 42), try (try vm.loadString(
+        "ZigNet.new.scale(6, factor: 7, label: 'six')",
+    )).asInt());
+    // A method with only optional keywords is callable without any.
+    try std.testing.expectEqual(@as(i64, -1), try (try vm.loadString("ZigNet.new.all_optional")).asInt());
+    try std.testing.expectEqual(@as(i64, 3), try (try vm.loadString("ZigNet.new.all_optional(depth: 3)")).asInt());
+    // Keywords combine with a block parameter.
+    try std.testing.expectEqual(@as(i64, 5), try (try vm.loadString(
+        "ZigNet.new.with_block(n: 5) { |x| x }",
+    )).asInt());
+    try std.testing.expectError(error.RubyException, vm.loadString("ZigNet.new.with_block(n: 5)"));
+
+    // A missing required keyword is an mruby ArgumentError.
+    try std.testing.expectError(error.RubyException, vm.loadString("ZigNet.new.connect(host: 'db', verbose: true)"));
+    {
+        const exc = vm.lastError().?;
+        const class_name = try exc.className(std.testing.allocator);
+        defer std.testing.allocator.free(class_name);
+        try std.testing.expectEqualStrings("ArgumentError", class_name);
+    }
+    // An unknown keyword is rejected (no **rest capture).
+    try std.testing.expectError(error.RubyException, vm.loadString(
+        "ZigNet.new.connect(host: 'db', port: 1, verbose: true, bogus: 2)",
+    ));
+    {
+        const exc = vm.lastError().?;
+        const class_name = try exc.className(std.testing.allocator);
+        defer std.testing.allocator.free(class_name);
+        try std.testing.expectEqualStrings("ArgumentError", class_name);
+    }
+    // A keyword value of the wrong type surfaces the checked conversion
+    // error as a Ruby RuntimeError.
+    try std.testing.expectError(error.RubyException, vm.loadString("ZigNet.new.connect(port: 'nine', host: 'x')"));
+    {
+        const exc = vm.lastError().?;
+        const class_name = try exc.className(std.testing.allocator);
+        defer std.testing.allocator.free(class_name);
+        try std.testing.expectEqualStrings("RuntimeError", class_name);
+    }
+}
+
 test "blocks reach zig methods" {
     const vm = try mruby.Vm.init();
     defer vm.deinit();

@@ -399,6 +399,29 @@ pub extern fn mrz_protected_get_args(
     slots: [*]?*anyopaque,
     out: *mrb_int,
 ) bool;
+/// Keyword-argument descriptor consumed by mrb_get_args's `:` spec.
+/// `table` must list the required keywords first (mruby raises
+/// ArgumentError for a missing one); `values` is filled by mruby with
+/// `undef` for omitted optional keywords. `rest == null` rejects unknown
+/// keywords with ArgumentError.
+pub const mrb_kwargs = extern struct {
+    num: mrb_int,
+    required: mrb_int,
+    table: ?[*]const mrb_sym,
+    values: ?[*]mrb_value,
+    rest: ?*mrb_value,
+};
+/// Like `mrz_protected_get_args`, with keyword names interned inside the
+/// protection frame before mrb_get_args consumes the `:` slot.
+pub extern fn mrz_protected_get_args_kw(
+    mrb: *mrb_state,
+    format: [*:0]const u8,
+    slots: [*]?*anyopaque,
+    names: [*]const [*:0]const u8,
+    names_len: usize,
+    syms_out: [*]mrb_sym,
+    out: *mrb_int,
+) bool;
 pub extern fn mrz_protected_set_exception(
     mrb: *mrb_state,
     class_name: [*]const u8,
