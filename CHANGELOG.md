@@ -79,6 +79,15 @@ Toolchain:
   The Zig version is not a compatibility input: CodeDB manifests and
   RITE envelopes are byte-identical under both toolchains, so existing
   artifacts and capsules remain valid.
+- CI fuzz campaigns now run at `-Doptimize=ReleaseSafe` on every job.
+  Zig's fuzzer builds an empty coverage map for Debug test binaries on
+  Linux, so the build runner's report step failed with `corrupted
+  coverage file ... pcs_len was zero` — including every hosted run since
+  the fuzz targets landed, which had gone unnoticed because the weekly
+  scheduled failures raised no notification. Bisection on hosted Linux
+  runners confirmed the optimize mode is the only variable (gem set and
+  compiler profile are irrelevant); Debug remains fine on macOS. Tracked
+  upstream as part of the fuzz-testing rework (ziglang/zig#31205).
 
 ## 0.4.0 (2026-09-04)
 
