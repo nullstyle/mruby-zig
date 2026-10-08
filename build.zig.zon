@@ -10,14 +10,22 @@
         "examples",
         "tools",
         "docs",
+        "vendor",
         "LICENSE",
         "README.md",
         "CHANGELOG.md",
     },
     .dependencies = .{
         .mruby = .{
-            .url = "https://github.com/mruby/mruby/archive/refs/tags/4.0.0.tar.gz",
-            .hash = "N-V-__8AANTiWAB7SfrLfA6pKTaZPFOZT4biv9oK15dP3zUP",
+            .url = "https://github.com/mruby/mruby/archive/refs/tags/4.1.0-rc2.tar.gz",
+            .hash = "N-V-__8AAIoJdAA6N-S_kKnu2QVvxXGsdDTv0S0jjyeDtJV5",
+        },
+        // Prism's hand-written sources and headers; the template-generated
+        // files (node.c, ast.h, ...) are vendored under vendor/prism (see
+        // its MANIFEST.md) because generating them requires Ruby.
+        .prism = .{
+            .url = "https://github.com/ruby/prism/archive/c0e37816e97e23e92524a4070e1b99a4025bc63f.tar.gz",
+            .hash = "N-V-__8AAIhHlQAxbZzaFIz3dyJA0P2qi7pvxdMGx7RmPzVx",
         },
     },
 }

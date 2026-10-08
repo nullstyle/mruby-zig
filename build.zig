@@ -36,7 +36,7 @@ pub fn addCodeDB(b: *std.Build, dependency: *std.Build.Dependency, options: Code
     }, options);
 }
 
-const mruby_version = "4.0.0";
+const mruby_version = "4.1.0-rc2";
 const rite_binary_version = "04.00";
 const rite_vm_version = "0400";
 const portable_container_flags = &.{
@@ -111,6 +111,23 @@ pub fn build(b: *std.Build) !void {
     const arena = b.graph.arena;
     const mruby_dep = b.dependency("mruby", .{});
     const root = mruby_dep.path("");
+    // Prism's hand-written sources come from the pinned prism dependency
+    // (the mruby tarball's submodule is empty); its template-generated
+    // sources are vendored (see vendor/prism/c0e37816/MANIFEST.md).
+    const prism_dep = b.dependency("prism", .{});
+    const prism_root = prism_dep.path("");
+    const prism_gen_root = b.path("vendor/prism/c0e37816");
+    const compiler_include = try root.join(arena, "mrbgems/mruby-compiler/include");
+    const prism_include = try prism_root.join(arena, "include");
+    // prism/extension.h lives under the repository's ext/ root.
+    const prism_ext_include = try prism_root.join(arena, "ext");
+    const prism_gen_include = b.path("vendor/prism/c0e37816/include");
+    const prism_defines = [_][]const u8{
+        "-DMRC_TARGET_MRUBY",
+        "-DPRISM_XALLOCATOR",
+        "-DPRISM_DEPTH_MAXIMUM=256",
+        "-DPRISM_BUILD_MINIMAL",
+    };
 
     const selected_gems = try selectGems(arena, gem_set, with_gems, without_gems, no_compiler);
     const builtin_authority: []const authority.Source = if (no_compiler)
@@ -148,8 +165,13 @@ pub fn build(b: *std.Build) !void {
     const patched_hash = patchMrubyHash(b, arena, hash_patcher, root);
 
     // ============================= stage 1 =================================
-    // Presym headers for the host mrbc build: scan core (with allocf.c),
-    // compiler, and the mrbc tool itself.
+    // Presym headers for the host mrbc build. 4.1's mrbc.c is a
+    // self-contained program with its own allocator/symbol shims (no core
+    // objects are linked), but the mrc glue still includes <mruby.h>,
+    // whose presym.h needs the generated id.h/table.h. The mrc layer's own
+    // symbol table is the static mrc_presym.inc; the scan covers the glue
+    // and the tool so the generated headers match what they compile
+    // against (scanning mode bypasses id.h by design).
     const host_triple = try b.graph.host.result.zigTriple(arena);
 
     var mrbc_scan: std.ArrayList(ScanInput) = .empty;
@@ -158,7 +180,16 @@ pub fn build(b: *std.Build) !void {
     try addTreeFiles(arena, &mrbc_scan, root, &sources.compiler_srcs, "compiler");
     try addTreeFiles(arena, &mrbc_scan, root, &sources.mrbc_srcs, "mrbc");
 
-    const mrbc_presym_dir = try presymHeaders(b, presym_gen, arena, mrbc_scan.items, &.{}, root, host_triple);
+    const mrbc_presym_dir = try presymHeaders(
+        b,
+        presym_gen,
+        arena,
+        mrbc_scan.items,
+        &prism_defines,
+        root,
+        host_triple,
+        &.{ compiler_include, prism_include, prism_ext_include, prism_gen_include },
+    );
 
     // ============================= stage 2 =================================
     const mrbc_mod = b.createModule(.{
@@ -166,22 +197,42 @@ pub fn build(b: *std.Build) !void {
         .optimize = .ReleaseSafe,
         .link_libc = true,
     });
+    // 4.1's mrbc is self-contained: its mrbc.c carries the allocator and
+    // symbol shims it needs, so the tool links ONLY the mrc compiler glue,
+    // prism, and mrbc.c itself — no core library, matching upstream's rake
+    // (mrbc.c + compiler objects minus gem_init/mruby_compat).
     var mrbc_files: std.ArrayList([]const u8) = .empty;
-    try mrbc_files.appendSlice(arena, &sources.core_srcs);
-    try mrbc_files.append(arena, sources.allocf_src);
     try mrbc_files.appendSlice(arena, &sources.compiler_srcs);
     try mrbc_files.appendSlice(arena, &sources.mrbc_srcs);
+    const mrbc_flags: []const []const u8 = blk: {
+        var f: std.ArrayList([]const u8) = .empty;
+        try f.appendSlice(arena, &[_][]const u8{"-w"});
+        try f.appendSlice(arena, &prism_defines);
+        break :blk f.items;
+    };
     mrbc_mod.addCSourceFiles(.{
         .root = root,
         .files = mrbc_files.items,
-        .flags = &.{
-            "-w",
-            "-DMRB_STR_LENGTH_MAX=0",
-            "-DMRB_ARY_LENGTH_MAX=0",
-        },
+        .flags = mrbc_flags,
     });
+    mrbc_mod.addCSourceFiles(.{
+        .root = prism_root,
+        .files = &sources.prism_srcs,
+        .flags = mrbc_flags,
+    });
+    mrbc_mod.addCSourceFiles(.{
+        .root = prism_gen_root,
+        .files = &sources.prism_gen_srcs,
+        .flags = mrbc_flags,
+    });
+    // The mrc glue includes <mruby.h> for types (mrb_state, mrb_sym) even
+    // though this tool provides its own implementations of the functions.
     mrbc_mod.addIncludePath(try root.join(arena, "include"));
     mrbc_mod.addIncludePath(mrbc_presym_dir);
+    mrbc_mod.addIncludePath(compiler_include);
+    mrbc_mod.addIncludePath(prism_include);
+    mrbc_mod.addIncludePath(prism_ext_include);
+    mrbc_mod.addIncludePath(prism_gen_include);
     const mrbc = b.addExecutable(.{ .name = "mrbc", .root_module = mrbc_mod });
 
     // ============================= stage 3 =================================
@@ -253,7 +304,13 @@ pub fn build(b: *std.Build) !void {
             });
         }
     }
-    if (!no_compiler) try addTreeFiles(arena, &lib_scan, root, &sources.compiler_srcs, "compiler");
+    if (!no_compiler) {
+        try addTreeFiles(arena, &lib_scan, root, &sources.compiler_srcs, "compiler");
+        try lib_scan.append(arena, .{
+            .lp = try root.join(arena, sources.compiler_compat_src),
+            .pp_name = "compiler_mruby_compat.c.pp",
+        });
+    }
     var gem_include_dirs: std.ArrayList(std.Build.LazyPath) = .empty;
     for (selected_gems) |g| {
         for (g.c_srcs) |s| {
@@ -280,7 +337,16 @@ pub fn build(b: *std.Build) !void {
         try d.appendSlice(arena, ro_data_flags);
         break :defines d.items;
     };
-    const lib_presym_dir = try presymHeaders(b, presym_gen, arena, lib_scan.items, lib_scan_defines, root, triple);
+    const lib_presym_dir = try presymHeaders(
+        b,
+        presym_gen,
+        arena,
+        lib_scan.items,
+        lib_scan_defines,
+        root,
+        triple,
+        &.{ compiler_include, prism_include, prism_ext_include, prism_gen_include },
+    );
 
     // ============================= stage 5 =================================
     // The `mruby` module carries the entire C library (core + compiler +
@@ -405,9 +471,36 @@ pub fn build(b: *std.Build) !void {
     for (sources.core_srcs) |path| {
         if (!std.mem.eql(u8, path, "src/hash.c")) try lib_files.append(arena, path);
     }
-    if (!no_compiler) try lib_files.appendSlice(arena, &sources.compiler_srcs);
+    if (!no_compiler) {
+        try lib_files.appendSlice(arena, &sources.compiler_srcs);
+        try lib_files.append(arena, sources.compiler_compat_src);
+    }
     for (selected_gems) |g| try lib_files.appendSlice(arena, g.c_srcs);
     mruby_mod.addCSourceFiles(.{ .root = root, .files = lib_files.items, .flags = lib_flags });
+    if (!no_compiler) {
+        // Prism: hand-written sources from the pinned dependency plus the
+        // vendored template-generated sources, under the same flags.
+        const lib_prism_flags: []const []const u8 = blk: {
+            var f: std.ArrayList([]const u8) = .empty;
+            try f.appendSlice(arena, lib_flags);
+            try f.appendSlice(arena, &prism_defines);
+            break :blk f.items;
+        };
+        mruby_mod.addCSourceFiles(.{
+            .root = prism_root,
+            .files = &sources.prism_srcs,
+            .flags = lib_prism_flags,
+        });
+        mruby_mod.addCSourceFiles(.{
+            .root = prism_gen_root,
+            .files = &sources.prism_gen_srcs,
+            .flags = lib_prism_flags,
+        });
+        mruby_mod.addIncludePath(compiler_include);
+        mruby_mod.addIncludePath(prism_include);
+        mruby_mod.addIncludePath(prism_ext_include);
+        mruby_mod.addIncludePath(prism_gen_include);
+    }
     mruby_mod.addCSourceFile(.{ .file = patched_hash, .flags = lib_flags });
     // Generated sources (cache paths, not under the dependency root).
     for (generated_c.items) |g| {
@@ -1385,6 +1478,7 @@ fn presymHeaders(
     defines: []const []const u8,
     root: std.Build.LazyPath,
     triple: []const u8,
+    extra_include_dirs: []const std.Build.LazyPath,
 ) !std.Build.LazyPath {
     const include = try root.join(arena, "include");
     const run = b.addRunArtifact(presym_gen);
@@ -1395,6 +1489,9 @@ fn presymHeaders(
         cmd.addPrefixedDirectoryArg("-I", include);
         for (in.includes) |dir| {
             cmd.addPrefixedDirectoryArg("-I", try root.join(arena, dir));
+        }
+        for (extra_include_dirs) |dir| {
+            cmd.addPrefixedDirectoryArg("-I", dir);
         }
         for (defines) |d| cmd.addArg(d);
         cmd.addFileArg(in.lp);

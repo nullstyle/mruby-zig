@@ -1,8 +1,12 @@
-//! mruby 4.0.0 source inventory.
+//! mruby 4.1.0-rc2 source inventory.
 //!
-//! Paths are relative to the root of the mruby dependency tree. The lists
-//! mirror what `tasks/core.rake`, `tasks/mrblib.rake`, and
-//! `mrbgems/mruby-compiler/mrbgem.rake` compile in the upstream Rake build.
+//! Paths are relative to the root of the mruby dependency tree unless a
+//! list says otherwise. The lists mirror what `tasks/core.rake`,
+//! `tasks/mrblib.rake`, and `mrbgems/mruby-compiler/mrbgem.rake` compile
+//! in the upstream Rake build. 4.1 moved the parser to Prism (a separate
+//! pinned dependency for its hand-written sources; the template-generated
+//! sources are vendored under `vendor/prism` because generating them
+//! requires Ruby).
 
 /// Core interpreter sources compiled into libmruby.
 ///
@@ -13,7 +17,6 @@
 pub const core_srcs = [_][]const u8{
     "src/array.c",
     "src/backtrace.c",
-    "src/cdump.c",
     "src/class.c",
     "src/codedump.c",
     "src/debug.c",
@@ -21,7 +24,7 @@ pub const core_srcs = [_][]const u8{
     "src/enum.c",
     "src/error.c",
     "src/etc.c",
-    "src/fmt_fp.c",
+    "src/fp_uscale.c",
     "src/gc.c",
     "src/hash.c",
     "src/init.c",
@@ -34,12 +37,12 @@ pub const core_srcs = [_][]const u8{
     "src/print.c",
     "src/proc.c",
     "src/range.c",
-    "src/readfloat.c",
     "src/readint.c",
     "src/readnum.c",
     "src/state.c",
     "src/string.c",
     "src/symbol.c",
+    "src/unicase.c",
     "src/variable.c",
     "src/version.c",
     "src/vm.c",
@@ -48,18 +51,66 @@ pub const core_srcs = [_][]const u8{
 /// The default allocator, used only by the host `mrbc` tool.
 pub const allocf_src = "src/allocf.c";
 
-/// Parser + codegen (`mrbgems/mruby-compiler`); required by `mrb_load_string`.
-/// `y.tab.c` and `lex.def` are committed upstream; no bison/gperf needed.
+/// Parser + codegen glue (`mrbgems/mruby-compiler/src`). Prism replaced
+/// bison: there is no y.tab.c. `mruby_compat.c` is excluded from the host
+/// `mrbc` link exactly as upstream's rake does (the tool links without the
+/// objects that reference gem initialization, replacing 4.0's stub.c).
 pub const compiler_srcs = [_][]const u8{
-    "mrbgems/mruby-compiler/core/codegen.c",
-    "mrbgems/mruby-compiler/core/y.tab.c",
+    "mrbgems/mruby-compiler/src/ccontext.c",
+    "mrbgems/mruby-compiler/src/cdump.c",
+    "mrbgems/mruby-compiler/src/codedump.c",
+    "mrbgems/mruby-compiler/src/codegen.c",
+    "mrbgems/mruby-compiler/src/compile.c",
+    "mrbgems/mruby-compiler/src/debug.c",
+    "mrbgems/mruby-compiler/src/diagnostic.c",
+    "mrbgems/mruby-compiler/src/dump.c",
+    "mrbgems/mruby-compiler/src/irep.c",
+    "mrbgems/mruby-compiler/src/mrc_presym.c",
+    "mrbgems/mruby-compiler/src/parser_util.c",
+    "mrbgems/mruby-compiler/src/pool.c",
 };
 
-/// The `mrbc` cross-compiler tool (`mrbgems/mruby-bin-mrbc`). Its checked-in
-/// empty `mrb_init_mrblib`/`mrb_init_mrbgems` stubs break the bootstrap cycle.
+/// `mruby_compat.c` (linked into the library, never the host mrbc).
+pub const compiler_compat_src = "mrbgems/mruby-compiler/src/mruby_compat.c";
+
+/// Prism's hand-written sources, relative to the root of the pinned prism
+/// dependency (see build.zig.zon; the submodule is empty in release
+/// tarballs).
+pub const prism_srcs = [_][]const u8{
+    "src/encoding.c",
+    "src/options.c",
+    "src/pack.c",
+    "src/prism.c",
+    "src/regexp.c",
+    "src/static_literals.c",
+    "src/util/pm_buffer.c",
+    "src/util/pm_char.c",
+    "src/util/pm_constant_pool.c",
+    "src/util/pm_integer.c",
+    "src/util/pm_list.c",
+    "src/util/pm_memchr.c",
+    "src/util/pm_newline_list.c",
+    "src/util/pm_string.c",
+    "src/util/pm_strncasecmp.c",
+    "src/util/pm_strpbrk.c",
+};
+
+/// Prism's template-generated sources, relative to this repository's
+/// `vendor/prism/<pin>` root. Upstream regenerates them with Ruby at build
+/// time; see vendor/prism/c0e37816/MANIFEST.md.
+pub const prism_gen_srcs = [_][]const u8{
+    "src/diagnostic.c",
+    "src/node.c",
+    "src/prettyprint.c",
+    "src/serialize.c",
+    "src/token_type.c",
+};
+
+/// The `mrbc` cross-compiler tool (`mrbgems/mruby-bin-mrbc`). 4.1 removed
+/// the 4.0 stub.c bootstrap; the link omits gem_init and mruby_compat
+/// objects instead (mruby-bin-mrbc/mrbgem.rake).
 pub const mrbc_srcs = [_][]const u8{
     "mrbgems/mruby-bin-mrbc/tools/mrbc/mrbc.c",
-    "mrbgems/mruby-bin-mrbc/tools/mrbc/stub.c",
 };
 
 /// Core Ruby-level library, sorted by filename (load order matters).
