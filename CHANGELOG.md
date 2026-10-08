@@ -4,6 +4,16 @@
 
 Safe API:
 
+- Symbol-cached dispatch: `mruby.Symbol` (`Vm.internSymbol`) +
+  `Vm.callSymbol`/`callSymbolWithOptions` skip the per-call name interning
+  of `Vm.call` via a new `mrz_protected_funcall_with_block_id` trampoline.
+  Symbols are per-interpreter like values.
+- **Breaking (type-level):** safe-layer `Vm` operations now declare the
+  named error set `mruby.VmError` instead of inferred sets. Callers using
+  `catch`/`try` are unaffected; callers that named a wider set themselves
+  may need `mruby.VmError`. Method callbacks still return
+  `anyerror!Value`.
+
 - **Breaking:** `Vm.lastInitFailure` (process-global, thread-unsafe) is
   replaced by `Vm.initWithFailure(?*InitFailure)`: pass a caller-owned
   `Vm.InitFailure` and read `message()` after `error.InitFailed`.

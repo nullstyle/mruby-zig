@@ -227,6 +227,15 @@ pub extern fn mrz_protected_funcall_with_block(
     block: mrb_value,
     out: *mrb_value,
 ) bool;
+pub extern fn mrz_protected_funcall_with_block_id(
+    mrb: *mrb_state,
+    receiver: mrb_value,
+    method: mrb_sym,
+    argc: mrb_int,
+    argv: [*]const mrb_value,
+    block: mrb_value,
+    out: *mrb_value,
+) bool;
 pub extern fn mrz_protected_funcall_preserve_error(
     mrb: *mrb_state,
     receiver: mrb_value,

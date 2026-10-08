@@ -655,6 +655,51 @@ test "stored procs are callable from zig" {
     }
 }
 
+test "symbol-cached dispatch skips per-call interning" {
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+
+    const up = try vm.internSymbol("upcase");
+    try std.testing.expectEqualStrings("upcase", vm.symbolName(up));
+
+    const s = try vm.stringValue("shout");
+    const r = try vm.callSymbol(s, up, .{});
+    try std.testing.expectEqualStrings("SHOUT", try r.asString());
+    // Blocks ride along on the symbol path too.
+    const each = try vm.internSymbol("each");
+    const items = try vm.loadString("[1, 2, 3]");
+    _ = try vm.callSymbolWithOptions(items, each, .{}, .{
+        .block = try vm.loadString("->(x) { x }"),
+    });
+    // An unknown symbol names an arbitrary method: NoMethodError.
+    try std.testing.expectError(error.RubyException, vm.callSymbol(s, 999_999, .{}));
+}
+
+test "the named Vm error set bounds safe-layer operations" {
+    // A consumer can type handlers against mruby.VmError alone; if a
+    // safe-layer operation ever grows a new error, this fails to compile.
+    const vm = try mruby.Vm.init();
+    defer vm.deinit();
+    const outcome = exercise(vm) catch |err| switch (err) {
+        error.RubyException => return, // fresh VM: loadString may raise
+        else => |e| return e,
+    };
+    try std.testing.expect(outcome >= 0);
+}
+
+fn exercise(vm: *mruby.Vm) mruby.VmError!i64 {
+    const v = try vm.loadString("40 + 2");
+    const cls = try vm.defineClass("ErrorSetProbe", null);
+    _ = cls;
+    try vm.setGlobal("probe", v);
+    const g = try vm.getGlobal("probe");
+    const sym = try vm.internSymbol("to_i");
+    const n = try vm.callSymbol(g, sym, .{});
+    // asInt's errors (Overflow, TypeMismatch) are members of VmError; a
+    // new error on any of these operations fails this function's type.
+    return try n.asInt();
+}
+
 test "blocks reach zig methods" {
     const vm = try mruby.Vm.init();
     defer vm.deinit();

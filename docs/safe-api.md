@@ -184,6 +184,17 @@ The positional argument tuple has no fixed eight-argument cap.
 `callWithOptions` additionally accepts an optional Ruby block and enforces the
 same VM ownership rule for that block.
 
+Hot paths can skip the per-call name lookup: intern once with
+`vm.internSymbol(name)` and dispatch with `vm.callSymbol` /
+`callSymbolWithOptions`. Symbols are per-interpreter like values — an id
+from another `Vm` names an arbitrary method.
+
+Safe-layer VM operations share the named error set `mruby.VmError`:
+`RubyException` for anything Ruby raised (inspect with `vm.lastError()`),
+plus checked precondition/identity/capability failures (`ForeignValue`,
+`InvalidSource`, `Overflow`, ...). Hosts can type handlers against the set
+alone; growing it is a breaking change.
+
 Stored procs are ordinary `Value`s — call them with `call` on `"call"`,
 which preserves Ruby's lambda/proc semantics (lambdas check arity; procs
 keep their captured `self` and tolerate extra arguments):

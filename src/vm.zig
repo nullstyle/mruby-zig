@@ -49,6 +49,31 @@ fn registryUnlock() void {
     registry_lock.store(false, .release);
 }
 
+/// A method or variable symbol id. Symbols belong to one interpreter, like
+/// values: intern once with `Vm.internSymbol` and reuse the id for
+/// `Vm.callSymbol` dispatch without per-call name lookups.
+pub const Symbol = u32;
+
+/// The error set of the safe-layer VM operations. Ruby exceptions are
+/// always `RubyException` (inspect with `lastError`); every other member is
+/// a checked precondition, identity, or capacity failure. (Method
+/// callbacks still return `anyerror!Value`: a callback's own errors are the
+/// host application's vocabulary, promoted to `RuntimeError` by the shell.)
+pub const Error = error{
+    RubyException,
+    OutOfMemory,
+    InitFailed,
+    ForeignValue,
+    InvalidSource,
+    InvalidSourceName,
+    CompilerUnavailable,
+    NameTooLong,
+    TooManyArguments,
+    UnknownClass,
+    Overflow,
+    TypeMismatch,
+};
+
 /// An mruby virtual machine. One per Ruby isolate; a single Vm must not be
 /// used from multiple threads simultaneously (like MRI).
 pub const Vm = struct {
@@ -83,13 +108,13 @@ pub const Vm = struct {
 
     /// Create a new interpreter. Fails on out-of-memory or if initialization
     /// raises (see `mruby.alloc.setAllocator` for the allocator).
-    pub fn init() !*Vm {
+    pub fn init() Error!*Vm {
         return Vm.initWithFailure(null);
     }
 
     /// Like `init`, with a caller-owned diagnostic filled when
     /// initialization raises (`error.InitFailed`).
-    pub fn initWithFailure(failure: ?*InitFailure) !*Vm {
+    pub fn initWithFailure(failure: ?*InitFailure) Error!*Vm {
         const mrb = c.mrb_open() orelse return error.OutOfMemory;
         errdefer c.mrb_close(mrb);
         if (!c.mrz_nil_p(c.mrz_exc_value(mrb))) {
@@ -148,7 +173,7 @@ pub const Vm = struct {
     /// evaluating only the prefix visible to mruby's lexer.
     /// Returns `error.CompilerUnavailable` in a `-Dno-compiler` build.
     /// Runtime-only builds return `error.CompilerUnavailable`.
-    pub fn loadString(vm: *Vm, src: []const u8) !Value {
+    pub fn loadString(vm: *Vm, src: []const u8) Error!Value {
         return vm.loadStringWithOptions(src, .{});
     }
 
@@ -157,7 +182,7 @@ pub const Vm = struct {
         vm: *Vm,
         src: []const u8,
         options: LoadOptions,
-    ) !Value {
+    ) Error!Value {
         if (comptime !features.has_compiler) return error.CompilerUnavailable;
         if (std.mem.indexOfScalar(u8, src, 0) != null) return error.InvalidSource;
         if (options.source_name) |source_name| {
@@ -207,7 +232,7 @@ pub const Vm = struct {
     /// is reported as `error.RubyException` (never returned as a value), and
     /// the pending exception is left set for `lastError()` rather than
     /// leaking into the next call.
-    pub fn loadIrep(vm: *Vm, image: []const u8) !Value {
+    pub fn loadIrep(vm: *Vm, image: []const u8) Error!Value {
         var v: c.mrb_value = undefined;
         if (!c.mrz_protected_load_irep(vm.mrb, image.ptr, image.len, &v))
             return error.RubyException;
@@ -219,7 +244,7 @@ pub const Vm = struct {
     /// Call `name` on `recv` with positional arguments (any type accepted by
     /// `convert.toValue`). Exceptions are reported as `error.RubyException`
     /// (never longjmp into Zig frames).
-    pub fn call(vm: *Vm, recv: Value, name: []const u8, args: anytype) !Value {
+    pub fn call(vm: *Vm, recv: Value, name: []const u8, args: anytype) Error!Value {
         return vm.callWithOptions(recv, name, args, .{});
     }
 
@@ -230,7 +255,7 @@ pub const Vm = struct {
         name: []const u8,
         args: anytype,
         options: CallOptions,
-    ) !Value {
+    ) Error!Value {
         try recv.ensureOwnedBy(vm.mrb);
         if (options.block) |block| try block.ensureOwnedBy(vm.mrb);
 
@@ -263,13 +288,55 @@ pub const Vm = struct {
         return .{ .mrb = vm.mrb, .v = v };
     }
 
+    /// Call a Ruby method by pre-interned symbol (`internSymbol`), skipping
+    /// the per-call name interning of `call`. Symbols are per-interpreter:
+    /// a symbol from another `Vm` names an arbitrary method here.
+    pub fn callSymbol(vm: *Vm, recv: Value, sym: Symbol, args: anytype) Error!Value {
+        return vm.callSymbolWithOptions(recv, sym, args, .{});
+    }
+
+    /// `callSymbol` with an optional block.
+    pub fn callSymbolWithOptions(
+        vm: *Vm,
+        recv: Value,
+        sym: Symbol,
+        args: anytype,
+        options: CallOptions,
+    ) Error!Value {
+        try recv.ensureOwnedBy(vm.mrb);
+        if (options.block) |block| try block.ensureOwnedBy(vm.mrb);
+
+        const n = comptime @typeInfo(@TypeOf(args)).@"struct".field_types.len;
+        const argc = std.math.cast(c.mrb_int, n) orelse
+            return error.TooManyArguments;
+
+        var argv: [n]c.mrb_value = undefined;
+        inline for (0..n) |i| {
+            argv[i] = (try convert.toValue(vm.mrb, args[i])).v;
+        }
+
+        var v: c.mrb_value = undefined;
+        if (!c.mrz_protected_funcall_with_block_id(
+            vm.mrb,
+            recv.v,
+            sym,
+            argc,
+            &argv,
+            if (options.block) |block| block.v else c.mrz_nil_value(),
+            &v,
+        )) {
+            return error.RubyException;
+        }
+        return .{ .mrb = vm.mrb, .v = v };
+    }
+
     // ---- classes ---------------------------------------------------------
 
     /// Define a new class (super defaults to Object). If the name already
     /// names a class it is returned unchanged; if it names a non-class
     /// constant, `error.RubyException` (TypeError) is returned — never a
     /// longjmp through Zig frames.
-    pub fn defineClass(vm: *Vm, name: []const u8, super: ?Class) !Class {
+    pub fn defineClass(vm: *Vm, name: []const u8, super: ?Class) Error!Class {
         if (super) |s| try s.ensureOwnedBy(vm.mrb);
         const existing = try vm.lookupClass(name);
         if (existing) |e| return e;
@@ -283,7 +350,7 @@ pub const Vm = struct {
     }
 
     /// Define a new module. Same conflict semantics as `defineClass`.
-    pub fn defineModule(vm: *Vm, name: []const u8) !Class {
+    pub fn defineModule(vm: *Vm, name: []const u8) Error!Class {
         const existing = try vm.lookupClass(name);
         if (existing) |e| return e;
         const v = try vm.protectedDefine(name, null, c.MRZ_DEFINE_MODULE);
@@ -295,7 +362,7 @@ pub const Vm = struct {
         name: []const u8,
         super: ?*c.RClass,
         kind: u8,
-    ) !c.mrb_value {
+    ) Error!c.mrb_value {
         var value: c.mrb_value = undefined;
         if (!c.mrz_protected_define(
             vm.mrb,
@@ -313,11 +380,11 @@ pub const Vm = struct {
 
     /// Fetch a class/module by fully-qualified name ("Object", "Math",
     /// "Enumerator::Lazy"). `error.UnknownClass` if no such constant exists.
-    pub fn getClass(vm: *Vm, name: []const u8) !Class {
+    pub fn getClass(vm: *Vm, name: []const u8) Error!Class {
         return (try vm.lookupClass(name)) orelse error.UnknownClass;
     }
 
-    fn lookupClass(vm: *Vm, name: []const u8) !?Class {
+    fn lookupClass(vm: *Vm, name: []const u8) Error!?Class {
         var value: c.mrb_value = undefined;
         if (!c.mrz_protected_lookup(vm.mrb, name.ptr, name.len, &value))
             return error.RubyException;
@@ -330,7 +397,7 @@ pub const Vm = struct {
 
     /// Read a global variable. `name` excludes the `$` ("version", not
     /// "$version").
-    pub fn getGlobal(vm: *Vm, name: []const u8) !Value {
+    pub fn getGlobal(vm: *Vm, name: []const u8) Error!Value {
         var buf: [256]u8 = undefined;
         if (name.len > buf.len - 1) return error.NameTooLong;
         buf[0] = '$';
@@ -348,7 +415,7 @@ pub const Vm = struct {
     /// Set a global variable. A value from another interpreter is rejected as
     /// `error.ForeignValue`; allocation failures and Ruby exceptions are
     /// reported rather than silently ignored.
-    pub fn setGlobal(vm: *Vm, name: []const u8, val: Value) !void {
+    pub fn setGlobal(vm: *Vm, name: []const u8, val: Value) Error!void {
         try val.ensureOwnedBy(vm.mrb);
 
         var buf: [256]u8 = undefined;
@@ -364,7 +431,7 @@ pub const Vm = struct {
     }
 
     /// Read an instance variable (`name` includes the `@`); nil if unset.
-    pub fn getIvar(vm: *Vm, obj: Value, name: []const u8) !Value {
+    pub fn getIvar(vm: *Vm, obj: Value, name: []const u8) Error!Value {
         try obj.ensureOwnedBy(vm.mrb);
         var value: c.mrb_value = undefined;
         if (!c.mrz_protected_ivar_get(
@@ -379,7 +446,7 @@ pub const Vm = struct {
 
     /// Set an instance variable (`name` includes the `@`). The object and
     /// value must both belong to this interpreter.
-    pub fn setIvar(vm: *Vm, obj: Value, name: []const u8, val: Value) !void {
+    pub fn setIvar(vm: *Vm, obj: Value, name: []const u8, val: Value) Error!void {
         try obj.ensureOwnedBy(vm.mrb);
         try val.ensureOwnedBy(vm.mrb);
 
@@ -395,7 +462,7 @@ pub const Vm = struct {
     // ---- symbols ----------------------------------------------------------
 
     /// Intern a symbol, returning its id.
-    pub fn internSymbol(vm: *Vm, name: []const u8) !u32 {
+    pub fn internSymbol(vm: *Vm, name: []const u8) Error!Symbol {
         var symbol: c.mrb_sym = undefined;
         if (!c.mrz_protected_intern(vm.mrb, name.ptr, name.len, &symbol))
             return error.RubyException;
@@ -404,7 +471,7 @@ pub const Vm = struct {
 
     /// Symbol name (borrowed; lives in the symbol table for the lifetime of
     /// the interpreter).
-    pub fn symbolName(vm: *Vm, sym: u32) []const u8 {
+    pub fn symbolName(vm: *Vm, sym: Symbol) []const u8 {
         var len: c.mrb_int = 0;
         const p = c.mrb_sym_name_len(vm.mrb, sym, &len) orelse return "";
         return p[0..@intCast(len)];
@@ -461,13 +528,13 @@ pub const Vm = struct {
 
     /// Integer value. Inputs outside mruby's signed 64-bit Integer range return
     /// `error.Overflow`; heap-boxing allocation failure is a Ruby exception.
-    pub fn intValue(vm: *Vm, x: anytype) !Value {
+    pub fn intValue(vm: *Vm, x: anytype) Error!Value {
         requireInteger(@TypeOf(x));
         return convert.toValue(vm.mrb, x);
     }
 
     /// Integer value with explicit saturation to mruby's signed 64-bit range.
-    pub fn saturatingIntValue(vm: *Vm, x: anytype) !Value {
+    pub fn saturatingIntValue(vm: *Vm, x: anytype) Error!Value {
         requireInteger(@TypeOf(x));
         const n: i64 = std.math.cast(i64, x) orelse if (x < 0)
             std.math.minInt(i64)
@@ -476,7 +543,7 @@ pub const Vm = struct {
         return convert.toValue(vm.mrb, n);
     }
 
-    pub fn floatValue(vm: *Vm, x: f64) !Value {
+    pub fn floatValue(vm: *Vm, x: f64) Error!Value {
         return convert.toValue(vm.mrb, x);
     }
 
@@ -486,7 +553,7 @@ pub const Vm = struct {
 
     /// String values are copied onto the Ruby heap. Allocation failure is
     /// contained in C and reported as `error.RubyException`.
-    pub fn stringValue(vm: *Vm, s: []const u8) !Value {
+    pub fn stringValue(vm: *Vm, s: []const u8) Error!Value {
         return convert.toValue(vm.mrb, s);
     }
 
@@ -495,7 +562,7 @@ pub const Vm = struct {
     }
 
     /// Construct a Ruby Array from values owned by this VM.
-    pub fn array(vm: *Vm, values: []const Value) !Array {
+    pub fn array(vm: *Vm, values: []const Value) Error!Array {
         _ = std.math.cast(c.mrb_int, values.len) orelse
             return error.Overflow;
         const raw = try alloc_mod.gpa.alloc(c.mrb_value, values.len);
@@ -516,7 +583,7 @@ pub const Vm = struct {
     }
 
     /// Construct a Ruby Hash from key/value entries owned by this VM.
-    pub fn hash(vm: *Vm, entries: []const HashEntry) !Hash {
+    pub fn hash(vm: *Vm, entries: []const HashEntry) Error!Hash {
         _ = std.math.cast(c.mrb_int, entries.len) orelse
             return error.Overflow;
         const raw = try alloc_mod.gpa.alloc(c.mrz_hash_entry, entries.len);

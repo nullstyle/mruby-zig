@@ -216,6 +216,38 @@ mrz_protected_funcall_with_block(mrb_state *mrb, mrb_value receiver,
   return mrz_protect_result(mrb, mrz_funcall_body, &context, out);
 }
 
+/* Call by pre-interned method id: interning is per-mrb_state, so a caller
+ * caching symbols across calls (Vm.callSymbol) skips the per-call lookup. */
+struct mrz_funcall_id_context {
+  mrb_value receiver;
+  mrb_sym method;
+  mrb_int argc;
+  const mrb_value *argv;
+  mrb_value block;
+};
+
+static mrb_value
+mrz_funcall_id_body(mrb_state *mrb, void *data)
+{
+  struct mrz_funcall_id_context *context =
+    (struct mrz_funcall_id_context*)data;
+  return mrb_funcall_with_block(
+    mrb, context->receiver, context->method, context->argc, context->argv,
+    context->block);
+}
+
+mrb_bool
+mrz_protected_funcall_with_block_id(mrb_state *mrb, mrb_value receiver,
+                                    mrb_sym method, mrb_int argc,
+                                    const mrb_value *argv,
+                                    mrb_value block, mrb_value *out)
+{
+  struct mrz_funcall_id_context context = {
+    receiver, method, argc, argv, block
+  };
+  return mrz_protect_result(mrb, mrz_funcall_id_body, &context, out);
+}
+
 mrb_bool
 mrz_protected_funcall_preserve_error(mrb_state *mrb, mrb_value receiver,
                                      const char *name, size_t name_length,
