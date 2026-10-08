@@ -7,7 +7,7 @@
 | x86_64-linux (ubuntu) | supported | unit + integration + ReleaseSafe + TSan + gem profiles (CI) | target-supported and authority-gated, including finite `RLIMIT_AS` | |
 | aarch64-linux-gnu | cross-compiles (CI) | compile-only in hosted CI; local Docker runtime rehearsal | target-supported and authority-gated | local rehearsal covers both gem presets and compiler profiles in Debug/ReleaseSafe |
 | x86_64-linux-musl | cross-compiles (CI) | compile-only | target-supported and authority-gated; compile-only in CI | static-friendly libc |
-| x86_64-windows-gnu | best effort | GNU cross-build plus a non-blocking native Windows runtime job | unavailable | runtime job is diagnostic; it is not a support guarantee |
+| x86_64-windows | supported | native Windows job (both optimize profiles, examples) plus the GNU cross-build | unavailable | process tier is Linux/macOS only; use in-process execution |
 
 ## Constraints
 
@@ -60,17 +60,15 @@
 - ThreadSanitizer build and test on Linux
 - C undefined-behavior detection in a ReleaseFast build
   (`-Dsanitize-c=true`) on Linux
-- a best-effort, non-blocking Windows runtime job (unit + integration
-  suites, ReleaseSafe, and the example binaries); promoting Windows to
-  supported means making that job blocking and updating this matrix in
-  the same change
+- a blocking native Windows job (unit + integration suites in both
+  optimize profiles, the example binaries, and the REPL)
 - weekly sustained StateCapsule parser and live materialization fuzzing
   (scheduled and manually dispatchable)
 - gem profiles: `-Dgem-set=minimal`, `-Dwithout-gems=…` subsets
 
-The hosted baseline for `786c41a` used Ubuntu 24.04 x86_64 and macOS 26 arm64.
-Its native Windows job failed while compiling the host `mrbc` (mruby's
-`jmp_buf`/`void **` exception-handler mismatch), before running tests; the
-Windows GNU cross-build passed. Windows runtime behavior is therefore still
-unverified. Promoting it requires fixing that build, making the runtime job
-blocking, and updating this matrix with passing evidence.
+The hosted baseline for `786c41a` used Ubuntu 24.04 x86_64 and macOS 26 arm64;
+its native Windows job failed compiling the host `mrbc` (mruby's
+`jmp_buf`/`void **` mismatch under clang-on-MinGW). Fixed by the audited
+throw.h patch (`tools/patch_mruby_throw.zig`, fingerprint marker
+`mruby-throw-clang-setjmp=v1`): the native Windows job now passes the full
+suite in both optimize profiles plus the example binaries (`de010ed`).

@@ -222,7 +222,7 @@ jobs:
         include:
           - target: aarch64-linux-gnu
           - target: x86_64-linux-musl
-          - target: x86_64-windows-gnu # best effort
+          - target: x86_64-windows-gnu
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
@@ -230,9 +230,7 @@ jobs:
           install: true
       - run: mise install
       - run: mise x -- zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
-        continue-on-error: ${{ matrix.target == 'x86_64-windows-gnu' }}
       - run: mise x -- zig build check -Dno-compiler=true -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
-        continue-on-error: ${{ matrix.target == 'x86_64-windows-gnu' }}
 
   thread-sanitizer:
     name: thread sanitizer (linux)
@@ -259,11 +257,8 @@ jobs:
       - run: mise x -- zig build test -Doptimize=ReleaseFast -Dsanitize-c=true
 
   windows-runtime:
-    name: windows runtime (best effort)
+    name: windows runtime
     runs-on: windows-latest
-    # Promoting Windows out of compile-only means making this job blocking
-    # and updating docs/platforms.md in the same change.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
