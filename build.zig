@@ -596,20 +596,6 @@ pub fn build(b: *std.Build) !void {
     });
     check_step.dependOn(&seccomp_probe.step);
 
-    // Maintenance-only fixture generator (see tests_artifacts/MANIFEST.md);
-    // built with check so it stays compiling but is never installed.
-    const determinism_gen_mod = b.createModule(.{
-        .root_source_file = b.path("tools/determinism_fixture_gen.zig"),
-        .target = b.graph.host,
-        .optimize = .ReleaseSafe,
-    });
-    determinism_gen_mod.addImport("mruby", mruby_mod);
-    const determinism_gen = b.addExecutable(.{
-        .name = "determinism-fixture-gen",
-        .root_module = determinism_gen_mod,
-    });
-    check_step.dependOn(&determinism_gen.step);
-
     // The conformance bundle is created where the CodeDB host tools live
     // (later in this function); these handles let the test section wire
     // itself up front.
@@ -1107,10 +1093,17 @@ pub fn build(b: *std.Build) !void {
     codedb_test_step.dependOn(&run_codedb_demo.step);
     test_step.dependOn(codedb_test_step);
 
+    // The generator runs on the build machine and imports the mruby
+    // module, so it exists only for native, compiler-enabled builds;
+    // cross and no-compiler graphs never see it.
+    if (!no_compiler and
+        target.result.cpu.arch == b.graph.host.result.cpu.arch and
+        target.result.os.tag == b.graph.host.result.os.tag and
+        target.result.abi == b.graph.host.result.abi)
     {
         const gen_mod = b.createModule(.{
             .root_source_file = b.path("tools/determinism_fixture_gen.zig"),
-            .target = b.graph.host,
+            .target = target,
             .optimize = .ReleaseSafe,
         });
         gen_mod.addImport("mruby", mruby_mod);
