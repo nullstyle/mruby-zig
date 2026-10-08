@@ -13,6 +13,7 @@ const artifact_value = @import("artifact_value.zig");
 const build_features = @import("build_features");
 const sandbox = @import("sandbox.zig");
 const protocol = @import("worker_protocol");
+const cgroup = @import("cgroup.zig");
 
 pub const supported: bool = build_features.worker_process_supported;
 
@@ -32,6 +33,10 @@ pub const ProcessLimits = struct {
     /// byte runs (see `mruby.seccomp`). Unsupported elsewhere; surfaced,
     /// never pretended.
     confine_syscalls: bool = false,
+    /// Place the helper in an ephemeral cgroupv2 leaf under a delegated
+    /// parent (see `mruby.cgroup`); the attach happens between spawn and
+    /// the first request byte, so confinement precedes guest execution.
+    cgroup: ?cgroup.Limits = null,
 };
 
 pub const Input = struct {
@@ -39,12 +44,137 @@ pub const Input = struct {
     accepted_schema: ?artifact.Schema = null,
 };
 
+/// A synchronous, controller-side audit sink. Invoked exactly once per
+/// completed exchange (one-shot or session) on every outcome path,
+/// including controller errors; it must not block — persist or forward
+/// asynchronously. All borrowed strings live only for the call.
+pub const AuditSink = struct {
+    context: ?*anyopaque = null,
+    function: *const fn (context: ?*anyopaque, record: *const AuditRecord) void,
+};
+
+/// What the controller observed for one worker exchange.
+pub const AuditOutcome = union(enum) {
+    value,
+    ruby_exception: struct { class_name: []const u8 },
+    limit: LimitKind,
+    artifact_rejected,
+    controller_error: struct { name: []const u8 },
+};
+
+/// The audit record: the full authority posture of one worker launch —
+/// executable and pid, process ceilings, confinement, the sandbox policy
+/// granted, the build's linked authority — plus outcome, elapsed time,
+/// and peak RSS where observable.
+pub const AuditRecord = struct {
+    executable: []const u8,
+    pid: std.posix.pid_t,
+    session: bool,
+    exchange: usize,
+    wall_time_ns: u64,
+    cpu_seconds: u32,
+    address_space_bytes: ?usize,
+    confined_syscalls: bool,
+    cgroup_parent: ?[]const u8,
+    cgroup_memory_max_bytes: ?u64,
+    cgroup_cpu_quota_us: ?u64,
+    cgroup_pids_max: ?u32,
+    policy: struct {
+        gas: ?u64,
+        gas_per_execution: bool,
+        wall_time_ns: ?u64,
+        memory_bytes: ?usize,
+        hard_memory_bytes: ?usize,
+        call_depth: ?u32,
+        capabilities: struct {
+            eval: bool,
+            send: bool,
+            introspection: bool,
+            object_space: bool,
+            freeze_object_model: bool,
+        },
+    },
+    gem_set: []const u8,
+    worker_authority_bits: u16,
+    outcome: AuditOutcome,
+    elapsed_ns: u128,
+    peak_rss_bytes: ?usize,
+};
+
+fn auditRecord(
+    executable: []const u8,
+    pid: std.posix.pid_t,
+    session: bool,
+    exchange: usize,
+    process: ProcessLimits,
+    policy: sandbox.Policy,
+    result: *const RunError!Report,
+    elapsed_ns: u128,
+) AuditRecord {
+    const outcome: AuditOutcome = if (result.*) |report| switch (report.outcome) {
+        .value => .value,
+        .ruby_exception => |exc| .{ .ruby_exception = .{ .class_name = exc.class_name } },
+        .limit => |kind| .{ .limit = kind },
+        .artifact_rejected => .artifact_rejected,
+    } else |err| .{ .controller_error = .{ .name = @errorName(err) } };
+    return .{
+        .executable = executable,
+        .pid = pid,
+        .session = session,
+        .exchange = exchange,
+        .wall_time_ns = process.wall_time_ns,
+        .cpu_seconds = process.cpu_seconds,
+        .address_space_bytes = switch (process.address_space) {
+            .unbounded => null,
+            .bytes => |bytes| bytes,
+        },
+        .confined_syscalls = process.confine_syscalls,
+        .cgroup_parent = if (process.cgroup) |cg| cg.parent else null,
+        .cgroup_memory_max_bytes = if (process.cgroup) |cg| cg.memory_max_bytes else null,
+        .cgroup_cpu_quota_us = if (process.cgroup) |cg| cg.cpu_quota_us else null,
+        .cgroup_pids_max = if (process.cgroup) |cg| cg.pids_max else null,
+        .policy = .{
+            .gas = switch (policy.limits.gas orelse .unlimited) {
+                .unlimited => null,
+                .per_isolate => |limit| limit,
+                .per_execution => |limit| limit,
+            },
+            .gas_per_execution = if (policy.limits.gas) |g| g == .per_execution else false,
+            .wall_time_ns = policy.limits.wall_time_ns,
+            .memory_bytes = policy.limits.memory_bytes,
+            .hard_memory_bytes = policy.limits.hard_memory_bytes,
+            .call_depth = policy.limits.call_depth,
+            .capabilities = .{
+                .eval = policy.capabilities.eval,
+                .send = policy.capabilities.send,
+                .introspection = policy.capabilities.introspection,
+                .object_space = policy.capabilities.object_space,
+                .freeze_object_model = policy.capabilities.freeze_object_model,
+            },
+        },
+        .gem_set = build_features.gem_set,
+        .worker_authority_bits = authorityBits(),
+        .outcome = outcome,
+        .elapsed_ns = elapsed_ns,
+        .peak_rss_bytes = if (result.*) |report| report.process_peak_rss_bytes else |_| null,
+    };
+}
+
+fn authorityBits() u16 {
+    return @import("features.zig").authority.aggregate.toBits();
+}
+
+fn emitAudit(sink: AuditSink, record: *const AuditRecord) void {
+    sink.function(sink.context, record);
+}
+
 pub const Request = struct {
     image: artifact.RiteImageView,
     input: ?Input = null,
     output_schema: ?artifact.Schema = null,
     policy: sandbox.Policy = .{},
     process: ProcessLimits = .{},
+    audit: ?AuditSink = null,
 };
 
 pub const LimitKind = enum {
@@ -138,6 +268,8 @@ pub const RunError = std.mem.Allocator.Error || error{
     BrokenPipeProtectionUnavailable,
     ProcessLimitSetupFailed,
     WorkerFailed,
+    CgroupUnavailable,
+    CgroupSetupFailed,
     SessionClosed,
     SessionBusy,
     ConcurrencyUnavailable,
@@ -181,11 +313,36 @@ const RawResponse = struct {
 /// Execute one typed image in a fresh helper process. Inputs are borrowed for
 /// this call; the returned report owns its capsule or diagnostic strings.
 /// Every successful spawn is killed if necessary and reaped before return.
+/// When `request.audit` is set it receives one record for the exchange,
+/// on every outcome path.
 pub fn runRite(
     io: std.Io,
     allocator: std.mem.Allocator,
     worker_executable: []const u8,
     request: Request,
+) RunError!Report {
+    var pid: std.posix.pid_t = 0;
+    const start = sandbox.monotonicNs();
+    const result = runRiteInner(io, allocator, worker_executable, request, &pid);
+    if (request.audit) |sink| emitAudit(sink, &auditRecord(
+        worker_executable,
+        pid,
+        false,
+        0,
+        request.process,
+        request.policy,
+        &result,
+        @as(u128, @intCast(sandbox.monotonicNs() -% start)),
+    ));
+    return result;
+}
+
+fn runRiteInner(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    worker_executable: []const u8,
+    request: Request,
+    pid_out: *std.posix.pid_t,
 ) RunError!Report {
     if (comptime !supported) return error.UnsupportedPlatform;
     // A relative path containing '/' is still an explicit executable path;
@@ -247,8 +404,29 @@ pub fn runRite(
         .clock = .boot,
     });
 
+    var cgroup_group: ?cgroup.Group = null;
+    if (request.process.cgroup) |limits| {
+        if (builtin.os.tag != .linux) return error.CgroupUnavailable;
+        cgroup_group = cgroup.create(allocator, &limits) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => |e| e,
+        };
+        errdefer cgroup_group.?.destroy(allocator);
+    }
     var child = try spawnWorker(allocator, worker_executable);
     const child_pid = child.id.?;
+    pid_out.* = child_pid;
+    // Attach precedes the first request byte, so confinement is in place
+    // before any guest byte executes.
+    if (cgroup_group) |*group| {
+        cgroup.attach(group, child_pid) catch |err| {
+            terminateAndReap(io, &child, child_pid);
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => |e| e,
+            };
+        };
+    }
     // Once spawn succeeds, block caller cancellation until the direct child
     // has been reaped. The mandatory process deadline still bounds this scope.
     const old_cancel_protection = io.swapCancelProtection(.blocked);
@@ -322,6 +500,7 @@ pub fn runRite(
     }
     const term = child.wait(io) catch return error.ProcessControlFailed;
     const peak_rss = child.resource_usage_statistics.getMaxRss();
+    if (cgroup_group) |*group| group.destroy(allocator);
 
     const timed_out = (if (response_failure) |err| err == error.Timeout else false) or
         (if (write_failure) |err| err == error.Timeout else false);
@@ -673,6 +852,11 @@ pub const SessionLimits = struct {
     cpu_seconds: u32 = 300,
     address_space: AddressSpaceLimit = .unbounded,
     confine_syscalls: bool = false,
+    /// Lifetime cgroup for the session helper (same delegated-parent
+    /// contract as the one-shot tier; destroyed at session deinit).
+    cgroup: ?cgroup.Limits = null,
+    /// Audit sink invoked once per completed exchange.
+    audit: ?AuditSink = null,
 };
 
 /// One exchange over a persistent session. The sandbox policy is applied
@@ -701,6 +885,8 @@ pub const Session = struct {
     input_file: std.Io.File,
     output_file: std.Io.File,
     lifetime: SessionLimits,
+    executable: []const u8 = "",
+    cgroup_group: ?cgroup.Group = null,
     requests: usize = 0,
     broken: bool = false,
     busy: bool = false,
@@ -731,16 +917,30 @@ pub const Session = struct {
         if (lifetime.confine_syscalls and builtin.os.tag != .linux) {
             return error.SyscallFilterUnavailable;
         }
+        var cgroup_group: ?cgroup.Group = null;
+        if (lifetime.cgroup) |limits| {
+            if (builtin.os.tag != .linux) return error.CgroupUnavailable;
+            cgroup_group = try cgroup.create(allocator, &limits);
+        }
+        errdefer if (cgroup_group) |*group| group.destroy(allocator);
         if (!childWaitOwnershipAvailable()) return error.ChildReapingUnavailable;
         if (!brokenPipeProtected()) return error.BrokenPipeProtectionUnavailable;
 
         var child = try spawnWorker(allocator, worker_executable);
         const pid = child.id.?;
+        if (cgroup_group) |*group| {
+            cgroup.attach(group, pid) catch |err| {
+                terminateAndReap(io, &child, pid);
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => |e| e,
+                };
+            };
+        }
         const input_file = child.stdin.?;
         child.stdin = null;
         const output_file = child.stdout.?;
         child.stdout = null;
-        _ = io; // spawn itself needs no io; exchanges do
         return .{
             .allocator = allocator,
             .child = child,
@@ -748,6 +948,8 @@ pub const Session = struct {
             .input_file = input_file,
             .output_file = output_file,
             .lifetime = lifetime,
+            .executable = try allocator.dupe(u8, worker_executable),
+            .cgroup_group = cgroup_group,
         };
     }
 
@@ -755,6 +957,28 @@ pub const Session = struct {
     /// returned report owns its capsule or diagnostics. Per-request peak
     /// RSS is not observable without process exit and is reported as null.
     pub fn runRite(session: *Session, io: std.Io, request: SessionRequest) RunError!Report {
+        const begin = sandbox.monotonicNs();
+        const result = session.runRiteInner(io, request);
+        if (session.lifetime.audit) |sink| emitAudit(sink, &auditRecord(
+            session.executable,
+            session.pid,
+            true,
+            session.requests,
+            .{
+                .wall_time_ns = request.wall_time_ns,
+                .cpu_seconds = session.lifetime.cpu_seconds,
+                .address_space = session.lifetime.address_space,
+                .confine_syscalls = session.lifetime.confine_syscalls,
+                .cgroup = session.lifetime.cgroup,
+            },
+            request.policy,
+            &result,
+            @as(u128, @intCast(sandbox.monotonicNs() -% begin)),
+        ));
+        return result;
+    }
+
+    fn runRiteInner(session: *Session, io: std.Io, request: SessionRequest) RunError!Report {
         if (session.broken) return error.SessionClosed;
         if (session.busy) return error.SessionBusy;
         session.busy = true;
@@ -909,6 +1133,8 @@ pub const Session = struct {
             }
         }
         session.output_file.close(io);
+        if (session.cgroup_group) |*group| group.destroy(session.allocator);
+        session.allocator.free(session.executable);
         session.* = undefined;
     }
 };

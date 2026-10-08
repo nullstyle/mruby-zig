@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+Workers (assurance track B3):
+
+- cgroupv2 confinement: `ProcessLimits.cgroup` / `SessionLimits.cgroup`
+  place each helper in an ephemeral leaf under a delegated parent
+  (mruby.cgroup) with hard memory.max (whole-process, sharper than
+  RLIMIT_AS), cpu.max bandwidth, and pids.max. Attach happens between
+  spawn and the first request byte; the leaf is removed after
+  kill-then-reap. mruby-zig never flips subtree_control — the parent
+  must delegate controllers (systemd shape). Unavailability is typed
+  (error.CgroupUnavailable) and fail-closed off Linux, following the
+  HardMemoryLimitUnavailable precedent. Validated end-to-end in a
+  privileged Linux container (real helper confined, limits verified,
+  audit carries cgroup parameters); CI without a delegated hierarchy
+  skips the integration test rather than pretending.
+- Worker audit trail: `Request.audit` / `SessionLimits.audit` take an
+  AuditSink invoked once per exchange on every outcome path — values,
+  Ruby exceptions, limits, artifact rejections, and controller errors.
+  AuditRecord carries the full authority posture (executable, pid,
+  ceilings, seccomp/cgroup parameters, sandbox policy and capability
+  grants, gem set, linked worker-authority bits) plus outcome,
+  elapsed time, and peak RSS. Session exchanges are 1-indexed.
+- The hardened-tier contract (seccomp + cgroups, Linux-only, typed
+  unavailability elsewhere) is documented in docs/workers.md.
+
 External anchoring (adoption track A4):
 
 - mruby 4.0.0's own ISO test suite (test/t, 42 of 43 files) now runs as

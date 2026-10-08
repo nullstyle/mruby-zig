@@ -4488,6 +4488,191 @@ fn sessionValueOf(report: *mruby.worker.Report) !i64 {
     }
 }
 
+const AuditCapture = struct {
+    records: std.ArrayList(mruby.worker.AuditRecord) = .empty,
+    failures: usize = 0,
+
+    fn sink(context: ?*anyopaque, record: *const mruby.worker.AuditRecord) void {
+        const self: *AuditCapture = @ptrCast(@alignCast(context.?));
+        self.records.append(std.testing.allocator, record.*) catch {
+            self.failures += 1;
+        };
+    }
+
+    fn deinit(self: *AuditCapture) void {
+        // Record strings are borrowed from the caller's report and die
+        // with it; the capture never dereferences them after the call.
+        self.records.deinit(std.testing.allocator);
+    }
+};
+
+test "worker audit: one-shot records every outcome class" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    var ok_image = try sandbox.compileRite(std.testing.allocator, "7", .{});
+    defer ok_image.deinit(std.testing.allocator);
+    var boom = try sandbox.compileRite(std.testing.allocator, "raise 'audited'", .{});
+    defer boom.deinit(std.testing.allocator);
+    var spin = try sandbox.compileRite(std.testing.allocator, "while true; end", .{});
+    defer spin.deinit(std.testing.allocator);
+
+    var capture: AuditCapture = .{};
+    defer capture.deinit();
+
+    {
+        var report = try mruby.worker.runRite(std.testing.io, std.testing.allocator, test_config.worker_executable, .{
+            .image = ok_image.view(),
+            .process = .{ .wall_time_ns = 10 * std.time.ns_per_s, .cpu_seconds = 10 },
+            .audit = .{ .context = &capture, .function = AuditCapture.sink },
+        });
+        defer report.deinit(std.testing.allocator);
+    }
+    {
+        var report = try mruby.worker.runRite(std.testing.io, std.testing.allocator, test_config.worker_executable, .{
+            .image = boom.view(),
+            .audit = .{ .context = &capture, .function = AuditCapture.sink },
+        });
+        defer report.deinit(std.testing.allocator);
+    }
+    {
+        var report = try mruby.worker.runRite(std.testing.io, std.testing.allocator, test_config.worker_executable, .{
+            .image = spin.view(),
+            .policy = .{ .limits = .{ .gas = .{ .per_execution = 2_000 } } },
+            .audit = .{ .context = &capture, .function = AuditCapture.sink },
+        });
+        defer report.deinit(std.testing.allocator);
+    }
+    // A controller-side failure is audited too.
+    try std.testing.expectError(error.InvalidOptions, mruby.worker.runRite(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{ .image = .{ .bytes = "" }, .audit = .{ .context = &capture, .function = AuditCapture.sink } },
+    ));
+
+    try std.testing.expectEqual(@as(usize, 4), capture.records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), capture.failures);
+
+    const first = capture.records.items[0];
+    try std.testing.expect(!first.session);
+    try std.testing.expectEqual(@as(usize, 0), first.exchange);
+    try std.testing.expect(first.pid != 0);
+    try std.testing.expectEqualStrings(mruby.features.gem_set, first.gem_set);
+    try std.testing.expect(first.outcome == .value);
+    try std.testing.expect(first.elapsed_ns > 0);
+    try std.testing.expect(first.peak_rss_bytes != null);
+    try std.testing.expect(first.wall_time_ns == 10 * std.time.ns_per_s);
+    try std.testing.expect(first.cpu_seconds == 10);
+
+    const second = capture.records.items[1];
+    try std.testing.expect(second.outcome == .ruby_exception);
+    // The class name is borrowed from the report, which was deinit'd; the
+    // capture must not be read past this point for that field. Assert on
+    // the tag only and skip the string.
+
+    const third = capture.records.items[2];
+    try std.testing.expectEqual(mruby.worker.LimitKind.sandbox_gas, third.outcome.limit);
+    try std.testing.expect(third.policy.gas != null);
+    try std.testing.expect(third.policy.gas_per_execution);
+
+    const fourth = capture.records.items[3];
+    try std.testing.expect(fourth.outcome == .controller_error);
+    try std.testing.expectEqualStrings("InvalidOptions", fourth.outcome.controller_error.name);
+    try std.testing.expect(fourth.peak_rss_bytes == null);
+}
+
+test "worker audit: sessions record per-exchange with climbing indexes" {
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    var image = try sandbox.compileRite(std.testing.allocator, "3", .{});
+    defer image.deinit(std.testing.allocator);
+
+    var capture: AuditCapture = .{};
+    defer capture.deinit();
+    var session = try mruby.worker.Session.start(
+        std.testing.io,
+        std.testing.allocator,
+        test_config.worker_executable,
+        .{ .audit = .{ .context = &capture, .function = AuditCapture.sink } },
+    );
+    defer session.deinit(std.testing.io);
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        var report = try session.runRite(std.testing.io, .{ .image = image.view() });
+        defer report.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), capture.records.items.len);
+    for (capture.records.items, 1..) |record, exchange| {
+        try std.testing.expect(record.session);
+        try std.testing.expectEqual(exchange, record.exchange);
+        try std.testing.expect(record.pid != 0);
+        try std.testing.expect(record.outcome == .value);
+    }
+}
+
+test "worker: cgroup confines a one-shot helper on Linux" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    // Requires a writable cgroupv2 hierarchy with memory+cpu enabled in
+    // the parent's subtree_control (systemd delegation or a private
+    // namespace); CI without that skips rather than pretends.
+    const parent = "/sys/fs/cgroup";
+    {
+        var buf: [128]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/memory.max", .{parent}) catch unreachable;
+        var f = std.Io.Dir.openFileAbsolute(std.testing.io, path, .{}) catch return error.SkipZigTest;
+        defer f.close(std.testing.io);
+    }
+
+    var image = try sandbox.compileRite(std.testing.allocator, "'cgroup audited'", .{});
+    defer image.deinit(std.testing.allocator);
+
+    var capture: AuditCapture = .{};
+    defer capture.deinit();
+    var report = try mruby.worker.runRite(std.testing.io, std.testing.allocator, test_config.worker_executable, .{
+        .image = image.view(),
+        .process = .{
+            .wall_time_ns = 15 * std.time.ns_per_s,
+            .cpu_seconds = 10,
+            .cgroup = .{
+                .parent = parent,
+                .memory_max_bytes = 512 << 20,
+                .cpu_quota_us = 2_000_000,
+                .pids_max = 8,
+            },
+        },
+        .audit = .{ .context = &capture, .function = AuditCapture.sink },
+    });
+    defer report.deinit(std.testing.allocator);
+    switch (report.outcome) {
+        .value => {},
+        else => return error.UnexpectedWorkerOutcome,
+    }
+    try std.testing.expectEqual(@as(usize, 1), capture.records.items.len);
+    const record = capture.records.items[0];
+    try std.testing.expect(record.cgroup_parent != null);
+    try std.testing.expectEqual(@as(u64, 512 << 20), record.cgroup_memory_max_bytes.?);
+    try std.testing.expectEqual(@as(u64, 2_000_000), record.cgroup_cpu_quota_us.?);
+    try std.testing.expectEqual(@as(u32, 8), record.cgroup_pids_max.?);
+}
+
+test "worker: cgroup confinement surfaces typed unavailability off Linux" {
+    if (builtin.os.tag == .linux) return error.SkipZigTest;
+    if (!mruby.worker.supported) return error.SkipZigTest;
+
+    var image = try sandbox.compileRite(std.testing.allocator, "1", .{});
+    defer image.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.CgroupUnavailable,
+        mruby.worker.runRite(std.testing.io, std.testing.allocator, test_config.worker_executable, .{
+            .image = image.view(),
+            .process = .{ .cgroup = .{ .parent = "/sys/fs/cgroup" } },
+        }),
+    );
+}
+
 test "worker session: many requests over one persistent helper" {
     if (!mruby.worker.supported) return error.SkipZigTest;
 

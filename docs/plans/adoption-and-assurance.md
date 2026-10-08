@@ -124,12 +124,19 @@ machine. Deferred follow-up: a protocol hello with feature negotiation
 only becomes necessary if the controller and helper can come from
 different builds.
 
-### B3. Platform honesty + hardening depth
+### B3. Platform honesty + hardening depth (shipped 2026-10-08)
 
-Either a macOS hardening story (EndpointSecurity is heavyweight; an
-honest "hardened tier is Linux-only" contract matches the existing
-`HardMemoryLimitUnavailable` precedent) plus cgroupv2 integration and
-audit logging of worker authority use.
+The hardened-tier contract is Linux-only and typed-fail-closed elsewhere
+(the HardMemoryLimitUnavailable precedent, now joined by
+SyscallFilterUnavailable and CgroupUnavailable). cgroupv2 integration:
+ephemeral leaf per helper under a delegated parent, hard memory.max /
+cpu.max / pids.max, attach between spawn and the first request byte,
+leaf removed after reap; subtree_control is never touched by the library
+(the systemd delegation shape is the caller's). Worker audit trail:
+AuditSink per exchange on every outcome path, carrying the full
+authority posture. Deferred: audit-log persistence/format (the record
+is embedder-owned), macOS EndpointSecurity (rejected as heavyweight;
+revisit only with an application pulling it).
 
 ### B4. External validation
 

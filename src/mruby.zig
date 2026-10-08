@@ -39,6 +39,7 @@ pub const artifact = @import("artifact.zig");
 pub const sandbox = @import("sandbox.zig");
 pub const worker = @import("worker.zig");
 pub const seccomp = @import("seccomp.zig");
+pub const cgroup = @import("cgroup.zig");
 pub const features = @import("features.zig");
 pub const codedb = @import("codedb.zig");
 

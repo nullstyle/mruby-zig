@@ -172,6 +172,48 @@ through `acquire`/`release` (null when exhausted; broken sessions are not
 reused). The pool is not synchronized — embedders share it across threads
 behind their own lock.
 
+## Hardened tier (Linux) and the audit trail
+
+The Linux worker tier composes three OS-enforced layers, each optional
+and independently surfaced:
+
+- `confine_syscalls` — the kernel syscall allowlist (`mruby.seccomp`).
+- `ProcessLimits.cgroup` / `SessionLimits.cgroup` — an ephemeral
+  **cgroupv2 leaf** per helper under a caller-provided *delegated
+  parent* (`mruby.cgroup`): hard `memory.max` for the whole process (a
+  sharper ceiling than RLIMIT_AS — every allocation accounted, kernel
+  OOM kill as the failure mode), `cpu.max` bandwidth complementing
+  RLIMIT_CPU's cumulative seconds, and `pids.max` bounding the
+  descendant tree. The attach happens between spawn and the first
+  request byte, so confinement precedes any guest execution; the leaf
+  is removed after kill-then-reap. mruby-zig never flips
+  `cgroup.subtree_control` itself — the parent must already delegate
+  the controllers (the standard systemd delegation shape). Missing,
+  read-only, or under-delegated parents report
+  `error.CgroupUnavailable`; off-Linux requests fail closed the same
+  way. Controller files absent from the created leaf (parent without
+  that controller enabled) also report unavailability, never a silent
+  no-op.
+- The RLIMIT ceilings and the in-isolate sandbox policy, as always.
+
+The **hardened-tier contract is Linux-only** and stated plainly: seccomp
+and cgroupv2 have no macOS equivalent in this tier, and requests asking
+for them there fail with typed errors rather than degrading silently
+(`SyscallFilterUnavailable`, `CgroupUnavailable`, matching the
+`HardMemoryLimitUnavailable` precedent for RLIMIT_AS).
+
+**Worker audit trail**: `Request.audit` / `SessionLimits.audit` take an
+`AuditSink` — a synchronous, controller-side callback invoked exactly
+once per completed exchange on *every* outcome path (values, Ruby
+exceptions, limits, artifact rejections, and controller errors like
+`InvalidOptions`). The `AuditRecord` carries the full authority posture:
+executable and pid, process ceilings, seccomp/cgroup confinement and
+their parameters, the sandbox policy granted (gas mode and limit, wall
+and memory ceilings, capability bits), the build's gem set and linked
+worker-authority bits, plus outcome classification, elapsed time, and
+peak RSS where observable. All strings are borrowed for the call only;
+sinks must not block.
+
 ## Enforcement and platform contract
 
 Worker availability is fail-closed and visible through separate feature
