@@ -192,6 +192,7 @@ pub fn build(b: *std.Build) !void {
             "-DMRB_ARY_LENGTH_MAX=0",
         },
     });
+    mrbc_mod.addIncludePath(patched_throw_dir);
     mrbc_mod.addIncludePath(try root.join(arena, "include"));
     mrbc_mod.addIncludePath(mrbc_presym_dir);
     const mrbc = b.addExecutable(.{ .name = "mrbc", .root_module = mrbc_mod });
