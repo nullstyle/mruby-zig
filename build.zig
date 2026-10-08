@@ -596,6 +596,25 @@ pub fn build(b: *std.Build) !void {
     });
     check_step.dependOn(&seccomp_probe.step);
 
+    // Maintenance-only fixture generator (see tests_artifacts/MANIFEST.md);
+    // built with check so it stays compiling but is never installed.
+    const determinism_gen_mod = b.createModule(.{
+        .root_source_file = b.path("tools/determinism_fixture_gen.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    determinism_gen_mod.addImport("mruby", mruby_mod);
+    const determinism_gen = b.addExecutable(.{
+        .name = "determinism-fixture-gen",
+        .root_module = determinism_gen_mod,
+    });
+    check_step.dependOn(&determinism_gen.step);
+
+    // The conformance bundle is created where the CodeDB host tools live
+    // (later in this function); these handles let the test section wire
+    // itself up front.
+    var conformance_test_mod: ?*std.Build.Module = null;
+
     const test_step = b.step("test", "run unit and integration tests for the selected profile");
     if (!no_compiler) {
         // Tests.
@@ -657,6 +676,7 @@ pub fn build(b: *std.Build) !void {
         }
         test_config.addOptionPath("seccomp_probe", seccomp_probe.getEmittedBin());
         test_mod.addOptions("test_config", test_config);
+        conformance_test_mod = test_mod;
         const unit_tests = b.addTest(.{ .root_module = test_mod });
         check_step.dependOn(&unit_tests.step);
         const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -915,6 +935,49 @@ pub fn build(b: *std.Build) !void {
         .mrbc = mrbc.getEmittedBin(),
         .envelope = rite_envelope.getEmittedBin(),
     };
+    // mruby upstream conformance suite, per-file like upstream's own
+    // rake harness (files are separate parse units; concatenation
+    // changes heredoc contexts). The prelude provides the driver
+    // definitions assert.rb expects; every test file depends on it and
+    // the summary tail depends on everything, so loading the tail runs
+    // the whole suite in deterministic order inside one isolate.
+    var conformance_sources: std.ArrayList(CodeDB.Source) = .empty;
+    {
+        const prelude_source = joinFiles(b, file_join, "prelude.rb", arena, &.{
+            .{ .str = "## mruby-zig conformance harness prelude\\n" },
+            .{ .file = b.path("src/tests_conformance/prelude.rb") },
+            .{ .file = try root.join(arena, "test/assert.rb") },
+        });
+        try conformance_sources.append(arena, .{
+            .name = "prelude",
+            .source = prelude_source,
+            .source_name = "conformance/prelude.rb",
+        });
+        var conformance_names: std.ArrayList([]const u8) = .empty;
+        const t_dir = try root.join(arena, "test/t");
+        for (sources.conformance_test_files) |name| {
+            const entry_name = try std.fmt.allocPrint(arena, "t_{s}", .{name[0 .. name.len - ".rb".len]});
+            try conformance_names.append(arena, entry_name);
+            try conformance_sources.append(arena, .{
+                .name = entry_name,
+                .source = try t_dir.join(arena, name),
+                .source_name = try std.fmt.allocPrint(arena, "conformance/{s}", .{name}),
+                .dependencies = &.{"prelude"},
+            });
+        }
+        try conformance_sources.append(arena, .{
+            .name = "summary",
+            .source = b.path("src/tests_conformance/tail.rb"),
+            .source_name = "conformance/summary.rb",
+            .dependencies = conformance_names.items,
+        });
+    }
+    const conformance_bundle = try CodeDB.add(b, codedb_tools, .{
+        .tier = .trusted,
+        .sources = conformance_sources.items,
+    });
+    if (conformance_test_mod) |m| m.addImport("conformance_manifest", conformance_bundle.manifest);
+
     // Package examples/tests must work with every selectable linked profile.
     // Applications default to the stricter worker tier in addCodeDB.
     const codedb_bundle = try CodeDB.add(b, codedb_tools, .{ .tier = .trusted, .sources = &.{
@@ -1043,6 +1106,19 @@ pub fn build(b: *std.Build) !void {
     codedb_test_step.dependOn(runtime_test_step);
     codedb_test_step.dependOn(&run_codedb_demo.step);
     test_step.dependOn(codedb_test_step);
+
+    {
+        const gen_mod = b.createModule(.{
+            .root_source_file = b.path("tools/determinism_fixture_gen.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        });
+        gen_mod.addImport("mruby", mruby_mod);
+        const gen_exe = b.addExecutable(.{ .name = "determinism-gen", .root_module = gen_mod });
+        const install_gen = b.addInstallArtifact(gen_exe, .{});
+        const gen_step = b.step("gen-determinism-fixture", "regenerate the cross-toolchain RITE determinism fixture");
+        gen_step.dependOn(&install_gen.step);
+    }
 
     // A test-only observer gates the same worker execution path while an
     // independent supervisor kills its controller and observes worker exit.

@@ -75,3 +75,53 @@ pub const mrblib_rb_files = [_][]const u8{
     "mrblib/string.rb",
     "mrblib/symbol.rb",
 };
+
+/// The mruby upstream test suite (test/t/*.rb) driven through the
+/// conformance harness; see src/tests_conformance/README.md.
+pub const conformance_test_files = [_][]const u8{
+    "argumenterror.rb",
+    "array.rb",
+    "basicobject.rb",
+    "bs_block.rb",
+    "bs_literal.rb",
+    "class.rb",
+    "codegen.rb",
+    "comparable.rb",
+    "ensure.rb",
+    "enumerable.rb",
+    "exception.rb",
+    "false.rb",
+    "float.rb",
+    "gc.rb",
+    "hash.rb",
+    "indexerror.rb",
+    "integer.rb",
+    "iterations.rb",
+    "kernel.rb",
+    "lang.rb",
+    "literals.rb",
+    "localjumperror.rb",
+    "methods.rb",
+    "module.rb",
+    "nameerror.rb",
+    "nil.rb",
+    "nomethoderror.rb",
+    "numeric.rb",
+    "object.rb",
+    "proc.rb",
+    "range.rb",
+    "rangeerror.rb",
+    "regexperror.rb",
+    "runtimeerror.rb",
+    "standarderror.rb",
+    "string.rb",
+    "superclass.rb",
+    "symbol.rb",
+    "syntax.rb",
+    "true.rb",
+    "typeerror.rb",
+    "unicode.rb",
+    // vformat.rb excluded: it exercises the TestVFormat C extension that
+    // upstream's test driver compiles into mrbtest; this harness runs the
+    // suite as pure Ruby through the safe layer.
+};

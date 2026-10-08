@@ -28,39 +28,41 @@ one-shot worker roundtrip.
 
 ## Reference observations
 
-Recorded on aarch64-macos, Zig `0.17.0-dev.1978+c961124d9`,
+Recorded on aarch64-macos, Zig `0.17.0` (the pinned release; re-recorded
+2026-10-08 after the pin — dev-snapshot numbers were materially slower),
 `-Doptimize=ReleaseSafe`, standard gem set. Re-measure on the same machine
 when comparing.
 
 | Metric | Per op | Throughput |
 | --- | ---: | ---: |
-| vm-cycle | 128.6 µs | 7,777 ops/s |
-| isolate-cycle | 104.0 µs | 9,617 ops/s |
-| eval-cold | 53.2 µs | 18,811 ops/s |
-| rite-cached | 48.4 µs | 20,684 ops/s |
-| call-loop | 0.09 µs | 10.8 M ops/s |
-| host-callback | 0.10 µs/call | 10.1 M calls/s |
-| gas-hook overhead | — | 1.03x |
-| capsule-export (200-entry) | 72.5 µs | 13,801 ops/s |
-| capsule-import (200-entry) | 41.6 µs | 24,027 ops/s |
-| worker-rite | 1,721 µs | 581 ops/s |
+| vm-cycle | 102.8 µs | 9,725 ops/s |
+| isolate-cycle | 105.3 µs | 9,499 ops/s |
+| eval-cold | 71.6 µs | 13,968 ops/s |
+| rite-cached | 70.3 µs | 14,218 ops/s |
+| call-loop | 0.14 µs | 7.25 M ops/s |
+| host-callback | 0.13 µs/call | 7.79 M calls/s |
+| gas-hook overhead | — | 1.07x |
+| capsule-export (200-entry) | 105.5 µs | 9,480 ops/s |
+| capsule-import (200-entry) | 50.4 µs | 19,857 ops/s |
+| worker-rite (one-shot) | 3,299 µs | 303 ops/s |
+| worker-session-rite (amortized) | 190 µs | 5,268 ops/s |
 
 Observations worth keeping in mind:
 
-- **The instruction hook is cheap.** Metered execution costs ~3% over
-  unmetered — the assessment's concern that the fetch hook runs even for
-  effectively-unlimited configurations is measurable but small.
-- **Cached RITE ≈ cold eval.** `runRite` (validation + load + execute) is
-  only ~9% cheaper than parsing and compiling source each time; the win of
+- **The instruction hook is cheap.** Metered execution costs ~7% over
+  unmetered — measurable but small for the protection it carries.
+- **Cached RITE ≈ cold eval.** `runRite` (validation + load + execute)
+  costs the same as parsing and compiling source each time; the win of
   RITE is determinism and compatibility control, not throughput. A
   load-once/run-many path would need a different API shape.
-- **Export costs ~1.7x import.** The export path encodes and then
+- **Export costs ~2x import.** The export path encodes and then
   reparses/normalizes its own output for safety symmetry; import runs the
   parser once. That symmetry is the most promising optimization target if
   capsule throughput ever matters (confirmed by the assessment).
-- **The worker roundtrip is process-spawn bound.** ~1.7 ms is dominated by
-  fork/exec + IPC of the 14 KB request, not Ruby execution; batching or a
-  persistent worker pool would change its economics.
+- **One-shot workers are process-spawn bound; sessions fix exactly
+  that.** The one-shot roundtrip is dominated by fork/exec, not Ruby
+  execution. A persistent session amortizes the spawn: ~190 µs/op, a
+  ~17x improvement — the IPC + execute floor of the same exchange.
 
 ## Binary size
 

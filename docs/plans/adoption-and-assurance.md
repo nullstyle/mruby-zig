@@ -40,21 +40,30 @@ shim.c reconciliation, RITE version constants, epoch decision. Add the
 planned 4.0.0-produced RITE fixture at the same time. Do this while
 pre-1.0 so the fingerprint change costs nothing.
 
-### A3. Windows
+### A3. Windows (shipped 2026-10-08)
 
-Fix the host-mrbc MinGW build (`jmp_buf` / `void **` mismatch diagnosed
-upstream; reproduces under both pinned Zig toolchains). A shim-level
-containing trampoline is the likely shape — mruby's `mrb_jmpbuf` is
-already `void **`. Then promote the windows-runtime CI job per
-docs/platforms.md criteria.
+The failure was upstream throw.h selecting GCC's untyped
+`__builtin_setjmp` on MinGW64 whenever `__GNUC__ >= 4` — zig cc (clang)
+satisfies that but type-checks the builtin against the platform
+`jmp_buf`. Fixed by the second audited patch
+(`tools/patch_mruby_throw.zig`, marker `mruby-throw-clang-setjmp=v1`)
+riding an include-override directory ahead of the dependency root; plus
+two 0.17 std API fixes (ntdll QPC, NtDelayExecution). The native Windows
+CI job passes the full suite in both profiles and is now blocking;
+platforms.md records Windows as supported. Lesson recorded: host tools
+build for the build machine, so only a Windows host exercises the host
+mrbc path — cross-compiles cannot catch that class.
 
-### A4. External anchoring
+### A4. External anchoring (shipped 2026-10-08)
 
-- Run mruby's own `test/t` suite as a conformance harness (biggest
-  credibility win per unit effort).
-- Re-record benchmarks on the pinned toolchain; commit cross-toolchain
-  artifact fixtures (the A/B check exists but is not committed evidence).
-- CONTRIBUTING, security policy, issue templates before announcements.
+- mruby's own test/t suite runs in CI: 697 pass / 0 fail / 1 documented
+  upstream delta (upstream suite-vs-impl inconsistency on endless
+  Range#last); vformat.rb excluded (C test extension). Harness notes in
+  src/tests_conformance/README.md.
+- Benchmarks re-recorded on the pinned toolchain; session numbers added.
+- Cross-toolchain determinism is now committed evidence:
+  gen-determinism-fixture + embedded byte comparison in the suite.
+- CONTRIBUTING.md, SECURITY.md, issue templates in place.
 
 ### A5. 1.0
 

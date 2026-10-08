@@ -15,6 +15,22 @@ against). Generation scripts are reproduced in this file's history.
 | `rite_image_v0_3_0.bin` | typed RITE image | `$input ? 1 : 2`, source_name `fixture.rb`, no application fingerprint | rejected with `IncompatibleRiteImage`: the compatibility fingerprint (presym digest, semantic defines, gems) changed after 0.3.0 |
 | `state_capsule_v0_3_0.bin` | schema-less StateCapsule | 20-entry Hash: frozen String keys `"0"`..`"19"`, values `[i, i* 2]` | accepted and restored: the capsule envelope carries schema identity, not a build fingerprint; format v1 is forward-compatible |
 
+## `determinism_rite.bin`
+
+The cross-toolchain RITE determinism fixture (A4): produced by
+`zig build gen-determinism-fixture` (tools/determinism_fixture_gen.zig)
+from `"[3, 4].sum * 2"` with source_name `determinism.rb`, then copied to
+this directory. sha256
+`907e5b20e9c9ce4d073784d3647a28ec3288d9d2129fd8ebc3dfeedf6e56fcc3`.
+The embedding test re-derives the bytes on every run: any toolchain or
+generator change that alters RITE output fails the suite instead of
+silently invalidating previously produced artifacts. Generation was
+verified byte-identical across the 0.17.0-dev.1978 → 0.17.0 toolchain
+change (2026-10-07, A/B manifest diff) and across repeated runs.
+
+Regenerate only to re-pin after a *deliberate* compatibility-relevant
+change, with the reason recorded here.
+
 Regenerate (from a `git worktree add <dir> v0.3.0`):
 
 ```zig
