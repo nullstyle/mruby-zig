@@ -67,7 +67,23 @@ mrbc path — cross-compiles cannot catch that class.
 
 ### A5. 1.0
 
-Semver freeze, migration notes, example gallery, announcements.
+Gates (all required, in order):
+
+1. 0.6.0 soak: green weekly scheduled runs (suite + sustained fuzz)
+   for at least two cycles after 2026-10-24, no flake recurrence.
+2. B4 findings dispositioned: every external-review finding fixed,
+   documented as accepted, or explicitly deferred with a ticket-shaped
+   note here.
+3. Roadmap deltas closed or consciously waived: Zig→Ruby keyword calls
+   (deferred behind the 4.1 migration), effects landing decided (it is
+   load-bearing for downstream prototypes; a 1.0 that diverges from it
+   needs a stated compatibility position).
+4. Release mechanics: semver freeze notes in CHANGELOG (0.x breaking
+   history summarized for the 1.0 reader), migration notes for every
+   0.4→0.6 breaking change (VmError sets, initWithFailure, HSMK ident
+   on the 4.1 line), example gallery reviewed against current API,
+   packaged-consumer rehearsal on the 1.0 tag.
+5. Announcements only after the tag exists and CI is green on it.
 
 ## Track B — assurance frontier
 
@@ -140,9 +156,19 @@ revisit only with an application pulling it).
 
 ### B4. External validation
 
-External security review of the worker boundary + seccomp policy;
-adversarial red-team corpus wired into the existing fuzz-retention CI;
-protocol property tests.
+- [x] Review package prepared (2026-10-24):
+      `docs/security-review-package.md` — scope table, six prioritized
+      review asks (session framing, seccomp BPF, cgroup lifecycle,
+      audit fidelity, new marshalling surfaces, admission re-review),
+      prior-review disposition, build/test instructions against v0.6.0,
+      honest trust-calibration context, and expected deliverables.
+- [ ] Review commissioned and completed (maintainer's call on reviewer
+      and budget; the package exists so this is a decision, not a
+      project).
+- [ ] Findings dispositioned (feeds the A5 gate).
+- Deferred: adversarial red-team corpus and protocol property tests —
+      candidates for a follow-up sprint; the fuzz-retention CI plumbing
+      they would build on is already in place.
 
 ## Cross-cutting decisions
 
@@ -185,3 +211,9 @@ A1 (finish) → B1 → A2 → A3 → B2 → A4 → B3 → A5/B4, with the flaky-
 CI-hygiene class of fixes (like the two already landed) taken whenever
 they appear. Each item ships independently behind green CI; nothing here
 blocks landing feature/effects when that becomes the priority.
+
+State 2026-10-24: A1–A4 and B1–B3 shipped; 0.5.0 and 0.6.0 released;
+the B4 package is prepared and awaiting commissioning; A5's gates are
+listed above. Remaining watch items: the 4.1.0 final swap (blocked
+upstream; procedure in the integration branch's MIGRATION.md) and the
+effects-landing decision.
